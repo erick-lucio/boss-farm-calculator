@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+.venv/
+venv/
+
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+.DS_Store
+Thumbs.db
