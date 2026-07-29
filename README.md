@@ -4,7 +4,7 @@ A single-file, zero-dependency web dashboard that estimates farming profitabilit
 
 > **Unofficial fan tool.** Not affiliated with or endorsed by Grinding Gear Games. Prices come from [poe.ninja](https://poe.ninja) / [poe.watch](https://poe.watch), drop data from [poewiki.net](https://www.poewiki.net) and community guides.
 
-**📸 Screenshot:** not included yet — run the app locally (see Quick Start below) and take one, then drop it at `docs/screenshot.png` and add `![Boss Farm Estimator](docs/screenshot.png)` above this line. No browser tool was available in the session that wrote this README to capture one directly.
+![Boss Farm Estimator](docs/initial_screenshot.png)
 
 ## Why this exists
 
