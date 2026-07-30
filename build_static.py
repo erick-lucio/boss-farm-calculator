@@ -17,15 +17,16 @@ pricing logic into client-side JS (the FETCH_ENGINE block below) that calls
 the Worker instead.
 
 The whole deployment (this build's output + the proxy) is one Cloudflare
-Worker: worker.js serves docs/ as static assets (see [assets] in
+Worker: worker.js serves build/ as static assets (see [assets] in
 worker/wrangler.toml) and only runs its own fetch() handler for the /ninja,
 /watch proxy routes and the redirect-everything-else-to-/ladder behavior —
 so the dashboard's real URL is host/ladder, written here to
-docs/ladder/index.html.
+build/ladder/index.html. build/ is generated output, kept separate from
+docs/ (real documentation, e.g. the README screenshot).
 
 Usage:
-    python build_static.py --worker-url https://boss-farm-calculator.<you>.workers.dev
-    python build_static.py --worker-url https://... --league Standard --poll 120 --out docs
+    python build_static.py
+    python build_static.py --worker-url https://... --league Standard --poll 120 --out build
 """
 
 import argparse
@@ -37,7 +38,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boss  # noqa: E402  (must follow sys.path tweak)
 
 OLD_FETCH_DATA = """async function fetchData(){
-  const r = await fetch('/api/data', {signal: AbortSignal.timeout(60000)});
+  const qs = currentLeague ? ('?league='+encodeURIComponent(currentLeague)) : '';
+  const r = await fetch('/api/data'+qs, {signal: AbortSignal.timeout(60000)});
   if(!r.ok) throw new Error('HTTP '+r.status);
   return r.json();
 }"""
@@ -349,7 +351,7 @@ async function buildPayload(league){
 
 async function fetchData(){
   const data = await Promise.race([
-    buildPayload(LEAGUE),
+    buildPayload(currentLeague || LEAGUE),
     new Promise((_, rej) => setTimeout(
       () => rej(Object.assign(new Error('timeout'), {name: 'TimeoutError'})), 60000)),
   ]);
@@ -395,12 +397,12 @@ ROOT_REDIRECT = """<!doctype html>
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--worker-url", required=True,
+    ap.add_argument("--worker-url", default="https://boss-farm-calculator.ericklucio-suv.workers.dev",
                     help="Cloudflare Worker base URL, e.g. https://boss-farm-calculator.you.workers.dev")
     ap.add_argument("--league", default="Allflame")
     ap.add_argument("--poll", type=int, default=120,
                     help="browser auto-refresh interval, in seconds")
-    ap.add_argument("--out", default="docs", help="output directory (default: docs — the same "
+    ap.add_argument("--out", default="build", help="output directory (default: build — the same "
                     "directory worker/wrangler.toml's [assets] block points at)")
     args = ap.parse_args()
 

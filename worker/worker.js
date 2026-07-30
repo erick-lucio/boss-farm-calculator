@@ -1,5 +1,5 @@
 // Cloudflare Worker serving the whole boss-farm-calculator deployment:
-// static assets (the built dashboard, see ../docs, configured via the
+// static assets (the built dashboard, see ../build, configured via the
 // [assets] block in wrangler.toml) plus a CORS-friendly reverse proxy for
 // the two upstreams boss.py's build_index()/build_payload() otherwise fetch
 // server-side.
@@ -15,7 +15,7 @@
 // wrangler.toml) and only invokes this fetch() handler when nothing matched
 // — so by the time we get here, the request is either an API-proxy path or
 // something that should redirect to /ladder (the dashboard's real URL; see
-// build_static.py, which writes it to docs/ladder/index.html).
+// build_static.py, which writes it to build/ladder/index.html).
 //
 // Routes (mirror boss.py's CURRENCY_URL/EXCHANGE_URL/ITEM_URL/WATCH_URL path
 // shapes 1:1, so the mapping is easy to eyeball against boss.py):

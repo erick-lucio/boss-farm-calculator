@@ -20,38 +20,42 @@ python boss.py --league Standard --port 8000 --poll 120
 
 No `pip install` — it's stdlib Python 3 only. Opens `http://localhost:8000` in your browser automatically. `--poll` sets the browser's auto-refresh interval in seconds; prices are cached server-side for 5 minutes regardless.
 
-## Deploying a static version (GitHub Pages)
+## Deploying a static version (Cloudflare Workers)
 
 `boss.py` needs a running Python process because poe.ninja sends no CORS header, so a browser
-can't call it directly from a static-hosted page — `boss.py`'s server proxies it. To publish a
-no-backend build (GitHub Pages or any static host), a small Cloudflare Worker fills the same
-CORS-proxy role, and the pricing math moves into client-side JS instead of running server-side.
+can't call it directly from a static-hosted page — `boss.py`'s server proxies it. The static
+deploy moves the pricing math (`build_index()`/`build_payload()`) into client-side JS, and uses
+one Cloudflare Worker (`worker/worker.js`) for two jobs at once:
 
-1. **Deploy the proxy** (one-time, needs a free [Cloudflare](https://dash.cloudflare.com/sign-up)
+- Serves the built dashboard as static assets (`build/`, via `[assets]` in `worker/wrangler.toml`)
+  at `host/ladder` — anything else (root, typos, old links) gets a 302 redirect to `/ladder`.
+- Reverse-proxies poe.ninja/poe.watch with CORS enabled (`/ninja/*`, `/watch/compact`), since
+  Cloudflare only invokes `worker.js`'s own logic for requests that don't match a static asset.
+
+1. **Deploy the Worker** (one-time, needs a free [Cloudflare](https://dash.cloudflare.com/sign-up)
    account and the [`wrangler`](https://developers.cloudflare.com/workers/wrangler/) CLI):
    ```bash
    cd worker
    wrangler deploy
    ```
-   This prints your Worker's URL, e.g. `https://boss-farm-calculator.<you>.workers.dev`.
+   This prints the Worker's URL, e.g. `https://boss-farm-calculator.<you>.workers.dev`.
 
-2. **Generate the static page** — `ENTITIES` in `boss.py` stays the single source of truth;
+2. **Generate the static build** — `ENTITIES` in `boss.py` stays the single source of truth;
    this reads it directly and embeds it, it isn't duplicated anywhere:
    ```bash
-   python build_static.py --worker-url https://boss-farm-calculator.<you>.workers.dev
-   # optional: --league Standard --poll 120 --out docs
-
-
-   full command
-   python build_static.py --worker-url https://boss-farm-calculator.ericklucio-suv.workers.dev --league Allflame --poll 120 --out docs
+   python build_static.py --worker-url https://boss-farm-calculator.<you>.workers.dev --league Allflame --poll 120 --out build
    ```
-   This writes `docs/index.html` (plus `docs/.nojekyll`).
+   Writes `build/ladder/index.html` (the dashboard) and `build/index.html` (a redirect stub —
+   Cloudflare's static-asset layer does its own "look for index.html" check at the bare root that
+   bypasses `worker.js` entirely, so a real file there is needed). `build/` is generated output,
+   kept separate from `docs/` (real documentation, e.g. the screenshot above).
 
-3. **Commit and push** `docs/`, then in the repo's GitHub settings: **Settings → Pages →
-   Deploy from a branch → `main` / `/docs`**.
+3. **Redeploy** so the Worker picks up the new build: `cd worker && wrangler deploy` (or push, if
+   Git-connected auto-deploy is set up in the Cloudflare dashboard — see `worker/wrangler.toml`'s
+   `[build]` block).
 
-Re-run step 2 (and re-push) whenever `ENTITIES` changes — there's no CI/auto-rebuild, this is a
-manual regenerate step by design.
+Re-run step 2 (and redeploy) whenever `ENTITIES` changes — there's no CI/auto-rebuild of the
+*build itself*, this is a manual regenerate step by design.
 
 ## Features
 
@@ -67,6 +71,8 @@ manual regenerate step by design.
 - **Access-type and invulnerability-phase badges** (🗺️ map-navigation required / ⚡ direct spawn, 🛡️ has an invulnerable phase) — shown only where actually verified, never a guessed default.
 - **Realistic pricing, not lucky-roll fantasy numbers**: for items whose value depends on a random roll (corrupted-implicit weapons, jewel affix combos), the EV uses the realistic floor price — [poe.watch](https://poe.watch)'s dedicated "Unidentified" price when published, otherwise the lowest of poe.ninja's per-roll listings — with the identified ceiling shown separately (`↑850c`) rather than baked into the average.
 - **EN / PT-BR UI**, dropdown in the header. Only interface labels and explanations translate — boss names, item names, and every number are exactly what poe.ninja/poe.watch/poewiki report, in either language.
+- **League switcher** in the header — reprices everything against any league (defaults to the server's/build's configured league, plus Standard/Hardcore/current-Hardcore as quick picks) without restarting or rebuilding.
+- **Dark / light theme toggle** in the header, persisted across reloads (defaults to your OS's light/dark preference the first time).
 - **Rich hover explanations** on every stat and control — not a one-line browser tooltip, an actual explanation of the mechanic and the math behind the number.
 - Left sidebar with a live-updating summary of every boss's worst/avg/best, click to jump straight to its card.
 
