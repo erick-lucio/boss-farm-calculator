@@ -1139,11 +1139,14 @@ button.sync:disabled, button.stop:disabled{opacity:.4; cursor:default}
 
 .snipe-log{display:flex; flex-direction:column; gap:6px; margin-top:10px;
   max-height:340px; overflow-y:auto}
-.snipe-log-row{display:flex; align-items:center; gap:10px; background:var(--panel);
+.snipe-log-row{display:flex; flex-direction:column; gap:3px; background:var(--panel);
   border:1px solid var(--line); border-radius:3px; padding:7px 12px; font-size:12px}
+.snipe-log-row .row-main{display:flex; align-items:center; gap:10px}
 .snipe-log-row img{width:24px; height:24px; object-fit:contain; flex:0 0 auto}
 .snipe-log-row .nm{flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
   font-family:"Spectral",Georgia,serif}
+.snipe-log-row .dbg{font-family:ui-monospace,monospace; font-size:10px; color:var(--ink-dim);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:.7; padding-left:34px}
 .snipe-log-row .prices{font-family:ui-monospace,monospace; font-size:11px; color:var(--ink-dim);
   white-space:nowrap}
 .snipe-log-row .prices b{color:var(--ink); font-weight:600}
@@ -2248,8 +2251,10 @@ function renderLogRow(chk){
   const actualTxt = chk.cheapestChaosEquiv != null
     ? `${chk.cheapestAmount} ${escAttr(chk.cheapestCurrency)} (~${chk.cheapestChaosEquiv}c)`
     : `<span class="none">${t('snipe_log_none_found')}</span>`;
-  div.innerHTML = `${img}<span class="nm">${escAttr(chk.name)}</span>
-    <span class="prices">ref ${refTxt} &rarr; <b>${actualTxt}</b></span>`;
+  const dbg = (chk.cheapestChaosEquiv == null && chk.debug)
+    ? `<div class="dbg">${escAttr(chk.debug)}</div>` : '';
+  div.innerHTML = `<div class="row-main">${img}<span class="nm">${escAttr(chk.name)}</span>
+    <span class="prices">ref ${refTxt} &rarr; <b>${actualTxt}</b></span></div>${dbg}`;
   return div;
 }
 
@@ -2258,12 +2263,15 @@ function renderLogRow(chk){
 // `cheapestChaosEquiv` is the actual cheapest currently-listed price found
 // live on pathofexile.com/trade just now — logged so it's visible exactly
 // which item was checked and how its live price compares to the reference.
+// `debug` (set server-side whenever no price was found) explains *why* —
+// a trade-API HTTP error, an empty search result, or an unparseable
+// listing — instead of leaving an unexplained zero.
 function logCheck(chk){
   console.log(
     `[Trade Sniper] checked "${chk.name}" — reference (poe.ninja floor): ~${Math.round(chk.referenceChaos)}c` +
     (chk.cheapestChaosEquiv != null
-      ? ` | cheapest live listing: ${chk.cheapestAmount} ${chk.cheapestCurrency} (~${chk.cheapestChaosEquiv}c, ${chk.listingsSeen} listing(s) seen)` + (chk.underpriced ? ' — UNDERPRICED HIT' : ''
-      ) : ' | no live listings found'),
+      ? ` | cheapest live listing: ${chk.cheapestAmount} ${chk.cheapestCurrency} (~${chk.cheapestChaosEquiv}c, ${chk.listingsSeen} listing(s) seen)` + (chk.underpriced ? ' — UNDERPRICED HIT' : '')
+      : ` | no price found${chk.debug ? ' — ' + chk.debug : ''}`),
     chk
   );
   const list = document.getElementById('snipeLog');

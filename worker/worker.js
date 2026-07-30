@@ -137,7 +137,7 @@ export class SnipeSession {
       name: item.name, icon: item.icon || null,
       referenceChaos: item.chaos, checkedAt: Date.now(),
       listingsSeen: 0, cheapestAmount: null, cheapestCurrency: null, cheapestChaosEquiv: null,
-      underpriced: false,
+      underpriced: false, debug: null,
     };
     let searchResp;
     try {
@@ -146,10 +146,20 @@ export class SnipeSession {
         headers: { "Content-Type": "application/json", "User-Agent": TRADE_UA },
         body: JSON.stringify({ query: { status: { option: "online" }, name: item.name }, sort: { price: "asc" } }),
       });
-    } catch (e) { this.pushLog(logEntry); return; }
-    if (!searchResp.ok) { this.pushLog(logEntry); return; }
+    } catch (e) { logEntry.debug = `search request threw: ${e}`; this.pushLog(logEntry); return; }
+    if (!searchResp.ok) {
+      let snippet = "";
+      try { snippet = (await searchResp.text()).slice(0, 200); } catch (e) {}
+      logEntry.debug = `search HTTP ${searchResp.status} ${searchResp.statusText}: ${snippet}`;
+      this.pushLog(logEntry); return;
+    }
     const searchData = await searchResp.json();
-    if (!searchData.id || !Array.isArray(searchData.result) || !searchData.result.length) { this.pushLog(logEntry); return; }
+    if (!searchData.id || !Array.isArray(searchData.result) || !searchData.result.length) {
+      logEntry.debug = searchData.error
+        ? `search error: ${JSON.stringify(searchData.error)}`
+        : "search OK, 0 listings currently online for this item";
+      this.pushLog(logEntry); return;
+    }
 
     const ids = searchData.result.slice(0, 5).join(",");
     let fetchResp;
@@ -157,9 +167,15 @@ export class SnipeSession {
       fetchResp = await fetch(`https://www.pathofexile.com/api/trade/fetch/${ids}?query=${searchData.id}`, {
         headers: { "User-Agent": TRADE_UA },
       });
-    } catch (e) { this.pushLog(logEntry); return; }
-    if (!fetchResp.ok) { this.pushLog(logEntry); return; }
+    } catch (e) { logEntry.debug = `fetch request threw: ${e}`; this.pushLog(logEntry); return; }
+    if (!fetchResp.ok) {
+      let snippet = "";
+      try { snippet = (await fetchResp.text()).slice(0, 200); } catch (e) {}
+      logEntry.debug = `fetch HTTP ${fetchResp.status} ${fetchResp.statusText}: ${snippet}`;
+      this.pushLog(logEntry); return;
+    }
     const fetchData = await fetchResp.json();
+    if (fetchData.error) logEntry.debug = `fetch error: ${JSON.stringify(fetchData.error)}`;
 
     for (const r of (fetchData.result || [])) {
       if (!r || !r.listing || !r.listing.price) continue;
@@ -191,6 +207,9 @@ export class SnipeSession {
       });
     }
     if (this.buffer.length > 200) this.buffer = this.buffer.slice(-200);
+    if (!logEntry.debug && logEntry.listingsSeen === 0) {
+      logEntry.debug = `fetch returned ${(fetchData.result || []).length} result(s), none had a usable price/currency`;
+    }
     this.pushLog(logEntry);
   }
 
@@ -315,7 +334,7 @@ export default {
         });
         const data = await doResp.json();
         if (!data.ok) return withCors(JSON.stringify(data), doResp.status);
-        return withCors(JSON.stringify({ ok: true, session: token }), 200);
+        return withCors(JSON.stringify({ ok: true, session: token, watchlistSize: data.watchlistSize }), 200);
       } else {
         const token = payload.session;
         if (!token) return withCors(JSON.stringify({ ok: false, error: "missing session" }), 400);
