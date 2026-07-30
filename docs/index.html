@@ -1,740 +1,4 @@
-#!/usr/bin/env python3
-"""
-poe_boss_dashboard.py
----------------------
-LIVE web dashboard for pinnacle boss economy (PoE 1).
-
-Each boss and its UBER version are separate entities (own card), since they
-have different entry items and loot pools. Runs a local server that proxies
-the poe.ninja API (avoids CORS) and serves a page with:
-  - item icons (web.poecdn.com) + direct link to poe.ninja
-  - price in chaos + divine conversion, using the realistic floor price for
-    roll-dependent uniques (poe.watch's "Unidentified" price when published,
-    else the lowest of poe.ninja's per-roll listings) instead of an arbitrary
-    high-roll outlier
-  - entry cost (with quantity; uber uses 4 fragments)
-  - loot pool with chance per item (real, from poewiki, when available; else est.)
-  - estimated profit per run = drop EV - entry cost
-  - ranking by profit + AUTO-REFRESH
-
-Zero dependencies (stdlib Python 3).
-
-Usage:
-    python poe_boss_dashboard.py
-    python poe_boss_dashboard.py --league Standard --port 8000 --poll 120
-"""
-
-import argparse
-import concurrent.futures
-import json
-import re
-import threading
-import time
-import urllib.parse
-import urllib.request
-import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-# --------------------------------------------------------------------------- #
-# Config
-# --------------------------------------------------------------------------- #
-BASE = "https://poe.ninja/poe1/api/economy"
-# poe.ninja has TWO price feeds for the same items, and they diverge:
-#   stash    = listing prices (stash/web) — what the site usually shows
-#   exchange = bulk currency-exchange prices — usually cheaper
-# A divergence of tens of chaos on a fragment is normal between the two.
-CURRENCY_URL = BASE + "/stash/current/currency/overview"
-EXCHANGE_URL = BASE + "/exchange/current/overview"
-ITEM_URL = BASE + "/stash/current/item/overview"
-
-# poe.ninja lists ONE row per (name, variant) — items whose value depends on a
-# random roll (corrupted implicits, jewel affix combos) get several rows under
-# the same name at wildly different prices. poe.watch additionally publishes a
-# dedicated "Unidentified <name> <ilvl>" row for some of those — the actual
-# floor price the item sells for as-dropped, before anyone rolls/identifies it.
-WATCH_URL = "https://api.poe.watch/compact"
-
-# Manual price fix (chaos) — overrides everything, e.g. "Devouring Fragment": 120.0
-PRICE_OVERRIDE = {}
-
-UA = "boss-dashboard/1.0 (contact: you@example.com)"
-CACHE_TTL = 300
-
-ITEM_CATEGORIES = ["UniqueWeapon", "UniqueArmour", "UniqueAccessory",
-                   "UniqueJewel", "UniqueFlask", "Invitation", "Map"]
-
-# Currency/Fragment go through the Exchange+Stash feeds (see build_index); so
-# does Astrolabe — poe.ninja only prices it via Exchange, but the shape is
-# identical (items[]+lines[] with a primaryValue), so it merges the same way.
-EXCHANGE_CATEGORIES = ["Currency", "Fragment", "Astrolabe"]
-
-OVERVIEW_SLUG = {
-    "Currency": "currency", "Fragment": "fragments",
-    "UniqueWeapon": "unique-weapons", "UniqueArmour": "unique-armours",
-    "UniqueAccessory": "unique-accessories", "UniqueJewel": "unique-jewels",
-    "UniqueFlask": "unique-flasks", "Invitation": "invitations",
-    "Map": "maps", "Astrolabe": "astrolabes",
-}
-
-UBER_FRAG_QTY = 4
-DEFAULT_CHANCE = 0.05
-
-# Astrolabes (Threads of the Originator / Originator Voidstone, added in this
-# tool alongside the 3.28 mechanic): 10 named types, one per Atlas region
-# encounter type. Requires completing "Threads of the Originator" and
-# socketing the Originator Voidstone into the Atlas; doesn't drop in areas
-# already affected by a Shaped Region (not modeled here — same simplification
-# as every other prerequisite-gated unlock in this tool, e.g. reaching a
-# pinnacle fight at all). Memory bosses (the 3 Incarnations) guarantee
-# exactly one of these 10 per kill; other Atlas/map bosses only have a
-# chance. Confirmed real, currently-traded poe.ninja category (type=Astrolabe,
-# Exchange feed only) — not to be confused with "Venarius' Astrolabe", an
-# unrelated pre-existing UniqueAccessory already in this file's Incarnation
-# of Neglect pools.
-ASTROLABE_TYPES = ["Fruiting Astrolabe", "Deceptive Astrolabe", "Templar Astrolabe",
-                   "Lightless Astrolabe", "Runic Astrolabe", "Grasping Astrolabe",
-                   "Fungal Astrolabe", "Nameless Astrolabe", "Chaotic Astrolabe",
-                   "Timeless Astrolabe"]
-# Sums to 1.0 — memory bosses guarantee exactly one Astrolabe per kill.
-ASTROLABE_GUARANTEED = [(nm, "Astrolabe", 0.10, "est") for nm in ASTROLABE_TYPES]
-# Curated low estimate (GGG publishes no rate) for the map-boss chance source.
-ASTROLABE_MAP_CHANCE = [(nm, "Astrolabe", 0.005, "est") for nm in ASTROLABE_TYPES]
-
-# --------------------------------------------------------------------------- #
-# ENTITIES: each boss and its uber version are SEPARATE entries.
-#   entry: list of (name, type, quantity) consumed to open the fight
-#   drops: list of (name, type, chance, source[, qty]) — qty is the number of
-#     units received when it drops (default 1; e.g. Eldritch Embers/Ichors
-#     commonly drop 2-3 at once), factored into EV as chance * price * qty.
-#     source: "wiki" (real) | "est"
-# "wiki" chances come from poewiki (with sample size/patch noted in-line where
-# relevant); "est" is a curated estimate — GGG does not publish official drop %.
-#   quant_mod: True for fights whose loot can be boosted by a player-chosen
-#     "increased quantity of items found" source — Eldritch Altars (normal
-#     Searing Exarch / Eater of Worlds only, their Ubers open with pure
-#     fragments and can't be buffed) or map IIQ (T17 Nightmare maps). The
-#     frontend exposes an adjustable multiplier instead of a hardcoded
-#     percentage, since the actual buff stacked varies per run.
-#   access: "direct" (spawn straight in the boss room) or "map" (some
-#     navigation/traversal needed first) — omitted where not verified.
-#   invuln: short description of an invulnerability/untargetable phase, or
-#     omitted if none / not verified. Sourced from poewiki/poedb/maxroll
-#     boss guides; see change history for per-boss verification notes.
-# --------------------------------------------------------------------------- #
-ENTITIES = [
-    # ------------------------------- Shaper -------------------------------- #
-    {"name": "The Shaper", "tier": "normal", "access": "map",
-     "entry": [("Fragment of the Phoenix", "Fragment", 1),
-               ("Fragment of the Minotaur", "Fragment", 1),
-               ("Fragment of the Hydra", "Fragment", 1),
-               ("Fragment of the Chimera", "Fragment", 1)],
-     "drops": [("Shaper's Exalted Orb", "Currency", 0.12, "est"),
-               ("Starforge", "UniqueWeapon", 0.06, "est"),
-               ("Disintegrator", "UniqueWeapon", 0.05, "est"),
-               ("The Rippling Thoughts", "UniqueArmour", 0.05, "est")]},
-    {"name": "Uber Shaper", "tier": "uber", "access": "map",
-     "entry": [("Cosmic Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Cosmic Reliquary Key", "Fragment", 0.05, "est"),
-               ("Shaper's Exalted Orb", "Currency", 0.12, "est"),
-               ("The Rippling Thoughts", "UniqueArmour", 0.06, "est")]},
-
-    # ------------------------------- Elder --------------------------------- #
-    {"name": "The Shaper & Elder", "tier": "normal", "wiki": "The Elder", "access": "map",
-     "entry": [("Fragment of Knowledge", "Fragment", 1),
-               ("Fragment of Terror", "Fragment", 1),
-               ("Fragment of Emptiness", "Fragment", 1),
-               ("Fragment of Shape", "Fragment", 1)],
-     "drops": [("Watcher's Eye", "UniqueJewel", 0.30, "est"),
-               ("Elder's Exalted Orb", "Currency", 0.12, "est"),
-               ("Shaper's Exalted Orb", "Currency", 0.10, "est")]},
-    {"name": "Uber Elder", "tier": "uber", "access": "map",
-     "entry": [("Decaying Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Decaying Reliquary Key", "Fragment", 0.05, "est"),
-               ("Watcher's Eye", "UniqueJewel", 0.40, "est"),
-               ("Elder's Exalted Orb", "Currency", 0.12, "est")]},
-
-    # ------------------------------- Sirus --------------------------------- #
-    {"name": "Sirus, Awakener", "tier": "normal", "wiki": "Sirus, Awakener of Worlds",
-     "invuln": "splits into 4 illusions during Die Beam — only the real Sirus is attackable, the rest aren't",
-     "entry": [("Al-Hezmin's Crest", "Fragment", 1),
-               ("Baran's Crest", "Fragment", 1),
-               ("Drox's Crest", "Fragment", 1),
-               ("Veritania's Crest", "Fragment", 1)],
-     "drops": [("Awakener's Orb", "Currency", 0.15, "est"),
-               ("The Burden of Truth", "UniqueAccessory", 0.05, "est"),
-               ("Crown of the Inward Eye", "UniqueArmour", 0.05, "est"),
-               ("Hands of the High Templar", "UniqueArmour", 0.05, "est")]},
-    {"name": "Uber Sirus", "tier": "uber",
-     "invuln": "splits into 4 illusions during Die Beam — only the real Sirus is attackable, the rest aren't",
-     "entry": [("Awakening Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Oubliette Reliquary Key", "Fragment", 0.05, "est"),
-               ("Awakener's Orb", "Currency", 0.15, "est"),
-               ("The Saviour", "UniqueWeapon", 0.03, "est")]},
-
-    # ------------------------------- Maven --------------------------------- #
-    {"name": "The Maven", "tier": "normal",
-     "invuln": "Memory Game — invulnerable while you repeat a lit pattern; a wrong step speeds up a lethal channel",
-     "entry": [("The Maven's Writ", "Fragment", 1)],
-     "drops": [("Maven's Orb", "Currency", 0.12, "est"),
-               ("Orb of Dominance", "Currency", 0.05, "est")]},
-    {"name": "Uber Maven", "tier": "uber",
-     "invuln": "Memory Game — invulnerable while you repeat a lit pattern; a wrong step speeds up a lethal channel",
-     "entry": [("Reality Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Shiny Reliquary Key", "Fragment", 0.05, "est"),
-               ("Maven's Orb", "Currency", 0.12, "est"),
-               ("Orb of Dominance", "Currency", 0.08, "est"),
-               ("Viridi's Veil", "UniqueArmour", 0.04, "est"),
-               ("Impossible Escape", "UniqueJewel", 0.04, "est"),
-               ("Progenesis", "UniqueFlask", 0.02, "est"),
-               ("Grace of the Goddess", "UniqueWeapon", 0.03, "est"),
-               ("Curio of Potential", "UniqueAccessory", 0.05, "est")]},
-
-    # --------------------------- Searing Exarch ---------------------------- #
-    {"name": "The Searing Exarch", "tier": "normal", "quant_mod": True, "access": "direct",
-     "invuln": "Meteor Wall at ≤50% HP — invulnerable while unleashing meteors; destroy them to open a gap (1x)",
-     "entry": [("Incandescent Invitation", "Invitation", 1)],
-     "drops": [("Grand Eldritch Ember", "Currency", 0.30, "est"),
-               ("Exceptional Eldritch Ember", "Currency", 0.15, "est"),
-               ("Eldritch Exalted Orb", "Currency", 0.05, "est"),
-               ("Eldritch Orb of Annulment", "Currency", 0.05, "est"),
-               ("Eldritch Chaos Orb", "Currency", 0.05, "est"),
-               ("Orb of Conflict", "Currency", 0.10, "est"),
-               ("Forbidden Flame", "UniqueJewel", 0.05, "est")]},
-    {"name": "Uber Searing Exarch", "tier": "uber", "access": "direct",
-     "invuln": "Meteor Wall at ≤50% HP — invulnerable while unleashing meteors; destroy them to open a gap (1x, harsher)",
-     "entry": [("Blazing Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Archive Reliquary Key", "Fragment", 0.05, "est"),
-               ("Forbidden Flame", "UniqueJewel", 0.05, "est"),
-               ("Annihilation's Approach", "UniqueArmour", 0.04, "est"),
-               ("Crystallised Omniscience", "UniqueAccessory", 0.03, "est"),
-               ("Curio of Absorption", "UniqueAccessory", 0.05, "est"),
-               ("The Annihilating Light", "UniqueWeapon", 0.03, "est")]},
-
-    # ------------------- Eater of Worlds (poewiki, real) ------------------- #
-    # https://www.poewiki.net/wiki/The_Eater_of_Worlds  (v3.26-3.27, n~625r/695u)
-    {"name": "The Eater of Worlds", "tier": "normal", "quant_mod": True, "access": "map",
-     "invuln": "Inescapable Doom at 75% HP — invulnerable while channeling a lethal blast; activate spheres to interrupt (1x)",
-     "entry": [("Screaming Invitation", "Invitation", 1)],
-     "drops": [("Exceptional Eldritch Ichor", "Currency", 0.15, "wiki"),
-               ("Eldritch Exalted Orb", "Currency", 0.05, "wiki"),
-               ("Eldritch Orb of Annulment", "Currency", 0.05, "wiki"),
-               ("Eldritch Chaos Orb", "Currency", 0.05, "wiki"),
-               ("Forbidden Flesh", "UniqueJewel", 0.05, "wiki")]},
-    {"name": "Uber Eater of Worlds", "tier": "uber", "access": "map",
-     "invuln": "Inescapable Doom at 75% HP — invulnerable while channeling a lethal blast; activate spheres to interrupt (1x, harsher)",
-     "entry": [("Devouring Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Ravenous Passion", "UniqueArmour", 0.68, "wiki"),
-               ("Ashes of the Stars", "UniqueAccessory", 0.30, "wiki"),
-               ("Nimis", "UniqueAccessory", 0.02, "wiki"),
-               ("Curio of Consumption", "Fragment", 0.05, "wiki"),
-               ("Visceral Reliquary Key", "Fragment", 0.01, "wiki"),
-               ("Forbidden Flesh", "UniqueJewel", 0.05, "wiki")]},
-
-    # --------------------------- Venarius / Cortex ------------------------- #
-    {"name": "Venarius (Cortex)", "tier": "normal", "wiki": "Cortex (map)", "access": "direct",
-     "invuln": "Venarius is never the actual target — you fight summoned Synthete adds for the whole encounter",
-     "entry": [],
-     "drops": [("Garb of the Ephemeral", "UniqueArmour", 0.05, "est")]},
-    {"name": "Uber Cortex", "tier": "uber", "access": "direct",
-     "invuln": "Venarius is never the actual target — you fight summoned Synthete adds for the whole encounter",
-     "entry": [("Synthesising Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Forgotten Reliquary Key", "Fragment", 0.05, "est"),
-               ("Mask of the Tribunal", "UniqueArmour", 0.04, "est"),
-               ("Nebulis", "UniqueWeapon", 0.04, "est"),
-               ("Rational Doctrine", "UniqueJewel", 0.02, "est"),
-               ("Circle of Ambition", "UniqueAccessory", 0.04, "est"),
-               ("The Apostate", "UniqueArmour", 0.04, "est")]},
-
-    # ------------------------------- Atziri -------------------------------- #
-    {"name": "Atziri, Queen of the Vaal", "tier": "normal", "access": "map",
-     "invuln": "Minion Phase — shields herself and becomes invulnerable while spawning health-draining monsters (1x)",
-     "entry": [("Sacrifice at Dusk", "Fragment", 1),
-               ("Sacrifice at Midnight", "Fragment", 1),
-               ("Sacrifice at Dawn", "Fragment", 1),
-               ("Sacrifice at Noon", "Fragment", 1)],
-     "drops": [("Pledge of Hands", "UniqueWeapon", 0.05, "est"),
-               ("Atziri's Promise", "UniqueFlask", 0.10, "est"),
-               ("Atziri's Step", "UniqueArmour", 0.08, "est"),
-               ("Doryani's Invitation", "UniqueAccessory", 0.06, "est")]},
-    {"name": "Uber Atziri", "tier": "uber", "access": "map",
-     "invuln": "Minion Phase (1x) + splits into 4 copies at 75/50/25% HP — only one is the real target (up to 4x total)",
-     "entry": [("Mortal Grief", "Fragment", 1), ("Mortal Rage", "Fragment", 1),
-               ("Mortal Ignorance", "Fragment", 1), ("Mortal Hope", "Fragment", 1)],
-     "drops": [("Atziri's Disfavour", "UniqueWeapon", 0.06, "est"),
-               ("Atziri's Acuity", "UniqueAccessory", 0.06, "est"),
-               ("Atziri's Splendour", "UniqueArmour", 0.10, "est"),
-               ("The Vertex", "UniqueArmour", 0.05, "est")]},
-
-    # ----------------- Incarnations (Secrets of the Atlas) ----------------- #
-    # Pools/tiers from Maxroll; % still estimated (adjust against poewiki).
-    # Confirmed direct spawn, no invulnerability phase, for all 3 (normal+uber).
-    {"name": "Incarnation of Fear", "tier": "normal", "access": "direct",
-     "entry": [("Echo of Trauma", "Currency", 1)],
-     "drops": [("Orb of Intention", "Currency", 0.12, "est"),
-               ("Starcaller", "UniqueWeapon", 0.35, "est"),
-               ("Coiling Whisper", "UniqueAccessory", 0.30, "est"),
-               ("Servant of Decay", "UniqueAccessory", 0.20, "est"),
-               ("Enmity's Embrace", "UniqueAccessory", 0.08, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
-               *ASTROLABE_GUARANTEED]},
-    {"name": "Uber Incarnation of Fear", "tier": "uber", "access": "direct",
-     "entry": [("Traumatic Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Traumatic Reliquary Key", "Fragment", 0.05, "est"),
-               ("Orb of Intention", "Currency", 0.12, "est"),
-               ("Starcaller", "UniqueWeapon", 0.35, "est"),
-               ("Coiling Whisper", "UniqueAccessory", 0.30, "est"),
-               ("Servant of Decay", "UniqueAccessory", 0.20, "est"),
-               ("Enmity's Embrace", "UniqueAccessory", 0.08, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
-               *ASTROLABE_GUARANTEED]},
-    {"name": "Incarnation of Dread", "tier": "normal", "access": "direct",
-     "entry": [("Echo of Reverence", "Currency", 1)],
-     "drops": [("Orb of Unravelling", "Currency", 0.12, "est"),
-               ("Whispers of Infinity", "UniqueAccessory", 0.45, "est"),
-               ("The Dark Monarch", "UniqueArmour", 0.45, "est"),
-               ("Seven Teachings", "UniqueAccessory", 0.08, "est"),
-               ("Wine of the Prophet", "UniqueFlask", 0.02, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
-               *ASTROLABE_GUARANTEED]},
-    {"name": "Uber Incarnation of Dread", "tier": "uber", "access": "direct",
-     "entry": [("Reverent Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Reverent Reliquary Key", "Fragment", 0.05, "est"),
-               ("Orb of Unravelling", "Currency", 0.12, "est"),
-               ("Whispers of Infinity", "UniqueAccessory", 0.45, "est"),
-               ("The Dark Monarch", "UniqueArmour", 0.45, "est"),
-               ("Seven Teachings", "UniqueAccessory", 0.08, "est"),
-               ("Wine of the Prophet", "UniqueFlask", 0.02, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
-               *ASTROLABE_GUARANTEED]},
-    {"name": "Incarnation of Neglect", "tier": "normal", "access": "direct",
-     "entry": [("Echo of Loneliness", "Currency", 1)],
-     "drops": [("Orb of Remembrance", "Currency", 0.12, "est"),
-               ("Betrayal's Sting", "UniqueAccessory", 0.45, "est"),
-               ("Arkhon's Tools", "UniqueAccessory", 0.45, "est"),
-               ("Venarius' Astrolabe", "UniqueAccessory", 0.08, "est"),
-               ("Legacy of the Rose", "UniqueWeapon", 0.02, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
-               *ASTROLABE_GUARANTEED]},
-    {"name": "Uber Incarnation of Neglect", "tier": "uber", "access": "direct",
-     "entry": [("Lonely Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Lonely Reliquary Key", "Fragment", 0.05, "est"),
-               ("Orb of Remembrance", "Currency", 0.12, "est"),
-               ("Betrayal's Sting", "UniqueAccessory", 0.45, "est"),
-               ("Arkhon's Tools", "UniqueAccessory", 0.45, "est"),
-               ("Venarius' Astrolabe", "UniqueAccessory", 0.08, "est"),
-               ("Legacy of the Rose", "UniqueWeapon", 0.02, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
-               *ASTROLABE_GUARANTEED]},
-
-    # -------------------- T17 Nightmare Maps (area level 84) ----------------- #
-    # Each T17 map has a Nightmare boss (nightmare version of the original boss).
-    # Drops: uber fragments exclusive to that map's pool + 1 exclusive unique.
-    # Entry: the T17 map itself (no tradeable fragment modeled in this tool).
-    # Pool sources: poedb.tw + maxroll.gg/poe/currency/tier-17-boss-rushing
-    # quant_mod: T17 fragment yield scales with map IIQ — base drop (no IIQ
-    # affix) is always 1-3 fragments/kill; 2-3 at 235-250% IIQ; 2-4 at 250%+
-    # (averaging ~2.5/kill at 235%+ IIQ). Multiple fragment TYPES can also
-    # drop simultaneously, each in qty >1 (real example: one Ziggurat run
-    # dropped 1x Blazing + 3x Devouring). No official per-fragment %, so —
-    # like the Eldritch Altar control — this is exposed as a user-adjustable
-    # multiplier rather than a hardcoded number.
-
-    # -------------- Abomination — Nightmare of the Depraved Trinity ---------- #
-    {"name": "Abomination - Depraved Trinity", "tier": "nightmare", "wiki": "Abomination Map",
-     "access": "map", "quant_mod": True,
-     "entry": [("Nightmare Map", "Map", 1)],
-     "drops": [("Reality Fragment", "Fragment", 0.40, "est"),
-               ("Blazing Fragment", "Fragment", 0.25, "est"),
-               ("Synthesising Fragment", "Fragment", 0.25, "est"),
-               ("Traumatic Fragment", "Fragment", 0.20, "est"),
-               ("Malachai's Mark", "UniqueAccessory", 0.04, "est"),
-               *ASTROLABE_MAP_CHANCE]},
-
-    # ------------------ Citadel — Nightmare of Uhtred ----------------------- #
-    {"name": "Citadel - Uhtred", "tier": "nightmare", "wiki": "Citadel Map",
-     "access": "map", "quant_mod": True,
-     "invuln": "boss submerges and becomes untargetable, then re-emerges — repeats through the fight",
-     "entry": [("Nightmare Map", "Map", 1)],
-     "drops": [("Cosmic Fragment", "Fragment", 0.35, "est"),
-               ("Decaying Fragment", "Fragment", 0.30, "est"),
-               ("Traumatic Fragment", "Fragment", 0.25, "est"),
-               ("Lonely Fragment", "Fragment", 0.20, "est"),
-               ("Manastorm", "UniqueWeapon", 0.04, "est"),
-               *ASTROLABE_MAP_CHANCE]},
-
-    # ----------------- Fortress — Nightmare of the Unbreakable -------------- #
-    {"name": "Fortress - The Unbreakable", "tier": "nightmare", "wiki": "Fortress Map",
-     "access": "map", "quant_mod": True,
-     "entry": [("Nightmare Map", "Map", 1)],
-     "drops": [("Lonely Fragment", "Fragment", 0.35, "est"),
-               ("Decaying Fragment", "Fragment", 0.30, "est"),
-               ("Cosmic Fragment", "Fragment", 0.25, "est"),
-               ("Awakening Fragment", "Fragment", 0.20, "est"),
-               ("Yoke of Suffering", "UniqueAccessory", 0.04, "est"),
-               *ASTROLABE_MAP_CHANCE]},
-
-    # ----------------- Sanctuary — Nightmare of Lycia ----------------------- #
-    {"name": "Sanctuary - Lycia", "tier": "nightmare", "wiki": "Sanctuary Map",
-     "access": "map", "quant_mod": True,
-     "entry": [("Nightmare Map", "Map", 1)],
-     "drops": [("Devouring Fragment", "Fragment", 0.40, "est"),
-               ("Blazing Fragment", "Fragment", 0.30, "est"),
-               ("Awakening Fragment", "Fragment", 0.25, "est"),
-               ("Reverent Fragment", "Fragment", 0.20, "est"),
-               ("The Dark Seer", "UniqueWeapon", 0.04, "est"),
-               *ASTROLABE_MAP_CHANCE]},
-
-    # ----------------- Ziggurat — Nightmare of Catarina --------------------- #
-    {"name": "Ziggurat - Catarina", "tier": "nightmare", "wiki": "Ziggurat Map",
-     "access": "map", "quant_mod": True,
-     "invuln": "reportedly has invincibility phases per community guides, exact mechanic undocumented",
-     "entry": [("Nightmare Map", "Map", 1)],
-     "drops": [("Reality Fragment", "Fragment", 0.35, "est"),
-               ("Devouring Fragment", "Fragment", 0.35, "est"),
-               ("Synthesising Fragment", "Fragment", 0.25, "est"),
-               ("Reverent Fragment", "Fragment", 0.20, "est"),
-               ("Wraithlord", "UniqueArmour", 0.04, "est"),
-               *ASTROLABE_MAP_CHANCE]},
-]
-
-# --------------------------------------------------------------------------- #
-# Data collection (with cache)
-# --------------------------------------------------------------------------- #
-_cache = {}
-_index_cache = {}
-_lock = threading.Lock()
-
-
-def slugify(name):
-    s = name.lower().replace("'", "")
-    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    return s
-
-
-def _get_json(url, league, typ):
-    now = time.time()
-    key = (url, league, typ)
-    with _lock:
-        c = _cache.get(key)
-        if c and now - c[0] < CACHE_TTL:
-            return c[1]
-    qs = urllib.parse.urlencode({"league": league, "type": typ})
-    req = urllib.request.Request(url + "?" + qs, headers={"User-Agent": UA})
-    try:
-        with urllib.request.urlopen(req, timeout=25) as r:
-            data = json.loads(r.read().decode("utf-8"))
-    except Exception as e:
-        print(f"  [warning] {typ}: {e}")
-        data = {"lines": [], "currencyDetails": []}
-    with _lock:
-        _cache[key] = (now, data)
-    time.sleep(0.4)
-    return data
-
-
-_UNIDED_ILVL_SUFFIX = re.compile(r"\s+\d+\+?$")
-
-
-def _get_watch_unidentified(league):
-    """base item name -> lowest poe.watch "Unidentified <name> [ilvl]" price.
-
-    poe.watch splits some roll-dependent uniques (Watcher's Eye, Voices, ...)
-    into separate rows per item-level tier once unidentified, e.g.
-    "Unidentified Watcher's Eye 86+". That's the real floor value the item
-    sells for as-dropped, before anyone rolls/identifies it.
-    """
-    now = time.time()
-    key = ("watch-unided", league)
-    with _lock:
-        c = _cache.get(key)
-        if c and now - c[0] < CACHE_TTL:
-            return c[1]
-    result = {}
-    try:
-        qs = urllib.parse.urlencode({"league": league})
-        req = urllib.request.Request(WATCH_URL + "?" + qs, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=40) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        for it in data.get("items", []):
-            nm = it.get("name") or ""
-            if not nm.startswith("Unidentified "):
-                continue
-            base = _UNIDED_ILVL_SUFFIX.sub("", nm[len("Unidentified "):])
-            chaos = it.get("min")
-            if chaos is None:
-                chaos = it.get("mean")
-            if chaos is None:
-                continue
-            if base not in result or chaos < result[base]:
-                result[base] = chaos
-    except Exception as e:
-        print(f"  [warning] poe.watch unidentified prices: {e}")
-    with _lock:
-        _cache[key] = (now, result)
-    return result
-
-
-def build_index(league):
-    """(name, type) -> {chaos, chaos_max, chaos_n, chaos_alt, divine, icon,
-    detailsId, type, chaos_unided}.
-
-    Keyed by (name, type) because the SAME name appears in different
-    categories on poe.ninja — keying by name alone let one category
-    overwrite another and swap the item's price (mapping bug).
-    chaos     = lowest price seen for this (name, type); with roll-dependent
-                items (corrupted implicits, jewel affixes) poe.ninja returns
-                several rows per name at very different prices, so taking the
-                floor avoids the EV silently picking up a jackpot-roll price.
-    chaos_max = highest price seen — the identified/best-roll ceiling.
-    chaos_n   = how many priced rows contributed (>1 means "value varies").
-    chaos_alt = stash price (shown as a divergence when exchange also exists)
-    chaos_unided = poe.watch's dedicated "Unidentified <name>" price, when
-                published — the real floor value for an as-dropped item.
-    """
-    now = time.time()
-    with _lock:
-        c = _index_cache.get(league)
-        if c and now - c[0] < CACHE_TTL:
-            return c[1]
-
-    # Fire every external request concurrently instead of one-at-a-time —
-    # 13 poe.ninja calls plus poe.watch's heavy compact feed used to run
-    # fully serial (each with its own timeout + courtesy sleep), so a single
-    # slow/unreachable request could stall the whole page for a long time.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        exchange_fut = {typ: ex.submit(_get_json, EXCHANGE_URL, league, typ)
-                         for typ in EXCHANGE_CATEGORIES}
-        stash_fut = {typ: ex.submit(_get_json, CURRENCY_URL, league, typ)
-                      for typ in EXCHANGE_CATEGORIES}
-        item_fut = {typ: ex.submit(_get_json, ITEM_URL, league, typ)
-                    for typ in ITEM_CATEGORIES}
-        watch_fut = ex.submit(_get_watch_unidentified, league)
-
-        exchange_data = {typ: f.result() for typ, f in exchange_fut.items()}
-        stash_data = {typ: f.result() for typ, f in stash_fut.items()}
-        item_data = {typ: f.result() for typ, f in item_fut.items()}
-        watch_unided = watch_fut.result()
-
-    index = {}
-
-    def put(name, typ, chaos, divine, icon, details, field="chaos"):
-        key = (name, typ)
-        e = index.setdefault(key, {"chaos": None, "chaos_max": None, "chaos_n": 0,
-                                   "chaos_alt": None, "divine": None, "icon": None,
-                                   "detailsId": slugify(name), "type": typ,
-                                   "chaos_unided": None})
-        if chaos is not None:
-            cur = e.get(field)
-            if cur is None or chaos < cur:
-                e[field] = chaos
-                if field == "chaos":
-                    e["divine"] = divine
-            if field == "chaos":
-                e["chaos_max"] = chaos if e["chaos_max"] is None else max(e["chaos_max"], chaos)
-                e["chaos_n"] += 1
-        elif divine is not None and e.get("divine") is None:
-            e["divine"] = divine
-        if icon and not e.get("icon"):
-            e["icon"] = icon
-        if details:
-            e["detailsId"] = details
-
-    # 1) Exchange — primary price (the "chaos" field)
-    # Different structure from the stash API:
-    #   metadata is in "items" (not "currencyDetails"): id, name, detailsId
-    #   price is in "lines": id + primaryValue (no chaosEquivalent/chaosValue)
-    #   "items.image" is a relative path (/gen/image/...) — ignored; icon comes from stash
-    for typ in EXCHANGE_CATEGORIES:
-        data = exchange_data[typ]
-        id_to_meta = {d["id"]: d for d in data.get("items", []) if d.get("id")}
-        for line in data.get("lines", []):
-            item_id = line.get("id")
-            meta = id_to_meta.get(item_id, {})
-            nm = meta.get("name") or line.get("currencyTypeName") or line.get("name")
-            if not nm:
-                continue
-            chaos = line.get("primaryValue")
-            details = meta.get("detailsId") or item_id
-            put(nm, typ, chaos, None, None, details, "chaos")
-
-    # 2) Stash — secondary price (the "chaos_alt" field); becomes "chaos" if exchange has none
-    for typ in EXCHANGE_CATEGORIES:
-        data = stash_data[typ]
-        icons = {d.get("name"): d.get("icon")
-                 for d in data.get("currencyDetails", []) if d.get("name")}
-        for nm, ic in icons.items():
-            put(nm, typ, None, None, ic, None)
-        for line in data.get("lines", []):
-            nm = line.get("currencyTypeName") or line.get("name")
-            if not nm:
-                continue
-            chaos = line.get("chaosEquivalent")
-            if chaos is None:
-                chaos = line.get("chaosValue")
-            put(nm, typ, chaos, line.get("divineValue"), icons.get(nm),
-                line.get("detailsId"), "chaos_alt")
-
-    # Fallback: if exchange has no price, use stash (no divergence shown)
-    for e in index.values():
-        if e["chaos"] is None and e["chaos_alt"] is not None:
-            e["chaos"] = e["chaos_alt"]
-            e["chaos_max"] = e["chaos_alt"]
-            e["chaos_n"] = 1
-            e["chaos_alt"] = None
-
-    # 3) Items (uniques, maps, invitations) — only stash has these feeds
-    for typ in ITEM_CATEGORIES:
-        data = item_data[typ]
-        for line in data.get("lines", []):
-            nm = line.get("name")
-            if not nm:
-                continue
-            chaos = line.get("chaosValue")
-            if chaos is None:
-                chaos = line.get("chaosEquivalent")
-            put(nm, typ, chaos, line.get("divineValue"), line.get("icon"),
-                line.get("detailsId"))
-
-    # poe.watch's dedicated "Unidentified <name>" rows — the real as-dropped
-    # floor price for roll-dependent uniques (e.g. Watcher's Eye), overriding
-    # the poe.ninja floor above when available.
-    for nm, chaos in watch_unided.items():
-        for typ in ITEM_CATEGORIES:
-            e = index.get((nm, typ))
-            if e is not None:
-                e["chaos_unided"] = chaos
-
-    # Manual override wins over everything
-    for (nm, typ), e in index.items():
-        if nm in PRICE_OVERRIDE:
-            e["chaos"] = PRICE_OVERRIDE[nm]
-            e["chaos_unided"] = None
-            e["override"] = True
-
-    with _lock:
-        _index_cache[league] = (now, index)
-    return index
-
-
-def wiki_url(name):
-    return "https://www.poewiki.net/wiki/" + urllib.parse.quote(name.replace(" ", "_"))
-
-
-def lookup(index, name, typ):
-    """Look up by the declared type; if not found, try any category."""
-    e = index.get((name, typ))
-    if e and e.get("chaos") is not None:
-        return e, False
-    for (nm, t), v in index.items():
-        if nm == name and v.get("chaos") is not None:
-            # found under another category -> declared type in ENTITIES is wrong
-            return v, (t != typ)
-    return e or {}, False
-
-
-def build_payload(league):
-    league_slug = league.lower().replace(" ", "-")
-    index = build_index(league)
-    dv, _ = lookup(index, "Divine Orb", "Currency")
-    divine_rate = dv.get("chaos")
-
-    def res(name, typ):
-        info, mismatched = lookup(index, name, typ)
-        rtype = info.get("type", typ)
-        chaos_floor = info.get("chaos")
-        chaos_unided = info.get("chaos_unided")
-        chaos_max = info.get("chaos_max")
-        variants = info.get("chaos_n") or 0
-        if chaos_unided is not None:
-            # poe.watch's dedicated unidentified price beats the poe.ninja
-            # floor — its "divine" belongs to a different priced row, so drop
-            # it and let the frontend derive divine from the live rate.
-            chaos, price_mode, divine = chaos_unided, "unidentified", None
-        else:
-            chaos = chaos_floor
-            price_mode = "variants" if variants > 1 else "single"
-            divine = info.get("divine")
-        alt = info.get("chaos_alt")
-        # divergence between the two poe.ninja feeds (stash vs exchange)
-        diverge = None
-        if chaos_floor and alt and chaos_floor > 0:
-            d = abs(chaos_floor - alt) / chaos_floor
-            if d >= 0.10:
-                diverge = {"alt": alt, "pct": round(d * 100)}
-        if chaos is not None:
-            slug = OVERVIEW_SLUG.get(rtype) or OVERVIEW_SLUG.get(typ, "currency")
-            details = info.get("detailsId") or slugify(name)
-            url = f"https://poe.ninja/poe1/economy/{league_slug}/{slug}/{details}"
-            link_src = "ninja"
-        else:
-            url = wiki_url(name)
-            link_src = "wiki"
-        # only surface chaos_max as an "upside" ceiling when it actually is one —
-        # poe.watch's unidentified price can legitimately sit above poe.ninja's
-        # single identified listing in a young/volatile league
-        has_upside = chaos_max is not None and chaos and chaos_max > chaos * 1.05
-        return {"name": name, "type": rtype, "declared_type": typ,
-                "chaos": chaos, "divine": divine,
-                "chaosMax": chaos_max if has_upside else None,
-                "priceMode": price_mode,
-                "icon": info.get("icon"), "url": url, "link_src": link_src,
-                "diverge": diverge, "type_mismatch": mismatched,
-                "override": bool(info.get("override"))}
-
-    ents = []
-    for e in ENTITIES:
-        eitems, ecost, ehas = [], 0.0, False
-        for name, typ, qty in e["entry"]:
-            r = res(name, typ)
-            r["qty"] = qty
-            eitems.append(r)
-            if r["chaos"] is not None:
-                ecost += r["chaos"] * qty
-                ehas = True
-        entry = {"items": eitems, "total_chaos": ecost if ehas else None}
-
-        ditems, ev, best_item = [], 0.0, 0.0
-        for drop in e["drops"]:
-            name, typ, chance, src = drop[:4]
-            qty = drop[4] if len(drop) > 4 else 1
-            r = res(name, typ)
-            ch = chance if chance is not None else DEFAULT_CHANCE
-            r["chance"] = ch
-            r["chance_src"] = src
-            r["qty"] = qty
-            ditems.append(r)
-            if r["chaos"] is not None:
-                value = r["chaos"] * qty
-                ev += ch * value
-                best_item = max(best_item, value)
-        drops = {"items": ditems, "ev_chaos": ev}
-
-        # A single kill is a lottery, not a guaranteed average: most runs get
-        # nothing from the pool (worst case) or the single best item that
-        # rolled (best case) — NOT every pool item at once, which overstates
-        # pools where only one of several items can ever drop per kill (e.g.
-        # Eater of Worlds' guaranteed one-of-three). "net"/EV is the average
-        # across many runs, not what any single run actually looks like.
-        has_cost = entry["total_chaos"] is not None
-        net = (ev - entry["total_chaos"]) if has_cost else None
-        worst = (-entry["total_chaos"]) if has_cost else None
-        best = (best_item - entry["total_chaos"]) if has_cost else None
-        ents.append({"name": e["name"], "tier": e["tier"], "entry": entry,
-                     "drops": drops, "ev_chaos": ev, "net": net,
-                     "worst": worst, "best": best,
-                     "quantMod": bool(e.get("quant_mod")),
-                     "access": e.get("access"), "invuln": e.get("invuln"),
-                     "wikiUrl": wiki_url(e.get("wiki", e["name"]))})
-
-    return {"league": league, "leagueSlug": league_slug, "divineRate": divine_rate,
-            "source": "exchange→stash", "updated": int(time.time()),
-            "cacheTtl": CACHE_TTL, "bosses": ents}
-
-
-# --------------------------------------------------------------------------- #
-# Frontend
-# --------------------------------------------------------------------------- #
-PAGE = r"""<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1078,7 +342,7 @@ footer{border-top:1px solid var(--line); margin-top:24px;
 <div class="popover" id="popover" role="tooltip"></div>
 
 <script>
-const POLL_MS = __POLL_MS__;
+const POLL_MS = 120000;
 let lastUpdated = 0;
 let runMult = 1;
 
@@ -1582,10 +846,307 @@ window.addEventListener('hashchange', () => {
   el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
 });
 
+const WORKER_URL = "https://boss-farm-proxy.ericklucio-suv.workers.dev";
+const LEAGUE = "Allflame";
+const ENTITIES = [{"name": "The Shaper", "tier": "normal", "access": "map", "entry": [["Fragment of the Phoenix", "Fragment", 1], ["Fragment of the Minotaur", "Fragment", 1], ["Fragment of the Hydra", "Fragment", 1], ["Fragment of the Chimera", "Fragment", 1]], "drops": [["Shaper's Exalted Orb", "Currency", 0.12, "est"], ["Starforge", "UniqueWeapon", 0.06, "est"], ["Disintegrator", "UniqueWeapon", 0.05, "est"], ["The Rippling Thoughts", "UniqueArmour", 0.05, "est"]]}, {"name": "Uber Shaper", "tier": "uber", "access": "map", "entry": [["Cosmic Fragment", "Fragment", 4]], "drops": [["Cosmic Reliquary Key", "Fragment", 0.05, "est"], ["Shaper's Exalted Orb", "Currency", 0.12, "est"], ["The Rippling Thoughts", "UniqueArmour", 0.06, "est"]]}, {"name": "The Shaper & Elder", "tier": "normal", "wiki": "The Elder", "access": "map", "entry": [["Fragment of Knowledge", "Fragment", 1], ["Fragment of Terror", "Fragment", 1], ["Fragment of Emptiness", "Fragment", 1], ["Fragment of Shape", "Fragment", 1]], "drops": [["Watcher's Eye", "UniqueJewel", 0.3, "est"], ["Elder's Exalted Orb", "Currency", 0.12, "est"], ["Shaper's Exalted Orb", "Currency", 0.1, "est"]]}, {"name": "Uber Elder", "tier": "uber", "access": "map", "entry": [["Decaying Fragment", "Fragment", 4]], "drops": [["Decaying Reliquary Key", "Fragment", 0.05, "est"], ["Watcher's Eye", "UniqueJewel", 0.4, "est"], ["Elder's Exalted Orb", "Currency", 0.12, "est"]]}, {"name": "Sirus, Awakener", "tier": "normal", "wiki": "Sirus, Awakener of Worlds", "invuln": "splits into 4 illusions during Die Beam \u2014 only the real Sirus is attackable, the rest aren't", "entry": [["Al-Hezmin's Crest", "Fragment", 1], ["Baran's Crest", "Fragment", 1], ["Drox's Crest", "Fragment", 1], ["Veritania's Crest", "Fragment", 1]], "drops": [["Awakener's Orb", "Currency", 0.15, "est"], ["The Burden of Truth", "UniqueAccessory", 0.05, "est"], ["Crown of the Inward Eye", "UniqueArmour", 0.05, "est"], ["Hands of the High Templar", "UniqueArmour", 0.05, "est"]]}, {"name": "Uber Sirus", "tier": "uber", "invuln": "splits into 4 illusions during Die Beam \u2014 only the real Sirus is attackable, the rest aren't", "entry": [["Awakening Fragment", "Fragment", 4]], "drops": [["Oubliette Reliquary Key", "Fragment", 0.05, "est"], ["Awakener's Orb", "Currency", 0.15, "est"], ["The Saviour", "UniqueWeapon", 0.03, "est"]]}, {"name": "The Maven", "tier": "normal", "invuln": "Memory Game \u2014 invulnerable while you repeat a lit pattern; a wrong step speeds up a lethal channel", "entry": [["The Maven's Writ", "Fragment", 1]], "drops": [["Maven's Orb", "Currency", 0.12, "est"], ["Orb of Dominance", "Currency", 0.05, "est"]]}, {"name": "Uber Maven", "tier": "uber", "invuln": "Memory Game \u2014 invulnerable while you repeat a lit pattern; a wrong step speeds up a lethal channel", "entry": [["Reality Fragment", "Fragment", 4]], "drops": [["Shiny Reliquary Key", "Fragment", 0.05, "est"], ["Maven's Orb", "Currency", 0.12, "est"], ["Orb of Dominance", "Currency", 0.08, "est"], ["Viridi's Veil", "UniqueArmour", 0.04, "est"], ["Impossible Escape", "UniqueJewel", 0.04, "est"], ["Progenesis", "UniqueFlask", 0.02, "est"], ["Grace of the Goddess", "UniqueWeapon", 0.03, "est"], ["Curio of Potential", "UniqueAccessory", 0.05, "est"]]}, {"name": "The Searing Exarch", "tier": "normal", "quant_mod": true, "access": "direct", "invuln": "Meteor Wall at \u226450% HP \u2014 invulnerable while unleashing meteors; destroy them to open a gap (1x)", "entry": [["Incandescent Invitation", "Invitation", 1]], "drops": [["Grand Eldritch Ember", "Currency", 0.3, "est"], ["Exceptional Eldritch Ember", "Currency", 0.15, "est"], ["Eldritch Exalted Orb", "Currency", 0.05, "est"], ["Eldritch Orb of Annulment", "Currency", 0.05, "est"], ["Eldritch Chaos Orb", "Currency", 0.05, "est"], ["Orb of Conflict", "Currency", 0.1, "est"], ["Forbidden Flame", "UniqueJewel", 0.05, "est"]]}, {"name": "Uber Searing Exarch", "tier": "uber", "access": "direct", "invuln": "Meteor Wall at \u226450% HP \u2014 invulnerable while unleashing meteors; destroy them to open a gap (1x, harsher)", "entry": [["Blazing Fragment", "Fragment", 4]], "drops": [["Archive Reliquary Key", "Fragment", 0.05, "est"], ["Forbidden Flame", "UniqueJewel", 0.05, "est"], ["Annihilation's Approach", "UniqueArmour", 0.04, "est"], ["Crystallised Omniscience", "UniqueAccessory", 0.03, "est"], ["Curio of Absorption", "UniqueAccessory", 0.05, "est"], ["The Annihilating Light", "UniqueWeapon", 0.03, "est"]]}, {"name": "The Eater of Worlds", "tier": "normal", "quant_mod": true, "access": "map", "invuln": "Inescapable Doom at 75% HP \u2014 invulnerable while channeling a lethal blast; activate spheres to interrupt (1x)", "entry": [["Screaming Invitation", "Invitation", 1]], "drops": [["Exceptional Eldritch Ichor", "Currency", 0.15, "wiki"], ["Eldritch Exalted Orb", "Currency", 0.05, "wiki"], ["Eldritch Orb of Annulment", "Currency", 0.05, "wiki"], ["Eldritch Chaos Orb", "Currency", 0.05, "wiki"], ["Forbidden Flesh", "UniqueJewel", 0.05, "wiki"]]}, {"name": "Uber Eater of Worlds", "tier": "uber", "access": "map", "invuln": "Inescapable Doom at 75% HP \u2014 invulnerable while channeling a lethal blast; activate spheres to interrupt (1x, harsher)", "entry": [["Devouring Fragment", "Fragment", 4]], "drops": [["Ravenous Passion", "UniqueArmour", 0.68, "wiki"], ["Ashes of the Stars", "UniqueAccessory", 0.3, "wiki"], ["Nimis", "UniqueAccessory", 0.02, "wiki"], ["Curio of Consumption", "Fragment", 0.05, "wiki"], ["Visceral Reliquary Key", "Fragment", 0.01, "wiki"], ["Forbidden Flesh", "UniqueJewel", 0.05, "wiki"]]}, {"name": "Venarius (Cortex)", "tier": "normal", "wiki": "Cortex (map)", "access": "direct", "invuln": "Venarius is never the actual target \u2014 you fight summoned Synthete adds for the whole encounter", "entry": [], "drops": [["Garb of the Ephemeral", "UniqueArmour", 0.05, "est"]]}, {"name": "Uber Cortex", "tier": "uber", "access": "direct", "invuln": "Venarius is never the actual target \u2014 you fight summoned Synthete adds for the whole encounter", "entry": [["Synthesising Fragment", "Fragment", 4]], "drops": [["Forgotten Reliquary Key", "Fragment", 0.05, "est"], ["Mask of the Tribunal", "UniqueArmour", 0.04, "est"], ["Nebulis", "UniqueWeapon", 0.04, "est"], ["Rational Doctrine", "UniqueJewel", 0.02, "est"], ["Circle of Ambition", "UniqueAccessory", 0.04, "est"], ["The Apostate", "UniqueArmour", 0.04, "est"]]}, {"name": "Atziri, Queen of the Vaal", "tier": "normal", "access": "map", "invuln": "Minion Phase \u2014 shields herself and becomes invulnerable while spawning health-draining monsters (1x)", "entry": [["Sacrifice at Dusk", "Fragment", 1], ["Sacrifice at Midnight", "Fragment", 1], ["Sacrifice at Dawn", "Fragment", 1], ["Sacrifice at Noon", "Fragment", 1]], "drops": [["Pledge of Hands", "UniqueWeapon", 0.05, "est"], ["Atziri's Promise", "UniqueFlask", 0.1, "est"], ["Atziri's Step", "UniqueArmour", 0.08, "est"], ["Doryani's Invitation", "UniqueAccessory", 0.06, "est"]]}, {"name": "Uber Atziri", "tier": "uber", "access": "map", "invuln": "Minion Phase (1x) + splits into 4 copies at 75/50/25% HP \u2014 only one is the real target (up to 4x total)", "entry": [["Mortal Grief", "Fragment", 1], ["Mortal Rage", "Fragment", 1], ["Mortal Ignorance", "Fragment", 1], ["Mortal Hope", "Fragment", 1]], "drops": [["Atziri's Disfavour", "UniqueWeapon", 0.06, "est"], ["Atziri's Acuity", "UniqueAccessory", 0.06, "est"], ["Atziri's Splendour", "UniqueArmour", 0.1, "est"], ["The Vertex", "UniqueArmour", 0.05, "est"]]}, {"name": "Incarnation of Fear", "tier": "normal", "access": "direct", "entry": [["Echo of Trauma", "Currency", 1]], "drops": [["Orb of Intention", "Currency", 0.12, "est"], ["Starcaller", "UniqueWeapon", 0.35, "est"], ["Coiling Whisper", "UniqueAccessory", 0.3, "est"], ["Servant of Decay", "UniqueAccessory", 0.2, "est"], ["Enmity's Embrace", "UniqueAccessory", 0.08, "est"], ["Bound By Destiny", "UniqueJewel", 0.05, "est"], ["Fruiting Astrolabe", "Astrolabe", 0.1, "est"], ["Deceptive Astrolabe", "Astrolabe", 0.1, "est"], ["Templar Astrolabe", "Astrolabe", 0.1, "est"], ["Lightless Astrolabe", "Astrolabe", 0.1, "est"], ["Runic Astrolabe", "Astrolabe", 0.1, "est"], ["Grasping Astrolabe", "Astrolabe", 0.1, "est"], ["Fungal Astrolabe", "Astrolabe", 0.1, "est"], ["Nameless Astrolabe", "Astrolabe", 0.1, "est"], ["Chaotic Astrolabe", "Astrolabe", 0.1, "est"], ["Timeless Astrolabe", "Astrolabe", 0.1, "est"]]}, {"name": "Uber Incarnation of Fear", "tier": "uber", "access": "direct", "entry": [["Traumatic Fragment", "Fragment", 4]], "drops": [["Traumatic Reliquary Key", "Fragment", 0.05, "est"], ["Orb of Intention", "Currency", 0.12, "est"], ["Starcaller", "UniqueWeapon", 0.35, "est"], ["Coiling Whisper", "UniqueAccessory", 0.3, "est"], ["Servant of Decay", "UniqueAccessory", 0.2, "est"], ["Enmity's Embrace", "UniqueAccessory", 0.08, "est"], ["Bound By Destiny", "UniqueJewel", 0.05, "est"], ["Fruiting Astrolabe", "Astrolabe", 0.1, "est"], ["Deceptive Astrolabe", "Astrolabe", 0.1, "est"], ["Templar Astrolabe", "Astrolabe", 0.1, "est"], ["Lightless Astrolabe", "Astrolabe", 0.1, "est"], ["Runic Astrolabe", "Astrolabe", 0.1, "est"], ["Grasping Astrolabe", "Astrolabe", 0.1, "est"], ["Fungal Astrolabe", "Astrolabe", 0.1, "est"], ["Nameless Astrolabe", "Astrolabe", 0.1, "est"], ["Chaotic Astrolabe", "Astrolabe", 0.1, "est"], ["Timeless Astrolabe", "Astrolabe", 0.1, "est"]]}, {"name": "Incarnation of Dread", "tier": "normal", "access": "direct", "entry": [["Echo of Reverence", "Currency", 1]], "drops": [["Orb of Unravelling", "Currency", 0.12, "est"], ["Whispers of Infinity", "UniqueAccessory", 0.45, "est"], ["The Dark Monarch", "UniqueArmour", 0.45, "est"], ["Seven Teachings", "UniqueAccessory", 0.08, "est"], ["Wine of the Prophet", "UniqueFlask", 0.02, "est"], ["Bound By Destiny", "UniqueJewel", 0.05, "est"], ["Fruiting Astrolabe", "Astrolabe", 0.1, "est"], ["Deceptive Astrolabe", "Astrolabe", 0.1, "est"], ["Templar Astrolabe", "Astrolabe", 0.1, "est"], ["Lightless Astrolabe", "Astrolabe", 0.1, "est"], ["Runic Astrolabe", "Astrolabe", 0.1, "est"], ["Grasping Astrolabe", "Astrolabe", 0.1, "est"], ["Fungal Astrolabe", "Astrolabe", 0.1, "est"], ["Nameless Astrolabe", "Astrolabe", 0.1, "est"], ["Chaotic Astrolabe", "Astrolabe", 0.1, "est"], ["Timeless Astrolabe", "Astrolabe", 0.1, "est"]]}, {"name": "Uber Incarnation of Dread", "tier": "uber", "access": "direct", "entry": [["Reverent Fragment", "Fragment", 4]], "drops": [["Reverent Reliquary Key", "Fragment", 0.05, "est"], ["Orb of Unravelling", "Currency", 0.12, "est"], ["Whispers of Infinity", "UniqueAccessory", 0.45, "est"], ["The Dark Monarch", "UniqueArmour", 0.45, "est"], ["Seven Teachings", "UniqueAccessory", 0.08, "est"], ["Wine of the Prophet", "UniqueFlask", 0.02, "est"], ["Bound By Destiny", "UniqueJewel", 0.05, "est"], ["Fruiting Astrolabe", "Astrolabe", 0.1, "est"], ["Deceptive Astrolabe", "Astrolabe", 0.1, "est"], ["Templar Astrolabe", "Astrolabe", 0.1, "est"], ["Lightless Astrolabe", "Astrolabe", 0.1, "est"], ["Runic Astrolabe", "Astrolabe", 0.1, "est"], ["Grasping Astrolabe", "Astrolabe", 0.1, "est"], ["Fungal Astrolabe", "Astrolabe", 0.1, "est"], ["Nameless Astrolabe", "Astrolabe", 0.1, "est"], ["Chaotic Astrolabe", "Astrolabe", 0.1, "est"], ["Timeless Astrolabe", "Astrolabe", 0.1, "est"]]}, {"name": "Incarnation of Neglect", "tier": "normal", "access": "direct", "entry": [["Echo of Loneliness", "Currency", 1]], "drops": [["Orb of Remembrance", "Currency", 0.12, "est"], ["Betrayal's Sting", "UniqueAccessory", 0.45, "est"], ["Arkhon's Tools", "UniqueAccessory", 0.45, "est"], ["Venarius' Astrolabe", "UniqueAccessory", 0.08, "est"], ["Legacy of the Rose", "UniqueWeapon", 0.02, "est"], ["Bound By Destiny", "UniqueJewel", 0.05, "est"], ["Fruiting Astrolabe", "Astrolabe", 0.1, "est"], ["Deceptive Astrolabe", "Astrolabe", 0.1, "est"], ["Templar Astrolabe", "Astrolabe", 0.1, "est"], ["Lightless Astrolabe", "Astrolabe", 0.1, "est"], ["Runic Astrolabe", "Astrolabe", 0.1, "est"], ["Grasping Astrolabe", "Astrolabe", 0.1, "est"], ["Fungal Astrolabe", "Astrolabe", 0.1, "est"], ["Nameless Astrolabe", "Astrolabe", 0.1, "est"], ["Chaotic Astrolabe", "Astrolabe", 0.1, "est"], ["Timeless Astrolabe", "Astrolabe", 0.1, "est"]]}, {"name": "Uber Incarnation of Neglect", "tier": "uber", "access": "direct", "entry": [["Lonely Fragment", "Fragment", 4]], "drops": [["Lonely Reliquary Key", "Fragment", 0.05, "est"], ["Orb of Remembrance", "Currency", 0.12, "est"], ["Betrayal's Sting", "UniqueAccessory", 0.45, "est"], ["Arkhon's Tools", "UniqueAccessory", 0.45, "est"], ["Venarius' Astrolabe", "UniqueAccessory", 0.08, "est"], ["Legacy of the Rose", "UniqueWeapon", 0.02, "est"], ["Bound By Destiny", "UniqueJewel", 0.05, "est"], ["Fruiting Astrolabe", "Astrolabe", 0.1, "est"], ["Deceptive Astrolabe", "Astrolabe", 0.1, "est"], ["Templar Astrolabe", "Astrolabe", 0.1, "est"], ["Lightless Astrolabe", "Astrolabe", 0.1, "est"], ["Runic Astrolabe", "Astrolabe", 0.1, "est"], ["Grasping Astrolabe", "Astrolabe", 0.1, "est"], ["Fungal Astrolabe", "Astrolabe", 0.1, "est"], ["Nameless Astrolabe", "Astrolabe", 0.1, "est"], ["Chaotic Astrolabe", "Astrolabe", 0.1, "est"], ["Timeless Astrolabe", "Astrolabe", 0.1, "est"]]}, {"name": "Abomination - Depraved Trinity", "tier": "nightmare", "wiki": "Abomination Map", "access": "map", "quant_mod": true, "entry": [["Nightmare Map", "Map", 1]], "drops": [["Reality Fragment", "Fragment", 0.4, "est"], ["Blazing Fragment", "Fragment", 0.25, "est"], ["Synthesising Fragment", "Fragment", 0.25, "est"], ["Traumatic Fragment", "Fragment", 0.2, "est"], ["Malachai's Mark", "UniqueAccessory", 0.04, "est"], ["Fruiting Astrolabe", "Astrolabe", 0.005, "est"], ["Deceptive Astrolabe", "Astrolabe", 0.005, "est"], ["Templar Astrolabe", "Astrolabe", 0.005, "est"], ["Lightless Astrolabe", "Astrolabe", 0.005, "est"], ["Runic Astrolabe", "Astrolabe", 0.005, "est"], ["Grasping Astrolabe", "Astrolabe", 0.005, "est"], ["Fungal Astrolabe", "Astrolabe", 0.005, "est"], ["Nameless Astrolabe", "Astrolabe", 0.005, "est"], ["Chaotic Astrolabe", "Astrolabe", 0.005, "est"], ["Timeless Astrolabe", "Astrolabe", 0.005, "est"]]}, {"name": "Citadel - Uhtred", "tier": "nightmare", "wiki": "Citadel Map", "access": "map", "quant_mod": true, "invuln": "boss submerges and becomes untargetable, then re-emerges \u2014 repeats through the fight", "entry": [["Nightmare Map", "Map", 1]], "drops": [["Cosmic Fragment", "Fragment", 0.35, "est"], ["Decaying Fragment", "Fragment", 0.3, "est"], ["Traumatic Fragment", "Fragment", 0.25, "est"], ["Lonely Fragment", "Fragment", 0.2, "est"], ["Manastorm", "UniqueWeapon", 0.04, "est"], ["Fruiting Astrolabe", "Astrolabe", 0.005, "est"], ["Deceptive Astrolabe", "Astrolabe", 0.005, "est"], ["Templar Astrolabe", "Astrolabe", 0.005, "est"], ["Lightless Astrolabe", "Astrolabe", 0.005, "est"], ["Runic Astrolabe", "Astrolabe", 0.005, "est"], ["Grasping Astrolabe", "Astrolabe", 0.005, "est"], ["Fungal Astrolabe", "Astrolabe", 0.005, "est"], ["Nameless Astrolabe", "Astrolabe", 0.005, "est"], ["Chaotic Astrolabe", "Astrolabe", 0.005, "est"], ["Timeless Astrolabe", "Astrolabe", 0.005, "est"]]}, {"name": "Fortress - The Unbreakable", "tier": "nightmare", "wiki": "Fortress Map", "access": "map", "quant_mod": true, "entry": [["Nightmare Map", "Map", 1]], "drops": [["Lonely Fragment", "Fragment", 0.35, "est"], ["Decaying Fragment", "Fragment", 0.3, "est"], ["Cosmic Fragment", "Fragment", 0.25, "est"], ["Awakening Fragment", "Fragment", 0.2, "est"], ["Yoke of Suffering", "UniqueAccessory", 0.04, "est"], ["Fruiting Astrolabe", "Astrolabe", 0.005, "est"], ["Deceptive Astrolabe", "Astrolabe", 0.005, "est"], ["Templar Astrolabe", "Astrolabe", 0.005, "est"], ["Lightless Astrolabe", "Astrolabe", 0.005, "est"], ["Runic Astrolabe", "Astrolabe", 0.005, "est"], ["Grasping Astrolabe", "Astrolabe", 0.005, "est"], ["Fungal Astrolabe", "Astrolabe", 0.005, "est"], ["Nameless Astrolabe", "Astrolabe", 0.005, "est"], ["Chaotic Astrolabe", "Astrolabe", 0.005, "est"], ["Timeless Astrolabe", "Astrolabe", 0.005, "est"]]}, {"name": "Sanctuary - Lycia", "tier": "nightmare", "wiki": "Sanctuary Map", "access": "map", "quant_mod": true, "entry": [["Nightmare Map", "Map", 1]], "drops": [["Devouring Fragment", "Fragment", 0.4, "est"], ["Blazing Fragment", "Fragment", 0.3, "est"], ["Awakening Fragment", "Fragment", 0.25, "est"], ["Reverent Fragment", "Fragment", 0.2, "est"], ["The Dark Seer", "UniqueWeapon", 0.04, "est"], ["Fruiting Astrolabe", "Astrolabe", 0.005, "est"], ["Deceptive Astrolabe", "Astrolabe", 0.005, "est"], ["Templar Astrolabe", "Astrolabe", 0.005, "est"], ["Lightless Astrolabe", "Astrolabe", 0.005, "est"], ["Runic Astrolabe", "Astrolabe", 0.005, "est"], ["Grasping Astrolabe", "Astrolabe", 0.005, "est"], ["Fungal Astrolabe", "Astrolabe", 0.005, "est"], ["Nameless Astrolabe", "Astrolabe", 0.005, "est"], ["Chaotic Astrolabe", "Astrolabe", 0.005, "est"], ["Timeless Astrolabe", "Astrolabe", 0.005, "est"]]}, {"name": "Ziggurat - Catarina", "tier": "nightmare", "wiki": "Ziggurat Map", "access": "map", "quant_mod": true, "invuln": "reportedly has invincibility phases per community guides, exact mechanic undocumented", "entry": [["Nightmare Map", "Map", 1]], "drops": [["Reality Fragment", "Fragment", 0.35, "est"], ["Devouring Fragment", "Fragment", 0.35, "est"], ["Synthesising Fragment", "Fragment", 0.25, "est"], ["Reverent Fragment", "Fragment", 0.2, "est"], ["Wraithlord", "UniqueArmour", 0.04, "est"], ["Fruiting Astrolabe", "Astrolabe", 0.005, "est"], ["Deceptive Astrolabe", "Astrolabe", 0.005, "est"], ["Templar Astrolabe", "Astrolabe", 0.005, "est"], ["Lightless Astrolabe", "Astrolabe", 0.005, "est"], ["Runic Astrolabe", "Astrolabe", 0.005, "est"], ["Grasping Astrolabe", "Astrolabe", 0.005, "est"], ["Fungal Astrolabe", "Astrolabe", 0.005, "est"], ["Nameless Astrolabe", "Astrolabe", 0.005, "est"], ["Chaotic Astrolabe", "Astrolabe", 0.005, "est"], ["Timeless Astrolabe", "Astrolabe", 0.005, "est"]]}];
+const ITEM_CATEGORIES = ["UniqueWeapon", "UniqueArmour", "UniqueAccessory", "UniqueJewel", "UniqueFlask", "Invitation", "Map"];
+const OVERVIEW_SLUG = {"Currency": "currency", "Fragment": "fragments", "UniqueWeapon": "unique-weapons", "UniqueArmour": "unique-armours", "UniqueAccessory": "unique-accessories", "UniqueJewel": "unique-jewels", "UniqueFlask": "unique-flasks", "Invitation": "invitations", "Map": "maps", "Astrolabe": "astrolabes"};
+const DEFAULT_CHANCE = 0.05;
+const PRICE_OVERRIDE = {};
+const CACHE_TTL = 300;
+
+function pnSlugify(name){
+  let s = name.toLowerCase().split("'").join("");
+  s = s.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return s;
+}
+
+async function getJsonSafe(url, league, typ){
+  const qs = new URLSearchParams({league, type: typ});
+  try{
+    const r = await fetch(url+"?"+qs, {signal: AbortSignal.timeout(25000)});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return await r.json();
+  }catch(e){
+    console.warn('[warning] '+typ+': '+e);
+    return {lines: [], currencyDetails: [], items: []};
+  }
+}
+
+const UNIDED_ILVL_SUFFIX = /\s+\d+\+?$/;
+
+async function getWatchUnidentified(league){
+  const result = {};
+  try{
+    const qs = new URLSearchParams({league});
+    const r = await fetch(WORKER_URL+'/watch/compact?'+qs, {signal: AbortSignal.timeout(40000)});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const data = await r.json();
+    for(const it of (data.items||[])){
+      const nm = it.name || '';
+      if(!nm.startsWith('Unidentified ')) continue;
+      const base = nm.slice('Unidentified '.length).replace(UNIDED_ILVL_SUFFIX, '');
+      let chaos = it.min;
+      if(chaos == null) chaos = it.mean;
+      if(chaos == null) continue;
+      if(!(base in result) || chaos < result[base]) result[base] = chaos;
+    }
+  }catch(e){ console.warn('[warning] poe.watch unidentified prices: '+e); }
+  return result;
+}
+
+function getEntry(index, name, typ){
+  let byType = index.get(name);
+  if(!byType){ byType = new Map(); index.set(name, byType); }
+  let e = byType.get(typ);
+  if(!e){
+    e = {chaos: null, chaos_max: null, chaos_n: 0, chaos_alt: null, divine: null,
+         icon: null, detailsId: pnSlugify(name), type: typ, chaos_unided: null};
+    byType.set(typ, e);
+  }
+  return e;
+}
+
+async function buildIndex(league){
+  const EXCHANGE_URL = WORKER_URL+'/ninja/exchange/current/overview';
+  const CURRENCY_URL = WORKER_URL+'/ninja/stash/current/currency/overview';
+  const ITEM_URL = WORKER_URL+'/ninja/stash/current/item/overview';
+
+  const exchangeTypes = ['Currency', 'Fragment'];
+  const stashTypes = ['Currency', 'Fragment'];
+  const itemTypes = ITEM_CATEGORIES;
+
+  const [exchangeResults, stashResults, itemResults, watchUnided] = await Promise.all([
+    Promise.all(exchangeTypes.map(t => getJsonSafe(EXCHANGE_URL, league, t))),
+    Promise.all(stashTypes.map(t => getJsonSafe(CURRENCY_URL, league, t))),
+    Promise.all(itemTypes.map(t => getJsonSafe(ITEM_URL, league, t))),
+    getWatchUnidentified(league),
+  ]);
+  const exchangeData = {}; exchangeTypes.forEach((t,i) => exchangeData[t] = exchangeResults[i]);
+  const stashData = {}; stashTypes.forEach((t,i) => stashData[t] = stashResults[i]);
+  const itemData = {}; itemTypes.forEach((t,i) => itemData[t] = itemResults[i]);
+
+  const index = new Map(); // name -> Map(type -> entry)
+
+  function put(name, typ, chaos, divine, icon, details, field){
+    field = field || 'chaos';
+    const e = getEntry(index, name, typ);
+    if(chaos != null){
+      const cur = e[field];
+      if(cur == null || chaos < cur){
+        e[field] = chaos;
+        if(field === 'chaos') e.divine = divine;
+      }
+      if(field === 'chaos'){
+        e.chaos_max = e.chaos_max == null ? chaos : Math.max(e.chaos_max, chaos);
+        e.chaos_n += 1;
+      }
+    } else if(divine != null && e.divine == null){
+      e.divine = divine;
+    }
+    if(icon && !e.icon) e.icon = icon;
+    if(details) e.detailsId = details;
+  }
+
+  for(const typ of exchangeTypes){
+    const data = exchangeData[typ];
+    const idToMeta = {};
+    for(const d of (data.items||[])) if(d.id) idToMeta[d.id] = d;
+    for(const line of (data.lines||[])){
+      const itemId = line.id;
+      const meta = idToMeta[itemId] || {};
+      const nm = meta.name || line.currencyTypeName || line.name;
+      if(!nm) continue;
+      const chaos = line.primaryValue;
+      const details = meta.detailsId || itemId;
+      put(nm, typ, chaos == null ? null : chaos, null, null, details, 'chaos');
+    }
+  }
+
+  for(const typ of stashTypes){
+    const data = stashData[typ];
+    const icons = {};
+    for(const d of (data.currencyDetails||[])) if(d.name) icons[d.name] = d.icon;
+    for(const nm in icons) put(nm, typ, null, null, icons[nm], null, 'chaos');
+    for(const line of (data.lines||[])){
+      const nm = line.currencyTypeName || line.name;
+      if(!nm) continue;
+      let chaos = line.chaosEquivalent;
+      if(chaos == null) chaos = line.chaosValue;
+      put(nm, typ, chaos == null ? null : chaos, line.divineValue == null ? null : line.divineValue,
+          icons[nm] || null, line.detailsId || null, 'chaos_alt');
+    }
+  }
+
+  for(const byType of index.values()){
+    for(const e of byType.values()){
+      if(e.chaos == null && e.chaos_alt != null){
+        e.chaos = e.chaos_alt;
+        e.chaos_max = e.chaos_alt;
+        e.chaos_n = 1;
+        e.chaos_alt = null;
+      }
+    }
+  }
+
+  for(const typ of itemTypes){
+    const data = itemData[typ];
+    for(const line of (data.lines||[])){
+      const nm = line.name;
+      if(!nm) continue;
+      let chaos = line.chaosValue;
+      if(chaos == null) chaos = line.chaosEquivalent;
+      put(nm, typ, chaos == null ? null : chaos, line.divineValue == null ? null : line.divineValue,
+          line.icon || null, line.detailsId || null, 'chaos');
+    }
+  }
+
+  for(const nm in watchUnided){
+    const chaos = watchUnided[nm];
+    const byType = index.get(nm);
+    if(byType){
+      for(const typ of itemTypes){
+        const e = byType.get(typ);
+        if(e) e.chaos_unided = chaos;
+      }
+    }
+  }
+
+  for(const [nm, byType] of index.entries()){
+    if(Object.prototype.hasOwnProperty.call(PRICE_OVERRIDE, nm)){
+      for(const e of byType.values()){
+        e.chaos = PRICE_OVERRIDE[nm];
+        e.chaos_unided = null;
+        e.override = true;
+      }
+    }
+  }
+
+  return index;
+}
+
+function wikiUrl(name){
+  return 'https://www.poewiki.net/wiki/'+encodeURIComponent(name.split(' ').join('_'));
+}
+
+function lookup(index, name, typ){
+  const byType = index.get(name);
+  const e = byType ? byType.get(typ) : undefined;
+  if(e && e.chaos != null) return [e, false];
+  if(byType){
+    for(const [t, v] of byType.entries()){
+      if(v.chaos != null) return [v, t !== typ];
+    }
+  }
+  return [e || {}, false];
+}
+
+function resItem(index, name, typ, divineRate, leagueSlug){
+  const [info, mismatched] = lookup(index, name, typ);
+  const rtype = info.type || typ;
+  const chaosFloor = info.chaos == null ? null : info.chaos;
+  const chaosUnided = info.chaos_unided == null ? null : info.chaos_unided;
+  const chaosMaxRaw = info.chaos_max == null ? null : info.chaos_max;
+  const variants = info.chaos_n || 0;
+  let chaos, priceMode, divine;
+  if(chaosUnided != null){
+    chaos = chaosUnided; priceMode = 'unidentified'; divine = null;
+  }else{
+    chaos = chaosFloor;
+    priceMode = variants > 1 ? 'variants' : 'single';
+    divine = info.divine == null ? null : info.divine;
+  }
+  const alt = info.chaos_alt == null ? null : info.chaos_alt;
+  let diverge = null;
+  if(chaosFloor && alt && chaosFloor > 0){
+    const d = Math.abs(chaosFloor - alt) / chaosFloor;
+    if(d >= 0.10) diverge = {alt: alt, pct: Math.round(d*100)};
+  }
+  let url, linkSrc;
+  if(chaos != null){
+    const slug = OVERVIEW_SLUG[rtype] || OVERVIEW_SLUG[typ] || 'currency';
+    const details = info.detailsId || pnSlugify(name);
+    url = 'https://poe.ninja/poe1/economy/'+leagueSlug+'/'+slug+'/'+details;
+    linkSrc = 'ninja';
+  }else{
+    url = wikiUrl(name);
+    linkSrc = 'wiki';
+  }
+  const hasUpside = chaosMaxRaw != null && chaos && chaosMaxRaw > chaos * 1.05;
+  return {
+    name: name, type: rtype, declared_type: typ,
+    chaos: chaos == null ? null : chaos, divine: divine == null ? null : divine,
+    chaosMax: hasUpside ? chaosMaxRaw : null,
+    priceMode: priceMode,
+    icon: info.icon == null ? null : info.icon, url: url, link_src: linkSrc,
+    diverge: diverge, type_mismatch: mismatched,
+    override: !!info.override,
+  };
+}
+
+async function buildPayload(league){
+  const leagueSlug = league.toLowerCase().split(' ').join('-');
+  const index = await buildIndex(league);
+  const [dv] = lookup(index, 'Divine Orb', 'Currency');
+  const divineRate = dv.chaos == null ? null : dv.chaos;
+
+  const res = (name, typ) => resItem(index, name, typ, divineRate, leagueSlug);
+
+  const ents = [];
+  for(const e of ENTITIES){
+    const eitems = []; let ecost = 0.0; let ehas = false;
+    for(const entryLine of e.entry){
+      const name = entryLine[0], typ = entryLine[1], qty = entryLine[2];
+      const r = res(name, typ);
+      r.qty = qty;
+      eitems.push(r);
+      if(r.chaos != null){ ecost += r.chaos * qty; ehas = true; }
+    }
+    const entry = {items: eitems, total_chaos: ehas ? ecost : null};
+
+    const ditems = []; let ev = 0.0; let bestItem = 0.0;
+    for(const drop of e.drops){
+      const name = drop[0], typ = drop[1], chance = drop[2], src = drop[3];
+      const qty = drop.length > 4 ? drop[4] : 1;
+      const r = res(name, typ);
+      const ch = chance != null ? chance : DEFAULT_CHANCE;
+      r.chance = ch; r.chance_src = src; r.qty = qty;
+      ditems.push(r);
+      if(r.chaos != null){
+        const value = r.chaos * qty;
+        ev += ch * value;
+        bestItem = Math.max(bestItem, value);
+      }
+    }
+    const drops = {items: ditems, ev_chaos: ev};
+
+    const hasCost = entry.total_chaos != null;
+    const net = hasCost ? ev - entry.total_chaos : null;
+    const worst = hasCost ? -entry.total_chaos : null;
+    const best = hasCost ? bestItem - entry.total_chaos : null;
+    ents.push({
+      name: e.name, tier: e.tier, entry: entry, drops: drops, ev_chaos: ev,
+      net: net, worst: worst, best: best,
+      quantMod: !!e.quant_mod, access: e.access || null, invuln: e.invuln || null,
+      wikiUrl: wikiUrl(e.wiki || e.name),
+    });
+  }
+
+  return {
+    league: league, leagueSlug: leagueSlug, divineRate: divineRate,
+    source: 'exchange→stash', updated: Math.floor(Date.now()/1000),
+    cacheTtl: CACHE_TTL, bosses: ents,
+  };
+}
+
 async function fetchData(){
-  const r = await fetch('/api/data', {signal: AbortSignal.timeout(60000)});
-  if(!r.ok) throw new Error('HTTP '+r.status);
-  return r.json();
+  const data = await Promise.race([
+    buildPayload(LEAGUE),
+    new Promise((_, rej) => setTimeout(
+      () => rej(Object.assign(new Error('timeout'), {name: 'TimeoutError'})), 60000)),
+  ]);
+  if(data.divineRate == null) throw new Error('no pricing data reachable');
+  return data;
 }
 
 let lastErrKey = null; // 'err_timeout' | 'err_fetch' | null — re-rendered in the
@@ -1679,63 +1240,3 @@ setInterval(tick, 1000);
 </script>
 </body>
 </html>
-"""
-
-
-# --------------------------------------------------------------------------- #
-# Server
-# --------------------------------------------------------------------------- #
-def make_handler(league, poll_ms):
-    class H(BaseHTTPRequestHandler):
-        def log_message(self, *_):
-            pass
-
-        def _send(self, code, body, ctype):
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self):
-            path = urllib.parse.urlparse(self.path).path
-            if path == "/":
-                html = PAGE.replace("__POLL_MS__", str(poll_ms))
-                self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
-            elif path == "/api/data":
-                try:
-                    body = json.dumps(build_payload(league)).encode("utf-8")
-                    self._send(200, body, "application/json")
-                except Exception as e:
-                    self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
-            else:
-                self._send(404, b"not found", "text/plain")
-    return H
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--league", default="Allflame")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--poll", type=int, default=120,
-                    help="browser auto-refresh interval, in seconds")
-    args = ap.parse_args()
-
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port),
-                              make_handler(args.league, args.poll * 1000))
-    url = f"http://localhost:{args.port}"
-    print(f"Boss Farm Estimator at {url}  (league: {args.league}, price: exchange->stash)"
-          f"  --  Ctrl+C to stop")
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print("\nshutting down…")
-        srv.shutdown()
-
-
-if __name__ == "__main__":
-    main()

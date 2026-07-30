@@ -20,6 +20,35 @@ python boss.py --league Standard --port 8000 --poll 120
 
 No `pip install` — it's stdlib Python 3 only. Opens `http://localhost:8000` in your browser automatically. `--poll` sets the browser's auto-refresh interval in seconds; prices are cached server-side for 5 minutes regardless.
 
+## Deploying a static version (GitHub Pages)
+
+`boss.py` needs a running Python process because poe.ninja sends no CORS header, so a browser
+can't call it directly from a static-hosted page — `boss.py`'s server proxies it. To publish a
+no-backend build (GitHub Pages or any static host), a small Cloudflare Worker fills the same
+CORS-proxy role, and the pricing math moves into client-side JS instead of running server-side.
+
+1. **Deploy the proxy** (one-time, needs a free [Cloudflare](https://dash.cloudflare.com/sign-up)
+   account and the [`wrangler`](https://developers.cloudflare.com/workers/wrangler/) CLI):
+   ```bash
+   cd worker
+   wrangler deploy
+   ```
+   This prints your Worker's URL, e.g. `https://boss-farm-proxy.<you>.workers.dev`.
+
+2. **Generate the static page** — `ENTITIES` in `boss.py` stays the single source of truth;
+   this reads it directly and embeds it, it isn't duplicated anywhere:
+   ```bash
+   python build_static.py --worker-url https://boss-farm-proxy.<you>.workers.dev
+   # optional: --league Standard --poll 120 --out docs
+   ```
+   This writes `docs/index.html` (plus `docs/.nojekyll`).
+
+3. **Commit and push** `docs/`, then in the repo's GitHub settings: **Settings → Pages →
+   Deploy from a branch → `main` / `/docs`**.
+
+Re-run step 2 (and re-push) whenever `ENTITIES` changes — there's no CI/auto-rebuild, this is a
+manual regenerate step by design.
+
 ## Features
 
 - **27 boss encounters** across three independently-ranked categories:
