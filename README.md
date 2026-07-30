@@ -104,6 +104,69 @@ Example: [Uber Atziri's card links to poewiki](https://www.poewiki.net/wiki/Uber
 
 GGG does not publish official drop rates, kill times, or exact quantity-scaling formulas for any of this content. Every `"est"`-tagged chance in `ENTITIES` is a curated estimate, not an official number — `"wiki"`-tagged chances (currently: Eater of Worlds) come from a real published sample size on poewiki. This tool has gone through several correction passes (see `CLAUDE.md` for the full history) catching real errors: wrong item-to-boss attribution, misspelled names, wrong item types, and missing chase uniques — all fixed only after confirming the item exists as a real, currently-traded price on poe.ninja, never guessed. If you spot something wrong, it's a config change away: edit the 4-5 fields of the relevant line in `ENTITIES`.
 
+## Admin mode (personal use, via a Chrome extension)
+
+There's a second page, **Trade Sniper** (`/snipe`), that watches Path of Exile's official trade
+site for listings priced below the current market floor and alerts you the instant one appears —
+see the section below for how it works. It's deliberately **not linked anywhere in the public
+site menu** (still a work in progress), but it's still reachable by anyone who knows the URL.
+
+To see it in the menu (plus a small `ADMIN` badge in the header) on your own browser without
+exposing it to everyone else, this repo includes a personal, unpublished Chrome extension:
+**PoE Helper Admin** (`admin-extension/`).
+
+### How it works
+
+This is **not real authentication** — there's no login, no account, no database anywhere in this
+project (see [A note on accuracy](#a-note-on-accuracy) and `CLAUDE.md`'s Security section). It's a
+client-side convenience flag with nothing sensitive behind it, built so that only the site's owner
+sees a couple of extra UI elements in their own browser:
+
+1. The extension's content script runs on `poe-farm-helper.com` (and `localhost:8000` for local
+   testing) and holds a random secret token.
+2. On page load, the site dispatches a `poe-helper-admin-request` browser event. If the extension
+   is installed, its content script answers with a `poe-helper-admin-response` event carrying the
+   token (a `CustomEvent` on `window` is the one thing a content script's isolated JS world and the
+   page's own JS can both see — a content script can't just set a variable on the page's `window`
+   directly).
+3. The page hashes whatever token it receives with SHA-256 (`crypto.subtle.digest`, no libraries)
+   and compares it against a hardcoded expected hash. If it matches, the page reveals the Trade
+   Sniper link in the site menu and shows an `ADMIN` chip in the header. If nothing answers (every
+   visitor without the extension), nothing happens — indistinguishable from a normal visit.
+
+The page's own source only ever contains the **hash** of the token, never the token itself — so
+reading this repo's public JS doesn't hand anyone a working token to fake admin with via devtools.
+
+### Setting it up
+
+```
+admin-extension/
+├── manifest.json   # Manifest V3, content script matches poe-farm-helper.com + localhost:8000
+├── content.js      # holds the secret token, answers the page's handshake request
+└── popup.html      # small "active" confirmation when you click the extension's icon
+```
+
+1. Generate your own random token + its hash (don't reuse the one in this README):
+   ```bash
+   python -c "import secrets, hashlib; t = secrets.token_hex(32); print('TOKEN:', t); print('HASH:', hashlib.sha256(t.encode()).hexdigest())"
+   ```
+2. Paste the `TOKEN` value into `admin-extension/content.js` (the `ADMIN_TOKEN` constant).
+3. Paste the `HASH` value into `boss.py`'s `SHARED_JS_CHROME` (the `EXPECTED_ADMIN_HASH` constant),
+   then rebuild the static site (`python build_static.py ...`) and redeploy if you're using the
+   Cloudflare Worker deployment.
+4. Load the extension in Chrome: `chrome://extensions` → enable **Developer mode** → **Load
+   unpacked** → select the `admin-extension/` folder.
+5. Reload the site — the `ADMIN` chip and the Trade Sniper menu link should appear.
+
+### Why `admin-extension/` isn't in this repo's history
+
+It's git-ignored (see `.gitignore`). This repo's remote is public, and `content.js` holds the
+plaintext token — if it were committed, anyone could read it straight off GitHub and fake admin
+instantly in devtools (`window.dispatchEvent(new CustomEvent('poe-helper-admin-response',
+{detail: '<token>'}))`), no extension required, defeating the entire point of hashing it on the
+site side. Keep your own backup of that folder outside of git; if you ever suspect the token
+leaked, just regenerate a new one (step 1 above) and update both sides.
+
 ## Author
 
 Built by **Erick Lúcio** — [linkedin.com/in/erick-lucioo](https://www.linkedin.com/in/erick-lucioo/)

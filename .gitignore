@@ -3,6 +3,12 @@ __pycache__/
 
 temp/
 
+# Contains the plaintext admin token in content.js — the site only ever
+# stores its SHA-256 hash (see boss.py's SHARED_JS_CHROME), which only works
+# as a secret if the raw token never ends up in this public repo. Keep your
+# own local copy of this folder safe; it's not backed up via git.
+admin-extension/
+
 .venv/
 venv/
 

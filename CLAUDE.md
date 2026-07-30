@@ -258,86 +258,131 @@ verified line-for-line identical to the pre-refactor output (see Verification ha
 
 ### Trade Sniper page (`/snipe`) — `SNIPE_*` constants + `SnipeSession` Durable Object
 
-Watches PoE's **official trade site** for listings priced below the current poe.ninja market
-floor and surfaces them the instant they appear, using the user's own `POESESSID`. This is the
-one feature in the repo that **cannot** be a pure static-page computation like everything else —
-it needs a real backend holding an authenticated connection to a third party on the user's behalf.
+Watches a **curated list** of top Path of Exile Unique items for trade-site listings priced below
+the current poe.ninja market floor. This is the one feature in the repo that **cannot** be a pure
+static-page computation like everything else — it needs a real backend to run a periodic
+background check (see rotation-polling below), which only a stateful, scheduled compute primitive
+like a Durable Object can do; a stateless Worker `fetch()` handler has no way to do anything
+between browser polls.
 
-- **Why a backend is unavoidable here**: PoE's real-time mechanism for this is the trade site's own
-  **live-search WebSocket** (`wss://www.pathofexile.com/api/trade/live/{league}/{search_id}`),
-  which pushes new listing IDs the instant they're posted — the correct GGG-provided mechanism
-  (the same one every community sniping tool uses), *not* naive repeated polling of the search
-  endpoint (GGG's documented trade-API rate limits — search 5/12s, 15/62s, 30/302s; fetch 12/6s,
-  16/14s — would get burned through fast and risk a temporary account-wide lockout). That socket
-  requires an `Origin: https://www.pathofexile.com` header (browsers never let JS override
-  `Origin`) and a `Cookie: POESESSID=...` header that cross-origin browser JS cannot attach to a
-  fetch/WebSocket at all (forbidden by browser security; GGG's API doesn't grant third-party
-  origins credentialed CORS access either — this is exactly why every community trade tool is a
-  desktop app, not a website). Confirmed **without** a `POESESSID` at all: plain trade
-  search (`POST /api/trade/search/{league}`) and fetch (`GET /api/trade/fetch/{ids}?query=...`)
-  work fine unauthenticated — only the live-search socket itself needs the credential, so that's
-  the only place it's ever used.
-- **`SnipeSession`** (Durable Object, `worker/worker.js`) — one instance per active search, created
+- **The curated watchlist** (`fetchTopUniqueWatchlist()` in `worker.js`): fetches poe.ninja's
+  stash/item overview feed for the 5 Unique categories (`UniqueWeapon`/`UniqueArmour`/
+  `UniqueAccessory`/`UniqueJewel`/`UniqueFlask`), aggregates per item name (floor chaos price
+  across variant rows — e.g. Mageblood's 2/3/4-flask rows — matching this project's established
+  floor-price philosophy from `build_index()`; summed `listingCount` across variants as a "most
+  sold" proxy, since GGG publishes no real sales data), then takes the **top 50 by listing count**
+  ("most sold") + **top 50 by chaos value** ("most expensive"), deduped by name — up to 100 items,
+  fewer if the two lists overlap. Rebuilt fresh every time a session starts (not cached across
+  sessions), so it always reflects the current league's economy.
+- **Unique-item categories only** — `EXCHANGE_CATEGORIES` (Currency/Fragment/Astrolabe) and the
+  remaining `ITEM_CATEGORIES` (Invitation/Map/SkillGem) are deliberately out of scope, per explicit
+  user request: Faustus (the Expedition NPC) sells every stackable/fungible currency-type good —
+  Currency, Essences, Scarabs, Divination Cards, Delirium, Legion, Fragments, Oils, Catalysts,
+  Omens, Tattoos, Expedition, Harvest, Runegrafts, Allflame — at a fixed Artifacts price in-game,
+  so there's no reason to snipe those on the trade site; only rolled/"variation" items (Uniques)
+  actually need it.
+- **Rotation polling, not a live-search WebSocket, and no POESESSID at all** — this was a real
+  design pivot, not the original plan. Watching ~100 named items in real time would need either
+  100 concurrent per-item live-search WebSockets (a very heavy, unusual account footprint, and
+  ~100 individual `search` setup calls alone would take ~4 minutes to complete within the 5-req/12s
+  limit) or one broad "all currently-listed uniques" live socket filtered client-side by name
+  (confirmed via live testing: `rarity: unique` with no name filter is a valid query, `total: 10000`
+  — but the live feed for that is enormous, and fetching full details on nearly every unique listed
+  site-wide just to check the name would blow through the fetch-endpoint rate limit under real
+  volume). Both were rejected as bad trade-offs (confirmed with the user). Instead, `alarm()`
+  re-fires every ~3s, checks exactly one item from the watchlist (one `search` + one `fetch`
+  call), and advances `rotationIndex` — a full lap through a 100-item list takes ~5 minutes. That's
+  roughly an order of magnitude under both documented rate limits (search 5/12s, fetch 12/6s), and
+  since plain trade search + fetch work fully unauthenticated (confirmed live), **no POESESSID or
+  any other credential is needed anywhere in this feature** — a real simplification from the
+  original live-search-based design, which did need one. Confirmed via `curl` that PoE's trade API
+  sends no CORS headers, so the Worker still has to proxy every trade-API call — only the
+  WebSocket/credential half of the original design went away, not the backend itself.
+- **`SnipeSession`** (Durable Object, `worker/worker.js`) — one instance per active watch, created
   with a random `crypto.randomUUID()` token (never anything PoE-account-identifying) the browser
   holds as its session handle:
-  - `handleStart` — looks up the reference price via a simplified single-category poe.ninja
-    lookup (`fetchNinjaReferencePrice()` — **not** `build_index()`'s full floor-price merge; good
-    enough to flag "clearly underpriced" but if exact parity with the Boss Farm page's pricing is
-    ever needed, port that logic here instead), does exactly **one** `search` REST call, fetches
-    the first page of existing results once, then opens the live-search WebSocket with the
-    `Cookie`/`Origin` headers (confirmed live: Cloudflare Workers' `fetch()`-based WebSocket client
-    *can* set these — not documented by Cloudflare, verified empirically with a throwaway
-    prototype DO before building the real thing).
-  - `onMessage` → `fetchAndBufferListings` — new IDs pushed over the socket get batched (≤10 at a
-    time) through the fetch endpoint, converted to a chaos-equivalent (`toChaos`-style inline
-    logic — only `chaos`/`divine` currencies are compared; anything else is skipped rather than
-    guessed), and buffered in the DO's own memory if underpriced by at least the requested %.
-  - `handlePoll` drains the buffer and extends a Durable Object **alarm** (`alarm()`) that
-    auto-closes the socket after 10 minutes of no polling — sessions never run forever unattended.
-  - `handleStop` closes the socket and clears the alarm immediately.
+  - `handleStart` — builds the watchlist (`fetchTopUniqueWatchlist()`), stores it plus the poe.ninja
+    Divine/Exalted rates (for converting a listing's price to a chaos-equivalent — `chaos`/
+    `divine`/`exalted` are compared; any other currency is skipped rather than guessed), resets
+    `rotationIndex`/`buffer`, and schedules the first alarm ~1s out.
+  - `alarm()` — the rotation engine: stops itself if there's been no poll in 10+ minutes (session
+    considered abandoned), otherwise calls `checkOneItem()` for the current watchlist entry, then
+    advances the index (wrapping around) and reschedules itself ~3s later.
+  - `checkOneItem()` — one `search` (`query.name` = the item's exact name, `status: online`) +
+    one `fetch` on its cheapest few results; any result whose chaos-equivalent price sits below
+    `referenceChaos * (1 - thresholdPct/100)` gets buffered (capped at 200 buffered hits).
+  - `handlePoll` drains the buffer and returns `{running, listings, progress: {index, total}}` so
+    the frontend can show "checked N / 100" — also updates `lastPolledAt`, the idle-timeout clock.
+  - `handleStop` clears the watchlist (which also makes `alarm()`'s next fire a no-op) and deletes
+    the pending alarm.
   - Routes: `POST /snipe/start` (returns `{session}`), `GET /snipe/poll?session=`,
     `POST /snipe/stop` — all same-origin from the served page, CORS headers added anyway (via the
     existing `withCors()`) so a local test page opened from a different origin still works too.
-- **v1 scope is deliberately one item name/category at a time**, not a generic trade-query
-  builder — reimplementing PoE's full stat/mod filter UI would be a much larger feature. Category
-  list (`itemCategory` select in `SNIPE_BODY`) matches `boss.py`'s own `ITEM_CATEGORIES`/
-  `EXCHANGE_CATEGORIES` exactly, so the same names mean the same thing on both pages.
+- **Every listing this page can ever show requires whispering the seller in-game ("in person")** —
+  confirmed via live testing (searched Chaos Orb and Mageblood against the real trade API; every
+  single listing returned has a `whisper` field and `method: "psapi"`/`"forum"`) plus an official
+  GGG forum thread ([view-thread/3901902](https://www.pathofexile.com/forum/view-thread/3901902))
+  where a player explicitly asks for API access to the Asynchronous Trade / "Instant Buyout"
+  system and the consensus is that no such API exists and GGG has shown no interest in building
+  one. **There is currently no known way to query or filter to Instant-Buyout-only listings** —
+  this was the user's original ask, confirmed infeasible through the public API, not attempted via
+  any undocumented endpoint (GGG has been explicit about not wanting third-party tools accessing
+  this). `SNIPE_BODY`'s `snipe_scope_note` states this limitation directly on the page rather than
+  silently showing results that don't match what was asked for.
 - **Frontend** (`SNIPE_BODY`/`SNIPE_JS`, `render_snipe_page()`) follows `render_bosses_page()`'s
-  exact composition pattern. Reuses the shared header's League/Divine chips (League selector
-  genuinely applies here — the trade search itself is per-league) but **hides** the Price/Sync
-  chip-sm block and the Divine chip (`__PRICECHIPS_ATTR__`/`__DIVINE_CHIP_ATTR__`, substituted to
-  `"hidden"` here vs `""` on the Boss Farm page) since this page has no equivalent periodic
-  full-payload sync to report. `__BRAND_ICON__`/`__BRAND_TITLE__` placeholders in
-  `SHARED_HEADER_HTML` let each page set its own brand name/icon in the `<h1>` — added by this
-  feature; the tagline itself doesn't need a placeholder since it's already `data-i18n`-driven
-  (each page's own `I18N.tagline` differs, same pattern as everything else in the shared header).
-  A dedicated modal (`.modalbg`/`.modalbox`, own small CSS block) — not the hover-popover system —
-  explains how to find a `POESESSID`, with a button that opens `pathofexile.com/trade` in a new
-  tab; a hover tooltip isn't enough room for a numbered how-to with a real action button.
+  exact composition pattern. Just a threshold-% input + Start/Stop + status/progress line + results
+  list — no item/category picker, no credential field, since the watchlist is built server-side.
+  Reuses the shared header's League chip/selector (the search itself is still per-league) but
+  **hides** the Price/Sync chip-sm block and the Divine chip (`__PRICECHIPS_ATTR__`/
+  `__DIVINE_CHIP_ATTR__`, substituted to `"hidden"` here vs `""` on the Boss Farm page) since this
+  page has no equivalent periodic full-payload sync to report and no client-visible divine rate.
+  `__BRAND_ICON__`/`__BRAND_TITLE__` placeholders in `SHARED_HEADER_HTML` let each page set its own
+  brand name/icon in the `<h1>`; the tagline itself doesn't need a placeholder since it's already
+  `data-i18n`-driven (each page's own `I18N.tagline` differs, same pattern as everything else in
+  the shared header).
 - **Local dev server limitation**: `python boss.py` renders this page, but Start/Poll/Stop calls
-  will fail — there is no local equivalent of the Durable Object relay (`do_GET` has no matching
-  `do_POST`, and Python's `http.server` doesn't do outbound WebSocket relaying anyway). This
-  feature only fully works once deployed behind the Worker. Documented in-code as a comment above
-  `render_snipe_page()`; don't try to "fix" this by adding local WS support — it's out of scope for
-  what `boss.py`'s dev server is for.
-- **This depends on an undocumented, reverse-engineered protocol detail** (the live-search
-  Origin/Cookie requirement, and the exact shape of the WebSocket's "new listing" push message,
-  which is defensively parsed — `data.new` or `data.ids`, whichever the payload actually uses —
-  since only the initial `{"auth":true}` handshake message has been empirically observed so far).
-  GGG could change this without notice; it is accepted, known fragility, not a guaranteed-stable
-  integration.
+  will fail — there is no local equivalent of the Durable Object's alarm-driven rotation loop
+  (`do_GET` has no matching `do_POST`, and there's no background-timer mechanism in the local dev
+  server). This feature only fully works once deployed behind the Worker. Documented in-code as a
+  comment above `render_snipe_page()`. Note: unlike the original live-search design, nothing here
+  fundamentally *requires* a Worker/DO anymore (no WebSocket, no credential) — a background thread
+  in `boss.py`'s dev server could theoretically replicate the rotation loop locally if that's ever
+  wanted, but it isn't built today; out of scope unless requested.
+
+### Admin detection (`admin-extension/`, `SHARED_JS_CHROME`)
+
+A personal "PoE Helper Admin" Chrome extension (unpublished, loaded unpacked — see
+`admin-extension/manifest.json`) flags the site's owner as admin in their own browser. **This is
+not real authentication** — it's a client-side convenience flag with nothing sensitive behind it
+(this repo has no login/database/write endpoints, see Security below). Currently gates: showing
+the hidden Trade Sniper link in the site menu (see the "hidden from menu" note on `PAGES` above)
+and a small `ADMIN` chip in the header.
+
+- **Handshake, not a plain flag**: the extension's content script runs in an isolated JS world and
+  can't set a property directly on the page's own `window` — a `CustomEvent` dispatched on
+  `window` is the one thing both worlds can observe. The page dispatches
+  `poe-helper-admin-request` on load; the extension (if installed) answers with
+  `poe-helper-admin-response` carrying its token. Whichever side finishes loading first, the
+  answer always arrives once both exist — no race on injection timing. No answer ever arrives for
+  visitors without the extension, which is indistinguishable from "not admin."
+- **Hash, not a plain token comparison**: the page only ever hardcodes `EXPECTED_ADMIN_HASH` (a
+  SHA-256 hex digest, computed client-side via `crypto.subtle.digest` on whatever token the
+  extension sends) — never the raw token. This means reading this repo's own JS source doesn't
+  hand anyone a working token to fake admin with in devtools.
+- **`admin-extension/` is git-ignored on purpose** — it holds the plaintext token in `content.js`.
+  Since this repo's remote is public, committing it would publish the one secret the hash scheme
+  exists to protect (anyone could then read the token off GitHub and fake admin instantly via
+  `window.dispatchEvent(new CustomEvent('poe-helper-admin-response', {detail: '<token>'}))` in
+  devtools — no extension needed). Keep your own local copy of that folder safe; regenerate a new
+  random token + hash (`secrets.token_hex(32)` + `hashlib.sha256(...).hexdigest()`) and update both
+  `content.js` and `EXPECTED_ADMIN_HASH` together if it's ever suspected leaked.
+- Lives in `SHARED_JS_CHROME` (not a per-page constant) so both pages recognize admin status
+  consistently — the injected menu link and badge are built via plain DOM methods at runtime
+  (`enableAdminUI()`), not through `render_sitemenu()`/`PAGES`, since those are baked into the
+  static HTML at build time and can't reflect a client-side-only signal.
 
 ### Security
 
-- **`POESESSID` handling**: treated as a password-equivalent credential end-to-end. Sent from the
-  browser straight to this site's own Worker over HTTPS only (never to any third party), held only
-  in the `SnipeSession` Durable Object's **in-memory** instance state for that session's lifetime
-  (never written to any log, KV/D1, or file — confirm with `wrangler tail` during a real test that
-  it never appears in Worker log output), and cached client-side only in `localStorage`
-  (`bossFarmSnipeSessid`, same pattern as `bossFarmLeague`/`bossFarmTheme`) purely so the user
-  doesn't have to repaste it every visit — never sent anywhere except this site's own `/snipe/*`
-  routes. A clear on-page warning sits directly under the field, plus the POESESSID modal's own
-  warning line.
 - **HTML-injection hardening (`escAttr()`)**: `it.icon` (poe.ninja's icon URL, including the Astrolabe-specific `image` field), `it.url` (built from poe.ninja's `detailsId` when a price is found), and `it.type` (via `nmeClass()`) are the only fields flowing into `innerHTML`-rendered HTML attributes (`src=`, `href=`, `class=`) that originate from poe.ninja's API rather than this file's own trusted `ENTITIES` data. All three are passed through `escAttr()` (escapes `&"<>`) before interpolation. This defends against a compromised/malformed upstream response breaking out of an attribute and injecting an event handler — HTTPS + the fixed real poe.ninja domain already make this low-likelihood, but it was free to close. **If you add another field sourced from poe.ninja/poe.watch into an HTML attribute, run it through `escAttr()` too** — boss/item *names* don't need this (they come from `ENTITIES`, which this repo's own maintainer controls).
 - **`worker.js` reviewed and confirmed safe**: the `/ninja/<path>` proxy always concatenates onto the fixed `NINJA_BASE` string (never a relative-URL resolution against attacker input), so the upstream host can never change regardless of what a client requests — no SSRF. The `/bosses` redirect (`Response.redirect(url.origin + "/bosses", 302)`) always targets the Worker's own origin, never an attacker-supplied URL — no open redirect. `withCors()` sends `X-Content-Type-Options: nosniff` as cheap defense-in-depth.
 - **`?league=` query param (local server) is length-capped** (`[:64]` in `do_GET`) — added because `_cache`/`_index_cache` never evict entries, so an unbounded stream of distinct junk league strings would otherwise grow server memory forever. Low severity in practice (the server only binds `127.0.0.1`, never internet-reachable per its existing design), but cheap to close and matches this file's own "fail fast" standard.

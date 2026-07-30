@@ -43,36 +43,39 @@ function withCors(body, status, contentType) {
 }
 
 // --------------------------------------------------------------------------- //
-// SnipeSession — one Durable Object instance per active trade-sniper search.
+// SnipeSession — one Durable Object instance per active trade-sniper watch.
 //
-// Why this exists at all: PoE's live-search WebSocket
-// (wss://www.pathofexile.com/api/trade/live/<league>/<searchId>) requires a
-// Cookie: POESESSID=... header and an Origin: https://www.pathofexile.com
-// header on the upgrade request. Browsers can't do either from a
-// third-party page (JS can't override Origin; cross-origin fetch/WebSocket
-// can't attach a Cookie header at all) — confirmed live against the real
-// endpoint before building this (see CLAUDE.md). So the browser never holds
-// a WebSocket itself; it just polls this DO over plain HTTP.
-//
-// Confirmed live: plain trade search + fetch (steps 1 and 3 below) work
-// WITHOUT any POESESSID at all — only the live-search socket itself needs
-// it, so that's the only place the credential is used, and it's never
-// logged, persisted to storage, or echoed back in any response.
-//
-// Rate-limit discipline (GGG's documented trade API limits: search 5/12s,
-// 15/62s, 30/302s; fetch 12/6s, 16/14s): exactly one search call per
-// session start, fetch calls batched to <=10 ids at a time and only fired
-// when the live socket actually pushes new ids (never polled/repeated).
+// Watches a curated list (top 50 poe.ninja unique listing-count + top 50
+// poe.ninja unique price, deduped — see fetchTopUniqueWatchlist) rather than
+// one named item. Watching ~100 items in real time would need either one
+// live-search WebSocket per item (100 concurrent authenticated connections —
+// a very heavy, unusual footprint) or one broad "all currently-listed
+// uniques" live socket filtered client-side (technically one connection, but
+// the live feed for "any unique, no name filter" is enormous — filtering it
+// down would mean fetching full details on nearly every unique listed
+// site-wide just to check the name, blowing through the fetch-endpoint rate
+// limit under real volume). Neither is a good trade-off, so this uses
+// **rotation polling** instead: no WebSocket, no POESESSID, no live-search at
+// all. `alarm()` re-fires every ~3s, checks the single next item in the
+// watchlist (one `search` + one `fetch` call), and moves on — a full lap
+// through a 100-item list takes ~5 minutes. That's comfortably inside GGG's
+// documented rate limits (search 5/12s, fetch 12/6s — this uses one of each
+// per 3s, an order of magnitude under both) and needs no credential at all,
+// since plain trade search + fetch work fully unauthenticated (confirmed
+// live). Trades instant push for a ~5-minute-average staleness, which is the
+// deliberate, user-approved choice here over the two risky alternatives above.
 export class SnipeSession {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.ws = null;
+    this.watchlist = [];       // [{name, chaos}] — chaos is the poe.ninja floor reference price
+    this.rotationIndex = 0;
     this.buffer = [];
-    this.searchId = null;
-    this.referenceChaos = null;
+    this.league = null;
     this.divineRate = null;
+    this.exaltedRate = null;
     this.thresholdPct = 20;
+    this.lastPolledAt = 0;
   }
 
   async fetch(request) {
@@ -84,7 +87,7 @@ export class SnipeSession {
   }
 
   async handleStart(request) {
-    if (this.ws) {
+    if (this.watchlist.length) {
       return new Response(JSON.stringify({ ok: false, error: "session already running" }), { status: 409 });
     }
     let body;
@@ -93,111 +96,73 @@ export class SnipeSession {
     } catch (e) {
       return new Response(JSON.stringify({ ok: false, error: "bad JSON body" }), { status: 400 });
     }
-    const { poesessid, league, itemName, itemCategory, thresholdPct } = body;
-    if (!poesessid || !league || !itemName || !itemCategory) {
-      return new Response(JSON.stringify({ ok: false, error: "need poesessid, league, itemName, itemCategory" }), { status: 400 });
+    const { league, thresholdPct } = body;
+    if (!league) {
+      return new Response(JSON.stringify({ ok: false, error: "need league" }), { status: 400 });
     }
+    this.league = league;
     this.thresholdPct = Math.min(90, Math.max(1, Number(thresholdPct) || 20));
 
+    let data;
     try {
-      const ref = await fetchNinjaReferencePrice(league, itemCategory, itemName);
-      this.referenceChaos = ref.chaos;
-      this.divineRate = ref.divineRate;
+      data = await fetchTopUniqueWatchlist(league);
     } catch (e) {
-      return new Response(JSON.stringify({ ok: false, error: "poe.ninja price lookup failed: " + e }), { status: 502 });
+      return new Response(JSON.stringify({ ok: false, error: "poe.ninja lookup failed: " + e }), { status: 502 });
     }
-    if (this.referenceChaos == null) {
-      return new Response(JSON.stringify({ ok: false, error: "no current poe.ninja price found for that exact item name/category" }), { status: 400 });
+    if (!data.watchlist.length) {
+      return new Response(JSON.stringify({ ok: false, error: "no current poe.ninja unique price data found for that league" }), { status: 400 });
     }
+    this.watchlist = data.watchlist;
+    this.divineRate = data.divineRate;
+    this.exaltedRate = data.exaltedRate;
+    this.rotationIndex = 0;
+    this.buffer = [];
+    this.lastPolledAt = Date.now();
 
-    const isUnique = itemCategory.startsWith("Unique");
-    const query = isUnique
-      ? { query: { status: { option: "online" }, name: itemName }, sort: { price: "asc" } }
-      : { query: { status: { option: "online" }, type: itemName }, sort: { price: "asc" } };
+    await this.state.storage.setAlarm(Date.now() + 1000);
+    return new Response(JSON.stringify({ ok: true, watchlistSize: this.watchlist.length }), { status: 200 });
+  }
+
+  async checkOneItem(item) {
     let searchResp;
     try {
-      searchResp = await fetch(`https://www.pathofexile.com/api/trade/search/${encodeURIComponent(league)}`, {
+      searchResp = await fetch(`https://www.pathofexile.com/api/trade/search/${encodeURIComponent(this.league)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "User-Agent": TRADE_UA },
-        body: JSON.stringify(query),
+        body: JSON.stringify({ query: { status: { option: "online" }, name: item.name }, sort: { price: "asc" } }),
       });
-    } catch (e) {
-      return new Response(JSON.stringify({ ok: false, error: "trade search request failed: " + e }), { status: 502 });
-    }
-    if (!searchResp.ok) {
-      return new Response(JSON.stringify({ ok: false, error: "trade search API returned " + searchResp.status }), { status: 502 });
-    }
+    } catch (e) { return; }
+    if (!searchResp.ok) return;
     const searchData = await searchResp.json();
-    if (!searchData.id) {
-      return new Response(JSON.stringify({ ok: false, error: "trade search returned no search id" }), { status: 502 });
-    }
-    this.searchId = searchData.id;
+    if (!searchData.id || !Array.isArray(searchData.result) || !searchData.result.length) return;
 
-    if (Array.isArray(searchData.result) && searchData.result.length) {
-      await this.fetchAndBufferListings(searchData.result.slice(0, 10));
-    }
-
+    const ids = searchData.result.slice(0, 5).join(",");
+    let fetchResp;
     try {
-      const wsResp = await fetch(`https://www.pathofexile.com/api/trade/live/${encodeURIComponent(league)}/${encodeURIComponent(this.searchId)}`, {
-        headers: {
-          "Upgrade": "websocket",
-          "Cookie": `POESESSID=${poesessid}`,
-          "Origin": "https://www.pathofexile.com",
-          "User-Agent": TRADE_UA,
-        },
-      });
-      const ws = wsResp.webSocket;
-      if (!ws) {
-        return new Response(JSON.stringify({ ok: false, error: "live-search connection rejected (HTTP " + wsResp.status + ") — check your POESESSID is current" }), { status: 502 });
-      }
-      ws.accept();
-      this.ws = ws;
-      ws.addEventListener("message", (e) => this.onMessage(e));
-      ws.addEventListener("close", () => { this.ws = null; });
-      ws.addEventListener("error", () => { this.ws = null; });
-    } catch (e) {
-      return new Response(JSON.stringify({ ok: false, error: "live-search websocket connect failed: " + e }), { status: 502 });
-    }
-
-    await this.state.storage.setAlarm(Date.now() + 10 * 60 * 1000); // auto-stop after 10 min with no polls
-    return new Response(JSON.stringify({ ok: true }), { status: 200 });
-  }
-
-  onMessage(event) {
-    let data;
-    try { data = JSON.parse(event.data); } catch (e) { return; }
-    if (data.auth) return; // initial connection-confirmed message, not a listing update
-    const ids = Array.isArray(data.new) ? data.new : (Array.isArray(data.ids) ? data.ids : null);
-    if (ids && ids.length) this.fetchAndBufferListings(ids).catch(() => {});
-  }
-
-  async fetchAndBufferListings(ids) {
-    const chunk = ids.slice(0, 10).join(",");
-    let resp;
-    try {
-      resp = await fetch(`https://www.pathofexile.com/api/trade/fetch/${chunk}?query=${this.searchId}`, {
+      fetchResp = await fetch(`https://www.pathofexile.com/api/trade/fetch/${ids}?query=${searchData.id}`, {
         headers: { "User-Agent": TRADE_UA },
       });
     } catch (e) { return; }
-    if (!resp.ok) return;
-    let data;
-    try { data = await resp.json(); } catch (e) { return; }
-    for (const r of (data.result || [])) {
+    if (!fetchResp.ok) return;
+    const fetchData = await fetchResp.json();
+
+    for (const r of (fetchData.result || [])) {
       if (!r || !r.listing || !r.listing.price) continue;
       const { amount, currency } = r.listing.price;
       if (amount == null || !currency) continue;
       const chaosEquiv = currency === "chaos" ? amount
         : (currency === "divine" && this.divineRate) ? amount * this.divineRate
+        : (currency === "exalted" && this.exaltedRate) ? amount * this.exaltedRate
         : null;
       if (chaosEquiv == null) continue; // unsupported currency for comparison, skip
-      if (chaosEquiv > this.referenceChaos * (1 - this.thresholdPct / 100)) continue; // not underpriced enough
+      if (chaosEquiv > item.chaos * (1 - this.thresholdPct / 100)) continue; // not underpriced enough
       this.buffer.push({
         id: r.id,
-        itemName: (r.item && (r.item.name || r.item.typeLine || r.item.baseType)) || "?",
+        itemName: (r.item && (r.item.name || r.item.typeLine || r.item.baseType)) || item.name,
         icon: (r.item && r.item.icon) || null,
         amount, currency,
         chaosEquiv: Math.round(chaosEquiv * 100) / 100,
-        referenceChaos: this.referenceChaos,
+        referenceChaos: item.chaos,
         account: (r.listing.account && r.listing.account.name) || "?",
         whisper: r.listing.whisper || "",
         seenAt: Date.now(),
@@ -207,64 +172,90 @@ export class SnipeSession {
   }
 
   async handlePoll() {
-    await this.state.storage.setAlarm(Date.now() + 10 * 60 * 1000); // extend idle timer
+    this.lastPolledAt = Date.now();
+    const running = !!this.watchlist.length;
     const listings = this.buffer;
     this.buffer = [];
-    return new Response(JSON.stringify({ ok: true, running: !!this.ws, listings }), { status: 200 });
+    return new Response(JSON.stringify({
+      ok: true, running, listings,
+      progress: running ? { index: this.rotationIndex, total: this.watchlist.length } : null,
+    }), { status: 200 });
   }
 
   async handleStop() {
-    if (this.ws) { try { this.ws.close(); } catch (e) {} this.ws = null; }
+    this.watchlist = [];
     await this.state.storage.deleteAlarm();
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   }
 
   async alarm() {
-    if (this.ws) { try { this.ws.close(); } catch (e) {} this.ws = null; }
+    if (!this.watchlist.length) return;
+    if (Date.now() - this.lastPolledAt > 10 * 60 * 1000) {
+      this.watchlist = []; // no poll in 10+ min — stop rotating, matches handleStop's end state
+      return;
+    }
+    try {
+      await this.checkOneItem(this.watchlist[this.rotationIndex]);
+    } catch (e) { /* transient failure on this one item — keep the rotation going */ }
+    this.rotationIndex = (this.rotationIndex + 1) % this.watchlist.length;
+    await this.state.storage.setAlarm(Date.now() + 3000);
   }
 }
 
 const TRADE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 
-// Simplified single-category poe.ninja lookup — NOT the full multi-source
-// floor-price merge boss.py's build_index() does. Good enough to flag
-// "clearly underpriced" for the sniper; if you need the exact same
-// realistic-floor logic boss.py uses, port build_index() here instead.
-async function fetchNinjaReferencePrice(league, itemCategory, itemName) {
-  const isExchangeCategory = ["Currency", "Fragment", "Astrolabe"].includes(itemCategory);
-  const base = isExchangeCategory
-    ? `${NINJA_BASE}/exchange/current/overview`
-    : `${NINJA_BASE}/stash/current/item/overview`;
-  const qs = new URLSearchParams({ league, type: itemCategory });
-  const resp = await fetch(`${base}?${qs}`, { headers: { "User-Agent": UA } });
-  const data = await resp.json();
+// Builds the curated watchlist: top 50 uniques by poe.ninja listingCount
+// ("most sold" proxy — GGG publishes no real sales data, listing count is
+// the best available liquidity signal) plus top 50 by chaos value ("most
+// expensive"), deduped by name. Reference price per name is the FLOOR chaos
+// value across all its poe.ninja rows (matches this project's established
+// floor-price philosophy — see boss.py's build_index() — since a name like
+// "Mageblood" has several rows, one per flask-count variant, and the trade
+// search-by-name below returns all of them mixed together).
+async function fetchTopUniqueWatchlist(league) {
+  const categories = ["UniqueWeapon", "UniqueArmour", "UniqueAccessory", "UniqueJewel", "UniqueFlask"];
+  const results = await Promise.all(categories.map(async (cat) => {
+    const qs = new URLSearchParams({ league, type: cat });
+    const resp = await fetch(`${NINJA_BASE}/stash/current/item/overview?${qs}`, { headers: { "User-Agent": UA } });
+    return resp.json();
+  }));
 
-  let chaos = null;
-  if (isExchangeCategory) {
-    const idToMeta = {};
-    for (const it of (data.items || [])) if (it.id) idToMeta[it.id] = it;
+  const byName = new Map(); // name -> {chaos, listingCount}
+  for (const data of results) {
     for (const line of (data.lines || [])) {
-      const meta = idToMeta[line.id] || {};
-      const nm = meta.name || line.currencyTypeName || line.name;
-      if (nm === itemName) { chaos = line.primaryValue; break; }
-    }
-  } else {
-    for (const line of (data.lines || [])) {
-      if (line.name === itemName) { chaos = line.chaosValue ?? line.chaosEquivalent; break; }
+      if (!line.name) continue;
+      const chaos = line.chaosValue ?? line.chaosEquivalent;
+      if (chaos == null) continue;
+      const count = line.listingCount ?? line.count ?? 0;
+      const cur = byName.get(line.name);
+      if (!cur) byName.set(line.name, { chaos, listingCount: count });
+      else {
+        if (chaos < cur.chaos) cur.chaos = chaos;
+        cur.listingCount += count;
+      }
     }
   }
 
-  let divineRate = null;
-  const divResp = await fetch(`${NINJA_BASE}/exchange/current/overview?${new URLSearchParams({ league, type: "Currency" })}`, { headers: { "User-Agent": UA } });
-  const divData = await divResp.json();
-  const idToMeta2 = {};
-  for (const it of (divData.items || [])) if (it.id) idToMeta2[it.id] = it;
-  for (const line of (divData.lines || [])) {
-    const meta = idToMeta2[line.id] || {};
-    if ((meta.name || line.currencyTypeName) === "Divine Orb") { divineRate = line.primaryValue; break; }
+  const all = Array.from(byName.entries()).map(([name, v]) => ({ name, chaos: v.chaos, listingCount: v.listingCount }));
+  const byMostSold = [...all].sort((a, b) => b.listingCount - a.listingCount).slice(0, 50);
+  const byMostExpensive = [...all].sort((a, b) => b.chaos - a.chaos).slice(0, 50);
+
+  const watchlistMap = new Map();
+  for (const it of [...byMostSold, ...byMostExpensive]) watchlistMap.set(it.name, it.chaos);
+  const watchlist = Array.from(watchlistMap.entries()).map(([name, chaos]) => ({ name, chaos }));
+
+  let divineRate = null, exaltedRate = null;
+  const curResp = await fetch(`${NINJA_BASE}/exchange/current/overview?${new URLSearchParams({ league, type: "Currency" })}`, { headers: { "User-Agent": UA } });
+  const curData = await curResp.json();
+  const idToMeta = {};
+  for (const it of (curData.items || [])) if (it.id) idToMeta[it.id] = it;
+  for (const line of (curData.lines || [])) {
+    const nm = (idToMeta[line.id] || {}).name || line.currencyTypeName;
+    if (nm === "Divine Orb") divineRate = line.primaryValue;
+    if (nm === "Exalted Orb") exaltedRate = line.primaryValue;
   }
 
-  return { chaos, divineRate };
+  return { watchlist, divineRate, exaltedRate };
 }
 
 export default {

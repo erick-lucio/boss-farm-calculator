@@ -1095,6 +1095,9 @@ footer{border-top:1px solid var(--line); margin-top:24px;
 
 .meta-left[hidden]{display:none}
 
+.chip.admin-badge{color:var(--bg); background:var(--gold); border-color:var(--gold); font-weight:700;
+  font-family:"Cinzel",serif; letter-spacing:.12em; font-size:11px; text-transform:uppercase}
+
 .snipe-form{background:linear-gradient(180deg,var(--panel),var(--panel2));
   border:1px solid var(--line); border-radius:4px; padding:16px 18px; margin-top:14px;
   display:flex; flex-direction:column; gap:12px}
@@ -1103,12 +1106,6 @@ footer{border-top:1px solid var(--line); margin-top:24px;
   font-family:ui-monospace,monospace; text-transform:uppercase; letter-spacing:.05em; flex:1; min-width:160px}
 .snipe-row input, .snipe-row select{font-family:"Spectral",Georgia,serif; font-size:13px; color:var(--ink);
   background:var(--panel); border:1px solid var(--line); border-radius:2px; padding:8px 10px}
-.snipe-idrow{display:flex; align-items:flex-end; gap:6px; flex:1; min-width:200px}
-.snipe-idrow label{flex:1}
-.info-btn{width:22px; height:22px; border-radius:50%; background:var(--panel); color:var(--uber);
-  border:1px solid var(--line); cursor:help; font-size:12px; line-height:1; text-align:center;
-  padding:0; flex:0 0 auto; font-family:ui-monospace,monospace}
-.info-btn:hover{color:var(--ink)}
 .snipe-actions{display:flex; align-items:center; gap:10px}
 .snipe-status{font-family:ui-monospace,monospace; font-size:12px; color:var(--ink-dim)}
 .snipe-status.err{color:var(--neg)}
@@ -1118,7 +1115,6 @@ button.stop{font-family:"Cinzel",serif; font-weight:700; font-size:11px; letter-
   padding:8px 16px; cursor:pointer; border-radius:2px}
 button.stop:hover{border-color:var(--neg); color:var(--neg)}
 button.sync:disabled, button.stop:disabled{opacity:.4; cursor:default}
-.snipe-warn{font-size:12px; color:var(--warn); line-height:1.5}
 .snipe-results{margin-top:18px}
 .snipe-list{display:flex; flex-direction:column; gap:8px; margin-top:10px}
 .snipe-hit{display:flex; align-items:center; gap:12px; background:var(--panel);
@@ -1130,17 +1126,6 @@ button.sync:disabled, button.stop:disabled{opacity:.4; cursor:default}
 .snipe-hit a.whisper{font-family:ui-monospace,monospace; font-size:11px; color:var(--uber);
   border:1px solid var(--line); border-radius:2px; padding:4px 9px; white-space:nowrap}
 .snipe-hit a.whisper:hover{color:var(--ink); border-color:var(--uber)}
-
-.modalbg{display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:60;
-  align-items:center; justify-content:center; padding:20px}
-.modalbg.show{display:flex}
-.modalbox{background:var(--panel2); border:1px solid var(--line); border-radius:6px;
-  padding:22px 26px; max-width:480px; box-shadow:0 20px 50px -20px var(--shadow)}
-.modalbox h3{margin-top:0; color:var(--gold-bright); font-family:"Cinzel",serif; letter-spacing:.06em}
-.modalbox ol{padding-left:20px; line-height:1.8; font-size:13.5px}
-.modalbox p{font-size:12.5px; line-height:1.6}
-.modalbox .modal-actions{display:flex; gap:10px; margin-top:14px}
-.modalbox .secondary{background:var(--panel); color:var(--ink-dim); border:1px solid var(--line)}
 </style>"""
 
 SHARED_HEADER_HTML = r"""<header>
@@ -1254,6 +1239,55 @@ document.getElementById('menutoggle').addEventListener('click', openMenu);
 document.getElementById('sitemenu-close').addEventListener('click', closeMenu);
 document.getElementById('siteoverlay').addEventListener('click', closeMenu);
 document.addEventListener('keydown', e => { if(e.key === 'Escape') closeMenu(); });
+
+// Admin detection via the "PoE Helper Admin" Chrome extension (personal-use,
+// unpublished — see admin-extension/). This is NOT real authentication: it's
+// a client-side convenience flag with nothing sensitive behind it (this repo
+// has no login/database/write endpoints — see the Security section of
+// CLAUDE.md). The site only ever stores a SHA-256 hash of the extension's
+// token, never the token itself, so reading this page's source alone doesn't
+// hand anyone a working token — but this is still just a personal toggle to
+// show/hide dev-only UI in your own browser, not an access-control boundary.
+//
+// The extension's content script runs in an isolated JS world and can't set
+// a property directly on this page's own `window` — a CustomEvent dispatched
+// on `window` is the one thing both worlds can observe, so that's the
+// handshake: this page asks "are you there?", the extension (if installed)
+// answers with its token. Whichever side finishes loading first, the answer
+// always arrives once both exist — no race on injection timing. No response
+// ever arrives for the vast majority of visitors (no extension installed),
+// which is indistinguishable from "not admin" — there's nothing to time out,
+// the admin-only UI just never appears.
+async function sha256Hex(str){
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+const EXPECTED_ADMIN_HASH = '32aeba3d9e6dd8c874802de0d20d1b619dbcf326d11d8ae4d58ab9e33aad3172';
+function enableAdminUI(){
+  const meta = document.querySelector('.meta');
+  if(meta && !document.getElementById('adminbadge')){
+    const badge = document.createElement('div');
+    badge.className = 'chip admin-badge';
+    badge.id = 'adminbadge';
+    badge.textContent = 'ADMIN';
+    meta.insertBefore(badge, meta.firstChild);
+  }
+  const menu = document.getElementById('sitemenu');
+  if(menu && !menu.querySelector('a[href="/snipe"]')){
+    const isCurrent = location.pathname.startsWith('/snipe');
+    const a = document.createElement('a');
+    a.className = 'sitemenu-link' + (isCurrent ? ' active' : '');
+    a.href = '/snipe';
+    if(isCurrent) a.setAttribute('aria-current', 'page');
+    a.innerHTML = '&#127919; <span>' + t('menu_snipe') + '</span>';
+    menu.appendChild(a);
+  }
+}
+window.addEventListener('poe-helper-admin-response', async e => {
+  const hash = await sha256Hex(e.detail || '');
+  if(hash === EXPECTED_ADMIN_HASH) enableAdminUI();
+});
+window.dispatchEvent(new CustomEvent('poe-helper-admin-request'));
 """
 
 # --------------------------------------------------------------------------- #
@@ -1999,15 +2033,17 @@ def render_bosses_page():
 # --------------------------------------------------------------------------- #
 # Trade Sniper page (/snipe)
 # --------------------------------------------------------------------------- #
-# Watches PoE's official trade site (via a Cloudflare Durable Object relay,
-# see worker/worker.js's SnipeSession) for listings priced below the current
-# poe.ninja market floor, using the user's own POESESSID. Unlike the Boss
-# Farm page, this feature is NOT a pure static-page computation — it needs a
-# real backend holding an authenticated live-search WebSocket to PoE (see
-# CLAUDE.md's Trade Sniper section for why: browsers can't set the Origin/
-# Cookie headers PoE's live-search endpoint requires). Locally (`python
-# boss.py`), this page renders but Start/Stop/Poll calls will fail — there's
-# no local equivalent of the Durable Object relay. It only works fully once
+# Watches a curated list of Unique items (top 50 poe.ninja listing-count +
+# top 50 poe.ninja price, deduped — see worker.js's fetchTopUniqueWatchlist)
+# for trade-site listings priced below the poe.ninja floor, via a Cloudflare
+# Durable Object (worker/worker.js's SnipeSession) that rotates through the
+# list roughly once every 5 minutes (one search+fetch call every ~3s — see
+# CLAUDE.md for the rate-limit reasoning behind rotation-polling instead of a
+# live-search WebSocket). No POESESSID needed — plain trade search+fetch work
+# fully unauthenticated. Unlike the Boss Farm page, this still needs a real
+# backend (the Durable Object's alarm-driven rotation loop), so locally
+# (`python boss.py`) this page renders but Start/Stop/Poll calls will fail —
+# there's no local equivalent of the Durable Object. It only works fully once
 # deployed behind the Worker (poe-farm-helper.com or the *.workers.dev URL).
 SNIPE_EXTRA_CONTROLS = ""
 
@@ -2015,40 +2051,22 @@ SNIPE_BODY = r"""
 
 <div class="wrap">
   <div class="note" data-i18n="snipe_intro">
-    Watches Path of Exile's official trade site for listings priced below the current market
-    floor (from the same poe.ninja data the Boss Farm page uses), and lets you know the instant
-    one appears. Requires your own POESESSID — see the &#9432; button below for how to find it.
-    One item search at a time in this version.
+    Watches a curated list of Path of Exile Unique items — the top 50 by poe.ninja listing count
+    ("most sold" proxy) plus the top 50 by poe.ninja price ("most expensive"), deduped — for
+    trade-site listings priced below the current market floor. Rotates through the whole list
+    roughly once every 5 minutes, one item at a time, to stay well within Path of Exile's trade
+    API rate limits. No POESESSID needed.
+  </div>
+  <div class="note" data-i18n="snipe_scope_note">
+    Uniques only — Currency, Fragments, Scarabs, and other stackable currency-type goods are
+    intentionally left out (buy those from Faustus in-game instead, at a fixed Artifacts price).
+    Also: every listing found here requires whispering the seller in-game to complete the trade —
+    Path of Exile's Instant Buyout / Asynchronous Trade system has no public API, so this can't
+    show or filter to instant-buyout-only listings.
   </div>
 
   <div class="snipe-form">
     <div class="snipe-row">
-      <div class="snipe-idrow">
-        <label><span data-i18n="snipe_poessid_label">POESESSID</span>
-          <input type="password" id="poessid" autocomplete="off" placeholder="paste here">
-        </label>
-        <button type="button" class="info-btn" id="poessidHelp" aria-label="how to find your POESESSID">&#9432;</button>
-      </div>
-    </div>
-    <div class="snipe-row">
-      <label style="flex:2; min-width:220px"><span data-i18n="snipe_item_label">Item name (exact)</span>
-        <input type="text" id="itemName" placeholder="e.g. Mageblood, Exalted Orb, Headhunter">
-      </label>
-      <label><span data-i18n="snipe_category_label">Category</span>
-        <select id="itemCategory">
-          <option value="Currency">Currency</option>
-          <option value="Fragment">Fragment</option>
-          <option value="Astrolabe">Astrolabe</option>
-          <option value="UniqueWeapon">Unique Weapon</option>
-          <option value="UniqueArmour">Unique Armour</option>
-          <option value="UniqueAccessory">Unique Accessory</option>
-          <option value="UniqueJewel">Unique Jewel</option>
-          <option value="UniqueFlask">Unique Flask</option>
-          <option value="Invitation">Invitation</option>
-          <option value="Map">Map</option>
-          <option value="SkillGem">Skill Gem</option>
-        </select>
-      </label>
       <label><span data-i18n="snipe_threshold_label">Underpriced by at least</span>
         <input type="number" id="threshold" value="20" min="1" max="90" style="width:70px">
       </label>
@@ -2060,38 +2078,15 @@ SNIPE_BODY = r"""
       </div>
       <span class="snipe-status" id="snipeStatus" data-i18n="snipe_status_idle">idle</span>
     </div>
-    <div class="snipe-warn" data-i18n="snipe_credential_warn">
-      Your POESESSID logs trade requests in as you — treat it like a password. It's sent straight
-      to this site's own backend over HTTPS to open the connection to pathofexile.com and is never
-      logged, stored server-side, or sent anywhere else. It's kept in this browser's local storage
-      only so you don't have to repaste it every visit — clear it any time by clearing the field
-      and clicking Start once, or clearing your browser's site data.
+    <div class="snipe-row" id="snipeProgressRow" hidden>
+      <span class="snipe-status" id="snipeProgress"></span>
     </div>
   </div>
 
   <div class="snipe-results">
     <div class="slabel"><span data-i18n="snipe_results_label">Underpriced listings found</span></div>
     <div class="snipe-list" id="snipeList"></div>
-    <div class="empty" id="snipeEmpty" data-i18n="snipe_results_empty">Nothing yet — start a search above.</div>
-  </div>
-</div>
-
-<div class="modalbg" id="poessidModal">
-  <div class="modalbox">
-    <h3 data-i18n="snipe_modal_title">How to get your POESESSID</h3>
-    <ol data-i18n="snipe_modal_steps">
-      <li>Click "Open pathofexile.com/trade" below and log in if needed.</li>
-      <li>Press <b>F12</b> to open your browser's DevTools.</li>
-      <li>Go to the <b>Application</b> tab (Chrome/Edge) or <b>Storage</b> tab (Firefox).</li>
-      <li>In the left sidebar: <b>Cookies</b> &rarr; <b>https://www.pathofexile.com</b>.</li>
-      <li>Find the row named <b>POESESSID</b> and copy its <b>Value</b>.</li>
-      <li>Paste it into the POESESSID field on this page.</li>
-    </ol>
-    <p class="snipe-warn" data-i18n="snipe_modal_warn">This value logs you in as you — treat it like a password. It only ever goes from your browser to this site's own backend, never anywhere else.</p>
-    <div class="modal-actions">
-      <button class="sync" id="poessidModalOpen" data-i18n="snipe_modal_open_btn">Open pathofexile.com/trade</button>
-      <button class="stop secondary" id="poessidModalClose" data-i18n="snipe_modal_close_btn">Close</button>
-    </div>
+    <div class="empty" id="snipeEmpty" data-i18n="snipe_results_empty">Nothing yet — start watching above.</div>
   </div>
 </div>
 """
@@ -2122,13 +2117,11 @@ en: {
   tagline: 'PATH OF EXILE · TRADE SNIPER',
   menu_title: 'Menu', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
-  footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Uses Path of Exile’s official trade API on your behalf, with your own POESESSID — nothing is stored server-side beyond an active session.',
+  footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Uses Path of Exile’s official, unauthenticated trade API to check a curated list of items on a rotation — nothing is stored server-side beyond an active session.',
   footer_made_by: 'Built by Erick Lúcio',
   footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
-  snipe_intro: 'Watches Path of Exile’s official trade site for listings priced below the current market floor (from the same poe.ninja data the Boss Farm page uses), and lets you know the instant one appears. Requires your own POESESSID — see the ⓘ button below for how to find it. One item search at a time in this version.',
-  snipe_poessid_label: 'POESESSID',
-  snipe_item_label: 'Item name (exact)',
-  snipe_category_label: 'Category',
+  snipe_intro: 'Watches a curated list of Path of Exile Unique items — the top 50 by poe.ninja listing count ("most sold" proxy) plus the top 50 by poe.ninja price ("most expensive"), deduped — for trade-site listings priced below the current market floor. Rotates through the whole list roughly once every 5 minutes, one item at a time, to stay well within Path of Exile’s trade API rate limits. No POESESSID needed.',
+  snipe_scope_note: 'Uniques only — Currency, Fragments, Scarabs, and other stackable currency-type goods are intentionally left out (buy those from Faustus in-game instead, at a fixed Artifacts price). Also: every listing found here requires whispering the seller in-game to complete the trade — Path of Exile’s Instant Buyout / Asynchronous Trade system has no public API, so this can’t show or filter to instant-buyout-only listings.',
   snipe_threshold_label: 'Underpriced by at least',
   snipe_btn_start: 'Start watching',
   snipe_btn_stop: 'Stop',
@@ -2136,33 +2129,20 @@ en: {
   snipe_status_starting: 'starting…',
   snipe_status_running: 'watching…',
   snipe_status_stopped: 'stopped',
-  snipe_credential_warn: 'Your POESESSID logs trade requests in as you — treat it like a password. It’s sent straight to this site’s own backend over HTTPS to open the connection to pathofexile.com and is never logged, stored server-side, or sent anywhere else. It’s kept in this browser’s local storage only so you don’t have to repaste it every visit — clear it any time by clearing the field and clicking Start once, or clearing your browser’s site data.',
+  snipe_progress: 'checked {i} / {n} — full lap ≈5 min',
   snipe_results_label: 'Underpriced listings found',
-  snipe_results_empty: 'Nothing yet — start a search above.',
-  snipe_modal_title: 'How to get your POESESSID',
-  snipe_modal_warn: 'This value logs you in as you — treat it like a password. It only ever goes from your browser to this site’s own backend, never anywhere else.',
-  snipe_modal_open_btn: 'Open pathofexile.com/trade',
-  snipe_modal_close_btn: 'Close',
-  snipe_err_need_fields: 'fill in POESESSID and item name first',
+  snipe_results_empty: 'Nothing yet — start watching above.',
   snipe_err_generic: 'failed to start: ',
-  snipe_modal_steps: `<li>Click "Open pathofexile.com/trade" below and log in if needed.</li>
-    <li>Press <b>F12</b> to open your browser's DevTools.</li>
-    <li>Go to the <b>Application</b> tab (Chrome/Edge) or <b>Storage</b> tab (Firefox).</li>
-    <li>In the left sidebar: <b>Cookies</b> &rarr; <b>https://www.pathofexile.com</b>.</li>
-    <li>Find the row named <b>POESESSID</b> and copy its <b>Value</b>.</li>
-    <li>Paste it into the POESESSID field on this page.</li>`,
 },
 pt: {
   tagline: 'PATH OF EXILE · CAÇADOR DE OFERTAS',
   menu_title: 'Menu', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
-  footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games. Usa a API oficial de troca do Path of Exile em seu nome, com seu próprio POESESSID — nada é guardado no servidor além de uma sessão ativa.',
+  footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games. Usa a API oficial e não-autenticada de troca do Path of Exile para checar uma lista selecionada de itens em rodízio — nada é guardado no servidor além de uma sessão ativa.',
   footer_made_by: 'Feito por Erick Lúcio',
   footer_dm: 'Sugestão ou opinião? Manda um DM no LinkedIn',
-  snipe_intro: 'Monitora o site oficial de troca do Path of Exile em busca de anúncios com preço abaixo do valor de mercado atual (os mesmos dados do poe.ninja usados na página de Farm de Chefes), e avisa assim que um aparecer. Precisa do seu próprio POESESSID — veja o botão ⓘ abaixo para saber como encontrá-lo. Nesta versão, uma busca por item de cada vez.',
-  snipe_poessid_label: 'POESESSID',
-  snipe_item_label: 'Nome do item (exato)',
-  snipe_category_label: 'Categoria',
+  snipe_intro: 'Monitora uma lista selecionada de itens Únicos do Path of Exile — os 50 mais listados no poe.ninja (indicador de "mais vendidos") mais os 50 de maior preço no poe.ninja ("mais caros"), sem repetição — em busca de anúncios com preço abaixo do valor de mercado atual. Passa pela lista inteira a cada ~5 minutos, um item de cada vez, para ficar bem dentro dos limites de requisição da API de troca do Path of Exile. Não precisa de POESESSID.',
+  snipe_scope_note: 'Apenas itens Únicos — Moedas, Fragmentos, Scarabs e outros itens empilháveis do tipo moeda ficam de fora de propósito (compre esses do Faustus dentro do jogo, por um preço fixo em Artefatos). Além disso: todo anúncio encontrado aqui exige sussurrar para o vendedor dentro do jogo para completar a troca — o sistema de Compra Instantânea / Troca Assíncrona do Path of Exile não tem API pública, então isso não consegue mostrar ou filtrar só os anúncios de compra instantânea.',
   snipe_threshold_label: 'Abaixo do preço em pelo menos',
   snipe_btn_start: 'Começar a monitorar',
   snipe_btn_stop: 'Parar',
@@ -2170,21 +2150,10 @@ pt: {
   snipe_status_starting: 'iniciando…',
   snipe_status_running: 'monitorando…',
   snipe_status_stopped: 'parado',
-  snipe_credential_warn: 'Seu POESESSID faz login como você — trate como uma senha. Ele é enviado direto para o backend deste site via HTTPS para abrir a conexão com o pathofexile.com e nunca é registrado em log, guardado no servidor ou enviado a qualquer outro lugar. Ele fica salvo apenas no armazenamento local deste navegador para você não precisar colar de novo a cada visita — pode limpar a qualquer momento apagando o campo e clicando em Começar uma vez, ou limpando os dados do site no navegador.',
+  snipe_progress: 'checado {i} / {n} — volta completa ≈5 min',
   snipe_results_label: 'Ofertas abaixo do preço encontradas',
-  snipe_results_empty: 'Nada ainda — comece uma busca acima.',
-  snipe_modal_title: 'Como conseguir seu POESESSID',
-  snipe_modal_warn: 'Esse valor faz login como você — trate como uma senha. Ele só vai do seu navegador para o backend deste site, nunca para outro lugar.',
-  snipe_modal_open_btn: 'Abrir pathofexile.com/trade',
-  snipe_modal_close_btn: 'Fechar',
-  snipe_err_need_fields: 'preencha o POESESSID e o nome do item primeiro',
+  snipe_results_empty: 'Nada ainda — comece a monitorar acima.',
   snipe_err_generic: 'falha ao iniciar: ',
-  snipe_modal_steps: `<li>Clique em "Abrir pathofexile.com/trade" abaixo e faça login se precisar.</li>
-    <li>Aperte <b>F12</b> para abrir o DevTools do navegador.</li>
-    <li>Vá na aba <b>Application</b> (Chrome/Edge) ou <b>Storage</b> (Firefox).</li>
-    <li>Na barra lateral: <b>Cookies</b> &rarr; <b>https://www.pathofexile.com</b>.</li>
-    <li>Ache a linha chamada <b>POESESSID</b> e copie o <b>Value</b>.</li>
-    <li>Cole no campo POESESSID desta página.</li>`,
 },
 };
 
@@ -2195,6 +2164,14 @@ function setStatus(key, cls){
   const el = document.getElementById('snipeStatus');
   el.textContent = t(key);
   el.className = 'snipe-status' + (cls ? ' ' + cls : '');
+}
+
+function setProgress(progress){
+  const row = document.getElementById('snipeProgressRow');
+  if(!progress){ row.hidden = true; return; }
+  row.hidden = false;
+  document.getElementById('snipeProgress').textContent =
+    t('snipe_progress').replace('{i}', progress.index + 1).replace('{n}', progress.total);
 }
 
 function renderHit(hit){
@@ -2230,6 +2207,7 @@ async function pollLoop(){
       document.getElementById('snipeEmpty').hidden = true;
       for(const hit of data.listings) list.prepend(renderHit(hit));
     }
+    setProgress(data.progress);
     if(!data.running){ stopSniper(); setStatus('snipe_status_stopped'); return; }
   }catch(e){ /* transient network hiccup — next poll retries */ }
   pollTimer = setTimeout(pollLoop, POLL_MS);
@@ -2240,29 +2218,25 @@ function stopSniper(){
   pollTimer = null;
   document.getElementById('snipeStart').disabled = false;
   document.getElementById('snipeStop').disabled = true;
+  setProgress(null);
 }
 
 document.getElementById('snipeStart').addEventListener('click', async () => {
-  const poesessid = document.getElementById('poessid').value.trim();
-  const itemName = document.getElementById('itemName').value.trim();
-  const itemCategory = document.getElementById('itemCategory').value;
   const thresholdPct = Number(document.getElementById('threshold').value) || 20;
   const league = document.getElementById('leaguesel').value || LEAGUE;
-  if(!poesessid || !itemName){ setStatus('snipe_err_need_fields', 'err'); return; }
-  try { localStorage.setItem('bossFarmSnipeSessid', poesessid); } catch(e) {}
 
   document.getElementById('snipeStart').disabled = true;
   setStatus('snipe_status_starting');
   try{
     const r = await fetch('/snipe/start', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({poesessid, league, itemName, itemCategory, thresholdPct}),
+      body: JSON.stringify({league, thresholdPct}),
       signal: AbortSignal.timeout(20000),
     });
     const data = await r.json();
     if(!data.ok){
-      setStatus('snipe_err_generic', 'err');
       document.getElementById('snipeStatus').textContent = t('snipe_err_generic') + (data.error || ('HTTP '+r.status));
+      document.getElementById('snipeStatus').className = 'snipe-status err';
       document.getElementById('snipeStart').disabled = false;
       return;
     }
@@ -2291,26 +2265,6 @@ document.getElementById('snipeStop').addEventListener('click', async () => {
   }catch(e) {}
 });
 
-document.getElementById('poessidHelp').addEventListener('click', () => {
-  document.getElementById('poessidModal').classList.add('show');
-});
-document.getElementById('poessidModalClose').addEventListener('click', () => {
-  document.getElementById('poessidModal').classList.remove('show');
-});
-document.getElementById('poessidModalOpen').addEventListener('click', () => {
-  window.open('https://www.pathofexile.com/trade', '_blank', 'noopener');
-});
-document.getElementById('poessidModal').addEventListener('click', e => {
-  if(e.target.id === 'poessidModal') document.getElementById('poessidModal').classList.remove('show');
-});
-
-(function restoreSessid(){
-  try{
-    const saved = localStorage.getItem('bossFarmSnipeSessid');
-    if(saved) document.getElementById('poessid').value = saved;
-  }catch(e) {}
-})();
-
 applyStaticI18n();
 setStatus('snipe_status_idle');
 """
@@ -2318,12 +2272,12 @@ setStatus('snipe_status_idle');
 
 def render_snipe_page():
     head = (SHARED_HEAD_TEMPLATE
-            .replace("__PAGE_TITLE__", 'Trade Sniper — Path of Exile Trade API Underpriced Listing Watcher')
-            .replace("__PAGE_DESCRIPTION__", 'Watches Path of Exile’s official trade site for listings priced below the current poe.ninja market floor and alerts you the instant one appears, using your own POESESSID.')
-            .replace("__PAGE_SOCIAL_TITLE__", 'Trade Sniper — PoE Underpriced Listing Watcher')
-            .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Live Path of Exile trade-site watcher for underpriced listings, using your own POESESSID and the official trade API.')
+            .replace("__PAGE_TITLE__", 'Trade Sniper — Path of Exile Trade API Underpriced Unique Watcher')
+            .replace("__PAGE_DESCRIPTION__", 'Watches a curated list of top Path of Exile Unique items (most-listed + most-expensive on poe.ninja) for trade-site listings priced below the current market floor. No account credential needed.')
+            .replace("__PAGE_SOCIAL_TITLE__", 'Trade Sniper — PoE Underpriced Unique Watcher')
+            .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Path of Exile trade-site watcher for underpriced Unique-item listings across a curated top-100 list, via the official unauthenticated trade API.')
             .replace("__PAGE_APP_NAME__", 'Trade Sniper')
-            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Watches Path of Exile’s official trade site for underpriced listings in real time via the official trade API.'))
+            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Watches a curated list of top Path of Exile Unique items for underpriced trade-site listings via the official trade API.'))
     header = (SHARED_HEADER_HTML.replace("__EXTRA_CONTROLS__", SNIPE_EXTRA_CONTROLS)
               .replace("__BRAND_ICON__", "&#127919;").replace("__BRAND_TITLE__", "Trade Sniper")
               .replace("__PRICECHIPS_ATTR__", "hidden").replace("__DIVINE_CHIP_ATTR__", "hidden"))
