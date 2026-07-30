@@ -14,14 +14,14 @@
 // Cloudflare tries to match a static asset first (see [assets] in
 // wrangler.toml) and only invokes this fetch() handler when nothing matched
 // — so by the time we get here, the request is either an API-proxy path or
-// something that should redirect to /ladder (the dashboard's real URL; see
-// build_static.py, which writes it to build/ladder/index.html).
+// something that should redirect to /bosses (the dashboard's real URL; see
+// build_static.py, which writes it to build/bosses/index.html).
 //
 // Routes (mirror boss.py's CURRENCY_URL/EXCHANGE_URL/ITEM_URL/WATCH_URL path
 // shapes 1:1, so the mapping is easy to eyeball against boss.py):
 //   GET /ninja/<path>?<query>  -> https://poe.ninja/poe1/api/economy/<path>?<query>
 //   GET /watch/compact?<query> -> https://api.poe.watch/compact?<query>
-//   anything else (root, typos, old links) -> 302 redirect to /ladder
+//   anything else (root, typos, old links) -> 302 redirect to /bosses
 
 const NINJA_BASE = "https://poe.ninja/poe1/api/economy";
 const WATCH_BASE = "https://api.poe.watch";
@@ -33,6 +33,7 @@ function withCors(body, status, contentType) {
     status,
     headers: {
       "Content-Type": contentType || "application/json",
+      "X-Content-Type-Options": "nosniff",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, OPTIONS",
       "Access-Control-Allow-Headers": "*",
@@ -47,7 +48,7 @@ export default {
     if (!url.pathname.startsWith("/ninja/") && url.pathname !== "/watch/compact") {
       // Not an API-proxy path, and no static asset matched (Cloudflare tries
       // that first) — send the visitor to the dashboard's real URL.
-      return Response.redirect(url.origin + "/ladder", 302);
+      return Response.redirect(url.origin + "/bosses", 302);
     }
 
     if (request.method === "OPTIONS") return withCors(null, 204);

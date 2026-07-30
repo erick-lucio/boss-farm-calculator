@@ -19,9 +19,9 @@ the Worker instead.
 The whole deployment (this build's output + the proxy) is one Cloudflare
 Worker: worker.js serves build/ as static assets (see [assets] in
 worker/wrangler.toml) and only runs its own fetch() handler for the /ninja,
-/watch proxy routes and the redirect-everything-else-to-/ladder behavior —
-so the dashboard's real URL is host/ladder, written here to
-build/ladder/index.html. build/ is generated output, kept separate from
+/watch proxy routes and the redirect-everything-else-to-/bosses behavior —
+so the dashboard's real URL is host/bosses, written here to
+build/bosses/index.html. build/ is generated output, kept separate from
 docs/ (real documentation, e.g. the README screenshot).
 
 Usage:
@@ -383,14 +383,14 @@ def render_page(league, worker_url, poll_ms):
 # Cloudflare's static-asset layer does an implicit "look for index.html" check
 # at the bare root that returns its own 404 without ever invoking worker.js's
 # fetch() handler (confirmed live — every other unmatched path correctly
-# falls through to the Worker's redirect-to-/ladder logic, only "/" doesn't).
+# falls through to the Worker's redirect-to-/bosses logic, only "/" doesn't).
 # A real index.html file sidesteps that entirely.
 ROOT_REDIRECT = """<!doctype html>
 <html><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="0; url=/ladder">
-<script>location.replace('/ladder');</script>
+<meta http-equiv="refresh" content="0; url=/bosses">
+<script>location.replace('/bosses');</script>
 <title>Boss Farm Estimator</title>
-</head><body>Redirecting to <a href="/ladder">/ladder</a>...</body></html>
+</head><body>Redirecting to <a href="/bosses">/bosses</a>...</body></html>
 """
 
 
@@ -404,18 +404,23 @@ def main():
                     help="browser auto-refresh interval, in seconds")
     ap.add_argument("--out", default="build", help="output directory (default: build — the same "
                     "directory worker/wrangler.toml's [assets] block points at)")
+    ap.add_argument("--no-minify", action="store_true",
+                    help="skip minifying the output HTML/CSS/JS via `npx esbuild` (minified by "
+                    "default here — this workflow already requires Node/Wrangler)")
     args = ap.parse_args()
 
     out_dir = Path(__file__).resolve().parent / args.out
-    ladder_dir = out_dir / "ladder"
-    ladder_dir.mkdir(parents=True, exist_ok=True)
+    bosses_dir = out_dir / "bosses"
+    bosses_dir.mkdir(parents=True, exist_ok=True)
 
     html = render_page(args.league, args.worker_url, args.poll * 1000)
-    (ladder_dir / "index.html").write_text(html, encoding="utf-8")
+    if not args.no_minify:
+        html = boss.minify_page(html)
+    (bosses_dir / "index.html").write_text(html, encoding="utf-8")
     (out_dir / "index.html").write_text(ROOT_REDIRECT, encoding="utf-8")
 
-    print(f"Wrote {ladder_dir / 'index.html'} ({len(html):,} bytes)")
-    print(f"Wrote {out_dir / 'index.html'} (redirect -> /ladder)")
+    print(f"Wrote {bosses_dir / 'index.html'} ({len(html):,} bytes)")
+    print(f"Wrote {out_dir / 'index.html'} (redirect -> /bosses)")
     print(f"  league={args.league}  worker={args.worker_url}  poll={args.poll}s")
     print(f"  {len(boss.ENTITIES)} boss entities embedded")
     print("Redeploy: cd worker && wrangler deploy   (or push, if Git auto-deploy is set up)")

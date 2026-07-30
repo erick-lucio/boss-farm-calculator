@@ -18,7 +18,7 @@ python boss.py
 python boss.py --league Standard --port 8000 --poll 120
 ```
 
-No `pip install` — it's stdlib Python 3 only. Opens `http://localhost:8000` in your browser automatically. `--poll` sets the browser's auto-refresh interval in seconds; prices are cached server-side for 5 minutes regardless.
+No `pip install` — it's stdlib Python 3 only. Opens `http://localhost:8000/bosses` in your browser automatically (`/` redirects there too). `--poll` sets the browser's auto-refresh interval in seconds; prices are cached server-side for 5 minutes regardless.
 
 ## Deploying a static version (Cloudflare Workers)
 
@@ -28,7 +28,7 @@ deploy moves the pricing math (`build_index()`/`build_payload()`) into client-si
 one Cloudflare Worker (`worker/worker.js`) for two jobs at once:
 
 - Serves the built dashboard as static assets (`build/`, via `[assets]` in `worker/wrangler.toml`)
-  at `host/ladder` — anything else (root, typos, old links) gets a 302 redirect to `/ladder`.
+  at `host/bosses` — anything else (root, typos, old links) gets a 302 redirect to `/bosses`.
 - Reverse-proxies poe.ninja/poe.watch with CORS enabled (`/ninja/*`, `/watch/compact`), since
   Cloudflare only invokes `worker.js`'s own logic for requests that don't match a static asset.
 
@@ -45,7 +45,7 @@ one Cloudflare Worker (`worker/worker.js`) for two jobs at once:
    ```bash
    python build_static.py --worker-url https://boss-farm-calculator.<you>.workers.dev --league Allflame --poll 120 --out build
    ```
-   Writes `build/ladder/index.html` (the dashboard) and `build/index.html` (a redirect stub —
+   Writes `build/bosses/index.html` (the dashboard) and `build/index.html` (a redirect stub —
    Cloudflare's static-asset layer does its own "look for index.html" check at the bare root that
    bypasses `worker.js` entirely, so a real file there is needed). `build/` is generated output,
    kept separate from `docs/` (real documentation, e.g. the screenshot above).

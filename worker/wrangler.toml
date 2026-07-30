@@ -5,7 +5,7 @@ compatibility_date = "2024-01-01"
 [build]
 command = "python ../build_static.py --worker-url https://boss-farm-calculator.ericklucio-suv.workers.dev --league Allflame --poll 120 --out build"
 
-# The built static dashboard (see ../build_static.py -> build/ladder/index.html).
+# The built static dashboard (see ../build_static.py -> build/bosses/index.html).
 # Cloudflare tries to match a static asset first; only unmatched requests
 # (the /ninja, /watch proxy routes, and anything else) reach worker.js's
 # fetch() handler.

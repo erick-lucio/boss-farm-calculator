@@ -27,7 +27,9 @@ Usage:
 import argparse
 import concurrent.futures
 import json
+import os
 import re
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -748,6 +750,8 @@ PAGE = r"""<!doctype html>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%92%80%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Spectral:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7517572231491496"
+     crossorigin="anonymous"></script>
 <style>
 :root{
   --bg:#0b0b0f; --panel:#14141c; --panel2:#1b1b26; --line:#2a2a38;
@@ -979,14 +983,47 @@ footer{border-top:1px solid var(--line); margin-top:24px;
 .foot{max-width:1240px; margin:0 auto; padding:16px 20px; display:flex;
   justify-content:space-between; align-items:center; gap:20px; flex-wrap:wrap;
   color:var(--ink-dim); font-size:11.5px; line-height:1.5}
-.foot-linkedin{flex:0 0 auto; color:var(--gold); white-space:nowrap; font-weight:600}
+.foot-credits{display:flex; flex-direction:column; align-items:flex-end; gap:4px; flex:0 0 auto}
+.foot-linkedin{color:var(--gold); white-space:nowrap; font-weight:600}
 .foot-linkedin:hover{color:var(--gold-bright)}
-@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+.foot-dm{color:var(--ink-dim); font-size:11px; white-space:nowrap}
+.foot-dm:hover{color:var(--ink)}
+
+.menutoggle{font-family:ui-monospace,monospace; font-size:16px; line-height:1; color:var(--ink-dim);
+  background:var(--panel); border:1px solid var(--line); border-radius:2px;
+  padding:6px 10px; cursor:pointer; flex:0 0 auto}
+.menutoggle:hover{color:var(--ink)}
+.siteoverlay{display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:29}
+.siteoverlay.show{display:block}
+.sitemenu{position:fixed; top:0; left:0; height:100vh; width:240px; background:var(--panel);
+  border-right:1px solid var(--line); z-index:30; transform:translateX(-100%);
+  transition:transform .22s ease; padding:16px; overflow-y:auto}
+.sitemenu.open{transform:translateX(0)}
+.sitemenu-head{display:flex; align-items:center; justify-content:space-between; margin-bottom:16px}
+.sitemenu-title{font-family:"Cinzel",serif; font-weight:700; font-size:12px; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--gold-bright)}
+.sitemenu-close{font-family:ui-monospace,monospace; font-size:14px; color:var(--ink-dim);
+  background:none; border:0; cursor:pointer; padding:2px 6px}
+.sitemenu-close:hover{color:var(--ink)}
+.sitemenu-link{display:flex; align-items:center; gap:8px; padding:8px 10px; border-radius:3px;
+  color:var(--ink-dim); font-size:13px}
+.sitemenu-link:hover{background:var(--overlay); color:var(--ink)}
+.sitemenu-link.active{color:var(--gold-bright); background:var(--overlay-soft); font-weight:600}
+@media (prefers-reduced-motion:reduce){*{animation:none!important} .sitemenu{transition:none}}
 </style>
 </head>
 <body>
+<div class="siteoverlay" id="siteoverlay" hidden></div>
+<nav class="sitemenu" id="sitemenu" aria-label="site menu">
+  <div class="sitemenu-head">
+    <span class="sitemenu-title" data-i18n="menu_title">Menu</span>
+    <button class="sitemenu-close" id="sitemenu-close" aria-label="close menu">&#10005;</button>
+  </div>
+  <a class="sitemenu-link active" href="/bosses" aria-current="page">&#128128; <span data-i18n="menu_main">Boss Farm</span></a>
+</nav>
 <header>
   <div class="head">
+    <button class="menutoggle" id="menutoggle" title="menu" aria-label="open menu">&#9776;</button>
     <div class="brand-block">
       <div class="brand"><b>&#128128; Boss Farm Estimator</b><span data-i18n="tagline">PATH OF EXILE · BOSS ECONOMY</span></div>
       <div class="meta-left">
@@ -1099,9 +1136,14 @@ footer{border-top:1px solid var(--line); margin-top:24px;
 <footer>
   <div class="foot">
     <span data-i18n="footer_disclaimer">Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Prices from poe.ninja/poe.watch, drop data from poewiki/community guides — see the note above for sourcing and caveats.</span>
-    <a class="foot-linkedin" href="https://www.linkedin.com/in/erick-lucioo/" target="_blank" rel="noopener">
-      <span data-i18n="footer_made_by">Built by Erick Lúcio</span> — LinkedIn &#8599;
-    </a>
+    <div class="foot-credits">
+      <a class="foot-linkedin" href="https://www.linkedin.com/in/erick-lucioo/" target="_blank" rel="noopener">
+        <span data-i18n="footer_made_by">Built by Erick Lúcio</span> — LinkedIn &#8599;
+      </a>
+      <a class="foot-dm" href="https://www.linkedin.com/in/erick-lucioo/" target="_blank" rel="noopener">
+        <span data-i18n="footer_dm">Suggestion or opinion? Send me a DM on LinkedIn</span> &#8599;
+      </a>
+    </div>
   </div>
 </footer>
 
@@ -1119,6 +1161,19 @@ function applyTheme(){
   document.documentElement.setAttribute('data-theme', theme);
   const btn = document.getElementById('themetoggle');
   if(btn) btn.innerHTML = theme === 'dark' ? '&#127769;' : '&#9728;&#65039;';
+}
+
+function openMenu(){
+  document.getElementById('sitemenu').classList.add('open');
+  const overlay = document.getElementById('siteoverlay');
+  overlay.hidden = false;
+  requestAnimationFrame(() => overlay.classList.add('show'));
+}
+function closeMenu(){
+  document.getElementById('sitemenu').classList.remove('open');
+  const overlay = document.getElementById('siteoverlay');
+  overlay.classList.remove('show');
+  setTimeout(() => { if(!document.getElementById('sitemenu').classList.contains('open')) overlay.hidden = true; }, 220);
 }
 
 let currentLeague = (function(){
@@ -1140,6 +1195,7 @@ function populateLeagueOptions(data){
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE · BOSS ECONOMY',
+  menu_title: 'Menu', menu_main: 'Boss Farm',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   btn_refresh: 'Refresh', btn_syncing: 'Syncing…',
   legend_currency: 'currency / fragment', legend_unique: 'unique',
@@ -1172,6 +1228,7 @@ en: {
   warn_retry_title: 'last good data shown above; will retry in {s}s',
   footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Prices from poe.ninja/poe.watch, drop data from poewiki/community guides — see the note above for sourcing and caveats.',
   footer_made_by: 'Built by Erick Lúcio',
+  footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
   worst: 'Nothing from the loot pool drops this run — every independent chance roll misses, so you just lose the entry cost. Not a hypothetical: most bosses have no guaranteed drop, so this happens often.',
   avg: '<b>Expected value across many runs</b>, not what any single run looks like: EV = Σ(chance × price × qty) summed over every item in the loot pool, minus entry cost. Over enough repeats your real results converge to this number — over a handful of runs they usually don’t.',
   best: 'The single most valuable item in the loot pool drops — not the whole pool at once. Some pools can only ever yield one of several items per kill (e.g. Eater of Worlds’ guaranteed one-of-three pick), so summing every item would overstate the real ceiling.',
@@ -1234,6 +1291,7 @@ en: {
 },
 pt: {
   tagline: 'PATH OF EXILE · ECONOMIA DE BOSS',
+  menu_title: 'Menu', menu_main: 'Farm de Bosses',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   btn_refresh: 'Atualizar', btn_syncing: 'Sincronizando…',
   legend_currency: 'moeda / fragmento', legend_unique: 'único',
@@ -1266,6 +1324,7 @@ pt: {
   warn_retry_title: 'últimos dados bons mostrados acima; tentará de novo em {s}s',
   footer_disclaimer: 'Ferramenta de fã não-oficial — sem afiliação ou endosso da Grinding Gear Games. Preços do poe.ninja/poe.watch, dados de drop do poewiki/guias da comunidade — veja a nota acima pras fontes e ressalvas.',
   footer_made_by: 'Feito por Erick Lúcio',
+  footer_dm: 'Sugestão ou opinião? Me manda uma DM no LinkedIn',
   worst: 'Nada do loot pool dropa nesse run — todas as chances independentes falham, então você só perde o custo de entrada. Não é hipotético: a maioria dos bosses não tem drop garantido, então isso acontece com frequência.',
   avg: '<b>Valor esperado ao longo de muitos runs</b>, não o que um único run parece: EV = Σ(chance × preço × qtd) somado por todo item do loot pool, menos o custo de entrada. Com repetições suficientes seus resultados reais convergem pra esse número — em poucos runs, geralmente não.',
   best: 'O item mais valioso do loot pool dropa sozinho — não o pool inteiro de uma vez. Alguns pools só permitem um entre vários itens por kill (ex: a escolha garantida de um-entre-três do Eater of Worlds), então somar todos os itens superestimaria o teto real.',
@@ -1335,7 +1394,7 @@ pt: {
 };
 
 let lang = (function(){
-  try { return localStorage.getItem('bossFarmLang') || 'en'; } catch(e) { return 'en'; }
+  try { return localStorage.getItem('bossFarmLang') || 'pt'; } catch(e) { return 'pt'; }
 })();
 function t(key){ return (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key; }
 
@@ -1397,14 +1456,18 @@ function chaosDiv(c, dr){
   if(dr && Math.abs(c) >= dr) s += ' <span class="div">('+(c/dr).toFixed(1)+' div)</span>';
   return s;
 }
-function nmeClass(typ){ return (typ||'').toLowerCase(); }
-function iconTag(it){ return it.icon ? `<img src="${it.icon}" alt="" loading="lazy">`
+function escAttr(s){
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;')
+                             .replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function nmeClass(typ){ return escAttr((typ||'').toLowerCase()); }
+function iconTag(it){ return it.icon ? `<img src="${escAttr(it.icon)}" alt="" loading="lazy">`
                                      : `<span style="width:26px"></span>`; }
 
 function entryRow(it, dr){
   const qty = it.qty > 1 ? `<span class="qty">×${it.qty}</span>` : '';
   const tt = it.link_src==='wiki' ? t('tt_no_price') : t('tt_ninja');
-  return `<a class="item" href="${it.url}" target="_blank" rel="noopener" title="${tt}">
+  return `<a class="item" href="${escAttr(it.url)}" target="_blank" rel="noopener" title="${tt}">
     ${iconTag(it)}<span class="nm ${nmeClass(it.type)}">${it.name}</span>
     ${qty}<span class="ext">&#8599;</span>
     <span class="px">${price(it, dr)}</span></a>`;
@@ -1416,7 +1479,7 @@ function dropRow(it, dr){
   const ch = pct ? `<span class="ch ${real?'real':'est'}" title="${real?t('tt_wiki'):t('tt_estimate')}">${real?'':'~'}${pct}</span>` : '';
   const qty = it.qty > 1 ? `<span class="qty" data-info-text="${t('tt_qty_factored').replace('{n}', it.qty)}">×${it.qty}</span>` : '';
   const tt = it.link_src==='wiki' ? t('tt_no_price') : t('tt_ninja');
-  return `<a class="item" href="${it.url}" target="_blank" rel="noopener" title="${tt}">
+  return `<a class="item" href="${escAttr(it.url)}" target="_blank" rel="noopener" title="${tt}">
     ${iconTag(it)}<span class="nm ${nmeClass(it.type)}">${it.name}</span>
     ${qty}<span class="ext">&#8599;</span>${ch}
     <span class="px">${price(it, dr)}</span></a>`;
@@ -1711,6 +1774,10 @@ document.getElementById('leaguesel').addEventListener('change', e => {
   try { localStorage.setItem('bossFarmLeague', currentLeague); } catch(e) {}
   load();
 });
+document.getElementById('menutoggle').addEventListener('click', openMenu);
+document.getElementById('sitemenu-close').addEventListener('click', closeMenu);
+document.getElementById('siteoverlay').addEventListener('click', closeMenu);
+document.addEventListener('keydown', e => { if(e.key === 'Escape') closeMenu(); });
 document.getElementById('sync').addEventListener('click', () => load());
 document.getElementById('runs').addEventListener('click', e => {
   const btn = e.target.closest('button[data-mult]');
@@ -1748,9 +1815,59 @@ setInterval(tick, 1000);
 
 
 # --------------------------------------------------------------------------- #
+# Minification (optional — see minify_page() docstring for the safety model)
+# --------------------------------------------------------------------------- #
+def _minify_css(css):
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+    css = re.sub(r"\s+", " ", css)
+    css = re.sub(r"\s*([{}:;,])\s*", r"\1", css)
+    return css.strip()
+
+
+def _minify_js(js):
+    """Best-effort JS minify via `npx esbuild --minify`. Returns js unchanged
+    on any failure (esbuild/node not installed, no network, timeout, etc.) —
+    minification must never be able to break or block the app. A hand-rolled
+    regex JS minifier is NOT used here on purpose: template literals, regex
+    literals, and ASI make that genuinely risky to get exactly right, and
+    shipping subtly-broken JS to every visitor is worse than shipping
+    unminified JS.
+    """
+    try:
+        result = subprocess.run(
+            ["npx", "--yes", "esbuild", "--minify", "--loader=js"],
+            input=js.encode("utf-8"), capture_output=True, timeout=30,
+            shell=(os.name == "nt"),
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return js
+        return result.stdout.decode("utf-8")
+    except Exception:
+        return js
+
+
+def minify_page(html):
+    """Shrinks the <style>/<script> blocks of a fully-rendered PAGE (i.e.
+    __POLL_MS__ already substituted). Safe to call on any HTML string; falls
+    back to returning it unchanged if minification isn't possible right now.
+    """
+    def sub_style(m):
+        return "<style>" + _minify_css(m.group(1)) + "</style>"
+
+    def sub_script(m):
+        return "<script>" + _minify_js(m.group(1)) + "</script>"
+
+    html = re.sub(r"<style>(.*?)</style>", sub_style, html, count=1, flags=re.DOTALL)
+    html = re.sub(r"<script>(.*?)</script>", sub_script, html, count=1, flags=re.DOTALL)
+    return html
+
+
+# --------------------------------------------------------------------------- #
 # Server
 # --------------------------------------------------------------------------- #
-def make_handler(league, poll_ms):
+def make_handler(league, poll_ms, page_html):
+    page_bytes = page_html.encode("utf-8")
+
     class H(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
@@ -1762,15 +1879,21 @@ def make_handler(league, poll_ms):
             self.end_headers()
             self.wfile.write(body)
 
+        def _redirect(self, location):
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.end_headers()
+
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
-            if path == "/":
-                html = PAGE.replace("__POLL_MS__", str(poll_ms))
-                self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
+            if path == "/bosses":
+                self._send(200, page_bytes, "text/html; charset=utf-8")
+            elif path == "/":
+                self._redirect("/bosses")
             elif path == "/api/data":
                 qs = urllib.parse.parse_qs(parsed.query)
-                req_league = (qs.get("league") or [league])[0].strip() or league
+                req_league = (qs.get("league") or [league])[0].strip()[:64] or league
                 try:
                     body = json.dumps(build_payload(req_league)).encode("utf-8")
                     self._send(200, body, "application/json")
@@ -1787,11 +1910,19 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--poll", type=int, default=120,
                     help="browser auto-refresh interval, in seconds")
+    ap.add_argument("--minify", action="store_true",
+                    help="minify the served HTML/CSS/JS via `npx esbuild` (falls back to "
+                    "unminified if esbuild/Node isn't available). Off by default so this file "
+                    "keeps working with zero dependencies beyond stdlib Python out of the box.")
     args = ap.parse_args()
 
+    page_html = PAGE.replace("__POLL_MS__", str(args.poll * 1000))
+    if args.minify:
+        page_html = minify_page(page_html)
+
     srv = ThreadingHTTPServer(("127.0.0.1", args.port),
-                              make_handler(args.league, args.poll * 1000))
-    url = f"http://localhost:{args.port}"
+                              make_handler(args.league, args.poll * 1000, page_html))
+    url = f"http://localhost:{args.port}/bosses"
     print(f"Boss Farm Estimator at {url}  (league: {args.league}, price: exchange->stash)"
           f"  --  Ctrl+C to stop")
     try:
