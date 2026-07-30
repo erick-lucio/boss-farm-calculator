@@ -24,3 +24,19 @@ command = "python ../build_static.py --worker-url https://poe-farm-helper.com --
 # fetch() handler.
 [assets]
 directory = "../build"
+
+# SnipeSession — one Durable Object instance per active trade-sniper search
+# (see worker.js). Holds the authenticated PoE live-search WebSocket on the
+# user's behalf; the browser only ever talks plain HTTP to /snipe/*.
+[[durable_objects.bindings]]
+name = "SNIPE_SESSION"
+class_name = "SnipeSession"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SnipeTestDO"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["SnipeTestDO"]
+new_sqlite_classes = ["SnipeSession"]

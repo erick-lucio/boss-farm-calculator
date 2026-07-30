@@ -751,32 +751,89 @@ def build_payload(league):
 # --------------------------------------------------------------------------- #
 # Frontend
 # --------------------------------------------------------------------------- #
-PAGE = r"""<!doctype html>
+# --------------------------------------------------------------------------- #
+# Frontend — shared chrome + per-page templates
+# --------------------------------------------------------------------------- #
+# Every page shares: head boilerplate (SEO/AdSense/fonts, SHARED_HEAD_TEMPLATE),
+# CSS (SHARED_CSS), header chrome (SHARED_HEADER_HTML, with an
+# __EXTRA_CONTROLS__ slot for page-specific header controls), the site-menu
+# drawer (PAGES registry + render_sitemenu()), the footer (SHARED_FOOTER_HTML),
+# and a small set of page-agnostic JS (SHARED_JS_CHROME: escAttr, theme
+# toggle, menu open/close, the popover system, and the t()/applyStaticI18n()
+# i18n plumbing). This is a plain string-composition pattern (same
+# __PLACEHOLDER__ substitution already used for __POLL_MS__/__CANONICAL_URL__)
+# — no build step, no bundler, no ES modules, consistent with this file's
+# zero-dependency character.
+#
+# Each page keeps its OWN complete I18N object (deliberately NOT auto-merged
+# from a shared dict — I18N is one large literal with nested template-literal
+# HTML, too risky to split/merge programmatically for the modest DRY win).
+# When adding a new page, copy these shared UI-chrome keys into its own I18N
+# as a starting point: tagline, chip_price, chip_sync, chip_next, btn_refresh,
+# btn_syncing, menu_title, footer_disclaimer, footer_made_by, footer_dm, plus
+# its own menu_<slug> label (see PAGES below).
+#
+# To add a new page: add one entry to PAGES, write its own <PAGE>_BODY/
+# <PAGE>_JS content (and __EXTRA_CONTROLS__ content if it needs header
+# controls beyond the shared ones), and a render_<page>_page() function
+# following render_bosses_page() below. Then add one do_GET branch and one
+# build_static.py build call — mechanical and explicit, not automatic (with
+# only one real page today, generic "loop over all pages" machinery would be
+# speculative).
+
+PAGES = [
+    {"slug": "bosses", "icon": "&#128128;", "menu_key": "menu_bosses", "label_en": "Boss Farm"},
+    # Trade Sniper ("snipe") intentionally not listed here — hidden from the site menu for
+    # now (not ready to publish/advertise), but the /snipe route itself still renders and
+    # works once deployed; only the nav link is suppressed. Re-add the entry when it's ready
+    # to be public.
+]
+
+
+def render_sitemenu(current_slug):
+    items = []
+    for pg in PAGES:
+        cls = "sitemenu-link active" if pg["slug"] == current_slug else "sitemenu-link"
+        aria = ' aria-current="page"' if pg["slug"] == current_slug else ""
+        items.append(f'  <a class="{cls}" href="/{pg["slug"]}"{aria}>{pg["icon"]} '
+                     f'<span data-i18n="{pg["menu_key"]}">{pg["label_en"]}</span></a>')
+    return ('<div class="siteoverlay" id="siteoverlay" hidden></div>\n'
+            '<nav class="sitemenu" id="sitemenu" aria-label="site menu">\n'
+            '  <div class="sitemenu-head">\n'
+            '    <span class="sitemenu-title" data-i18n="menu_title">Menu</span>\n'
+            '    <button class="sitemenu-close" id="sitemenu-close" aria-label="close menu">&#10005;</button>\n'
+            '  </div>\n'
+            + "\n".join(items) + "\n"
+            "</nav>\n")
+
+
+SHARED_HEAD_TEMPLATE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta name="google-adsense-account" content="ca-pub-7517572231491496">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Boss Farm Estimator — Path of Exile Pinnacle &amp; Uber Boss Farming Profit Calculator</title>
-<meta name="description" content="Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss — real poe.ninja prices, honest worst/average/best profit ranges instead of one misleading number.">
+<title>__PAGE_TITLE__</title>
+<meta name="description" content="__PAGE_DESCRIPTION__">
 <meta name="robots" content="index, follow">
 <link rel="canonical" href="__CANONICAL_URL__">
 <meta property="og:type" content="website">
-<meta property="og:title" content="Boss Farm Estimator — PoE Boss Farming Profit Calculator">
-<meta property="og:description" content="Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss — real poe.ninja prices, honest worst/average/best profit ranges.">
+<meta property="og:title" content="__PAGE_SOCIAL_TITLE__">
+<meta property="og:description" content="__PAGE_SOCIAL_DESCRIPTION__">
 <meta property="og:url" content="__CANONICAL_URL__">
 <meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="Boss Farm Estimator — PoE Boss Farming Profit Calculator">
-<meta name="twitter:description" content="Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss — real poe.ninja prices, honest worst/average/best profit ranges.">
+<meta name="twitter:title" content="__PAGE_SOCIAL_TITLE__">
+<meta name="twitter:description" content="__PAGE_SOCIAL_DESCRIPTION__">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%92%80%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Spectral:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7517572231491496"
      crossorigin="anonymous"></script>
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"WebApplication","name":"Boss Farm Estimator","description":"Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss, using real poe.ninja prices.","applicationCategory":"UtilitiesApplication","operatingSystem":"Any","url":"__CANONICAL_URL__","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
-</script>
-<style>
+{"@context":"https://schema.org","@type":"WebApplication","name":"__PAGE_APP_NAME__","description":"__PAGE_JSONLD_DESCRIPTION__","applicationCategory":"UtilitiesApplication","operatingSystem":"Any","url":"__CANONICAL_URL__","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
+</script>"""
+
+SHARED_CSS = r"""<style>
 :root{
   --bg:#0b0b0f; --panel:#14141c; --panel2:#1b1b26; --line:#2a2a38;
   --ink:#cdc7ba; --ink-dim:#8a8477; --gold:#c9a24c; --gold-bright:#e6c264;
@@ -946,6 +1003,7 @@ button.sync:disabled{opacity:.5; cursor:default}
   background:var(--panel); border:1px solid var(--line); border-radius:2px; padding:2px 5px}
 .timectl span:not(.qlbl){font-family:ui-monospace,monospace; font-size:10.5px; color:var(--ink-dim)}
 .timectl .rate{margin-left:auto; font-weight:700}
+.timectl .rate .div{color:var(--uber); font-size:10px; opacity:.85; margin-left:5px; font-weight:400}
 .rank{font-family:ui-monospace,monospace; font-size:12px; color:var(--bg);
   background:var(--gold); border-radius:2px; padding:1px 7px; font-weight:700}
 .rank.dim{background:var(--line); color:var(--ink-dim)}
@@ -1034,23 +1092,63 @@ footer{border-top:1px solid var(--line); margin-top:24px;
 .sitemenu-link:hover{background:var(--overlay); color:var(--ink)}
 .sitemenu-link.active{color:var(--gold-bright); background:var(--overlay-soft); font-weight:600}
 @media (prefers-reduced-motion:reduce){*{animation:none!important} .sitemenu{transition:none}}
-</style>
-</head>
-<body>
-<div class="siteoverlay" id="siteoverlay" hidden></div>
-<nav class="sitemenu" id="sitemenu" aria-label="site menu">
-  <div class="sitemenu-head">
-    <span class="sitemenu-title" data-i18n="menu_title">Menu</span>
-    <button class="sitemenu-close" id="sitemenu-close" aria-label="close menu">&#10005;</button>
-  </div>
-  <a class="sitemenu-link active" href="/bosses" aria-current="page">&#128128; <span data-i18n="menu_main">Boss Farm</span></a>
-</nav>
-<header>
+
+.meta-left[hidden]{display:none}
+
+.snipe-form{background:linear-gradient(180deg,var(--panel),var(--panel2));
+  border:1px solid var(--line); border-radius:4px; padding:16px 18px; margin-top:14px;
+  display:flex; flex-direction:column; gap:12px}
+.snipe-row{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+.snipe-row label{display:flex; flex-direction:column; gap:4px; font-size:11px; color:var(--ink-dim);
+  font-family:ui-monospace,monospace; text-transform:uppercase; letter-spacing:.05em; flex:1; min-width:160px}
+.snipe-row input, .snipe-row select{font-family:"Spectral",Georgia,serif; font-size:13px; color:var(--ink);
+  background:var(--panel); border:1px solid var(--line); border-radius:2px; padding:8px 10px}
+.snipe-idrow{display:flex; align-items:flex-end; gap:6px; flex:1; min-width:200px}
+.snipe-idrow label{flex:1}
+.info-btn{width:22px; height:22px; border-radius:50%; background:var(--panel); color:var(--uber);
+  border:1px solid var(--line); cursor:help; font-size:12px; line-height:1; text-align:center;
+  padding:0; flex:0 0 auto; font-family:ui-monospace,monospace}
+.info-btn:hover{color:var(--ink)}
+.snipe-actions{display:flex; align-items:center; gap:10px}
+.snipe-status{font-family:ui-monospace,monospace; font-size:12px; color:var(--ink-dim)}
+.snipe-status.err{color:var(--neg)}
+.snipe-status.ok{color:var(--ok)}
+button.stop{font-family:"Cinzel",serif; font-weight:700; font-size:11px; letter-spacing:.18em;
+  text-transform:uppercase; color:var(--ink); background:var(--panel); border:1px solid var(--line);
+  padding:8px 16px; cursor:pointer; border-radius:2px}
+button.stop:hover{border-color:var(--neg); color:var(--neg)}
+button.sync:disabled, button.stop:disabled{opacity:.4; cursor:default}
+.snipe-warn{font-size:12px; color:var(--warn); line-height:1.5}
+.snipe-results{margin-top:18px}
+.snipe-list{display:flex; flex-direction:column; gap:8px; margin-top:10px}
+.snipe-hit{display:flex; align-items:center; gap:12px; background:var(--panel);
+  border:1px solid var(--line); border-radius:3px; padding:10px 14px}
+.snipe-hit img{width:32px; height:32px; object-fit:contain; flex:0 0 auto}
+.snipe-hit .nm{flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.snipe-hit .px{font-family:ui-monospace,monospace; color:var(--gold-bright); font-weight:700; white-space:nowrap}
+.snipe-hit .ref{font-family:ui-monospace,monospace; color:var(--ink-dim); font-size:11px; white-space:nowrap}
+.snipe-hit a.whisper{font-family:ui-monospace,monospace; font-size:11px; color:var(--uber);
+  border:1px solid var(--line); border-radius:2px; padding:4px 9px; white-space:nowrap}
+.snipe-hit a.whisper:hover{color:var(--ink); border-color:var(--uber)}
+
+.modalbg{display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:60;
+  align-items:center; justify-content:center; padding:20px}
+.modalbg.show{display:flex}
+.modalbox{background:var(--panel2); border:1px solid var(--line); border-radius:6px;
+  padding:22px 26px; max-width:480px; box-shadow:0 20px 50px -20px var(--shadow)}
+.modalbox h3{margin-top:0; color:var(--gold-bright); font-family:"Cinzel",serif; letter-spacing:.06em}
+.modalbox ol{padding-left:20px; line-height:1.8; font-size:13.5px}
+.modalbox p{font-size:12.5px; line-height:1.6}
+.modalbox .modal-actions{display:flex; gap:10px; margin-top:14px}
+.modalbox .secondary{background:var(--panel); color:var(--ink-dim); border:1px solid var(--line)}
+</style>"""
+
+SHARED_HEADER_HTML = r"""<header>
   <div class="head">
     <button class="menutoggle" id="menutoggle" title="menu" aria-label="open menu">&#9776;</button>
     <div class="brand-block">
-      <div class="brand"><h1>&#128128; Boss Farm Estimator</h1><span data-i18n="tagline">PATH OF EXILE · BOSS ECONOMY</span></div>
-      <div class="meta-left">
+      <div class="brand"><h1>__BRAND_ICON__ __BRAND_TITLE__</h1><span data-i18n="tagline">PATH OF EXILE · BOSS ECONOMY</span></div>
+      <div class="meta-left" __PRICECHIPS_ATTR__>
         <span class="chip-sm"><span data-i18n="chip_price">Price</span> <b id="src">—</b></span>
         <span class="chip-sm"><span data-i18n="chip_sync">Sync</span> <b id="ago">—</b> · <span data-i18n="chip_next">next</span> <b id="next">—</b></span>
       </div>
@@ -1058,14 +1156,110 @@ footer{border-top:1px solid var(--line); margin-top:24px;
     <div class="meta">
       <div class="chip"><span class="dot"></span><span data-i18n="chip_league">League</span> <b id="league">—</b></div>
       <select class="langsel" id="leaguesel" aria-label="league / liga"></select>
-      <div class="chip">1 Divine <b id="divine">—</b> chaos</div>
+      <div class="chip" __DIVINE_CHIP_ATTR__>1 Divine <b id="divine">—</b> chaos</div>
       <div class="chip warn" id="warn" hidden></div>
       <select class="langsel" id="langsel" aria-label="language / idioma">
         <option value="en">EN</option>
         <option value="pt">PT-BR</option>
       </select>
       <button class="themetoggle" id="themetoggle" title="dark/light · escuro/claro" aria-label="toggle theme">&#127769;</button>
-      <div class="sortby" id="sortby" role="group" aria-label="sort order">
+__EXTRA_CONTROLS__    </div>
+  </div>
+</header>"""
+
+SHARED_FOOTER_HTML = r"""<footer>
+  <div class="foot">
+    <span data-i18n="footer_disclaimer">Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Prices from poe.ninja/poe.watch, drop data from poewiki/community guides — see the note above for sourcing and caveats.</span>
+    <div class="foot-credits">
+      <a class="foot-linkedin" href="https://www.linkedin.com/in/erick-lucioo/" target="_blank" rel="noopener">
+        <span data-i18n="footer_made_by">Built by Erick Lúcio</span> — LinkedIn &#8599;
+      </a>
+      <a class="foot-dm" href="https://www.linkedin.com/in/erick-lucioo/" target="_blank" rel="noopener">
+        <span data-i18n="footer_dm">Suggestion or opinion? Send me a DM on LinkedIn</span> &#8599;
+      </a>
+    </div>
+  </div>
+</footer>"""
+
+SHARED_JS_CHROME = r"""function escAttr(s){
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;')
+                             .replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+let theme = (function(){
+  try { return localStorage.getItem('bossFarmTheme') || 'dark'; } catch(e) { return 'dark'; }
+})();
+function applyTheme(){
+  document.documentElement.setAttribute('data-theme', theme);
+  const btn = document.getElementById('themetoggle');
+  if(btn) btn.innerHTML = theme === 'dark' ? '&#127769;' : '&#9728;&#65039;';
+}
+function openMenu(){
+  document.getElementById('sitemenu').classList.add('open');
+  const overlay = document.getElementById('siteoverlay');
+  overlay.hidden = false;
+  requestAnimationFrame(() => overlay.classList.add('show'));
+}
+function closeMenu(){
+  document.getElementById('sitemenu').classList.remove('open');
+  const overlay = document.getElementById('siteoverlay');
+  overlay.classList.remove('show');
+  setTimeout(() => { if(!document.getElementById('sitemenu').classList.contains('open')) overlay.hidden = true; }, 220);
+}
+let lang = (function(){
+  try { return localStorage.getItem('bossFarmLang') || 'pt'; } catch(e) { return 'pt'; }
+})();
+function t(key){ return (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key; }
+function showPopover(target){
+  const pop = document.getElementById('popover');
+  const html = target.dataset.infoText || t(target.dataset.info);
+  if(!html) return;
+  pop.innerHTML = html;
+  pop.classList.add('show');
+  const r = target.getBoundingClientRect();
+  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  let left = r.left + r.width/2 - pw/2;
+  left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
+  let top = r.top - ph - 8;
+  if(top < 8) top = r.bottom + 8;
+  pop.style.left = left+'px';
+  pop.style.top = top+'px';
+}
+function hidePopover(){ document.getElementById('popover').classList.remove('show'); }
+const INFO_SEL = '[data-info], [data-info-text]';
+document.addEventListener('mouseover', e => {
+  const el = e.target.closest(INFO_SEL);
+  if(el) showPopover(el);
+});
+document.addEventListener('mouseout', e => {
+  const el = e.target.closest(INFO_SEL);
+  if(el && !(e.relatedTarget && e.relatedTarget.closest(INFO_SEL) === el)) hidePopover();
+});
+document.addEventListener('focusin', e => {
+  const el = e.target.closest(INFO_SEL);
+  if(el) showPopover(el);
+});
+document.addEventListener('focusout', e => {
+  if(e.target.closest(INFO_SEL)) hidePopover();
+});
+function applyStaticI18n(){
+  document.querySelectorAll('[data-i18n]').forEach(el => { el.innerHTML = t(el.dataset.i18n); });
+  document.documentElement.lang = lang === 'pt' ? 'pt-BR' : 'en';
+}
+document.getElementById('themetoggle').addEventListener('click', () => {
+  theme = theme === 'dark' ? 'light' : 'dark';
+  try { localStorage.setItem('bossFarmTheme', theme); } catch(e) {}
+  applyTheme();
+});
+document.getElementById('menutoggle').addEventListener('click', openMenu);
+document.getElementById('sitemenu-close').addEventListener('click', closeMenu);
+document.getElementById('siteoverlay').addEventListener('click', closeMenu);
+document.addEventListener('keydown', e => { if(e.key === 'Escape') closeMenu(); });
+"""
+
+# --------------------------------------------------------------------------- #
+# Boss Farm page (/bosses)
+# --------------------------------------------------------------------------- #
+BOSSES_EXTRA_CONTROLS = r"""      <div class="sortby" id="sortby" role="group" aria-label="sort order">
         <span class="sortby-lbl" data-i18n="sortby_label">Order by</span>
         <button data-sort="best" class="active" data-i18n="word_best">best</button>
         <button data-sort="avg" data-i18n="word_avg">avg</button>
@@ -1077,9 +1271,9 @@ footer{border-top:1px solid var(--line); margin-top:24px;
         <button data-mult="100">×100</button>
       </div>
       <button class="sync" id="sync" data-i18n="btn_refresh">Refresh</button>
-    </div>
-  </div>
-</header>
+"""
+
+BOSSES_BODY = r"""
 
 <div class="wrap">
   <div class="legend">
@@ -1157,48 +1351,11 @@ footer{border-top:1px solid var(--line); margin-top:24px;
   </div>
 </div>
 
-<footer>
-  <div class="foot">
-    <span data-i18n="footer_disclaimer">Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Prices from poe.ninja/poe.watch, drop data from poewiki/community guides — see the note above for sourcing and caveats.</span>
-    <div class="foot-credits">
-      <a class="foot-linkedin" href="https://www.linkedin.com/in/erick-lucioo/" target="_blank" rel="noopener">
-        <span data-i18n="footer_made_by">Built by Erick Lúcio</span> — LinkedIn &#8599;
-      </a>
-      <a class="foot-dm" href="https://www.linkedin.com/in/erick-lucioo/" target="_blank" rel="noopener">
-        <span data-i18n="footer_dm">Suggestion or opinion? Send me a DM on LinkedIn</span> &#8599;
-      </a>
-    </div>
-  </div>
-</footer>
+"""
 
-<div class="popover" id="popover" role="tooltip"></div>
-
-<script>
-const POLL_MS = __POLL_MS__;
+BOSSES_JS = r"""const POLL_MS = __POLL_MS__;
 let lastUpdated = 0;
 let runMult = 1;
-
-let theme = (function(){
-  try { return localStorage.getItem('bossFarmTheme') || 'dark'; } catch(e) { return 'dark'; }
-})();
-function applyTheme(){
-  document.documentElement.setAttribute('data-theme', theme);
-  const btn = document.getElementById('themetoggle');
-  if(btn) btn.innerHTML = theme === 'dark' ? '&#127769;' : '&#9728;&#65039;';
-}
-
-function openMenu(){
-  document.getElementById('sitemenu').classList.add('open');
-  const overlay = document.getElementById('siteoverlay');
-  overlay.hidden = false;
-  requestAnimationFrame(() => overlay.classList.add('show'));
-}
-function closeMenu(){
-  document.getElementById('sitemenu').classList.remove('open');
-  const overlay = document.getElementById('siteoverlay');
-  overlay.classList.remove('show');
-  setTimeout(() => { if(!document.getElementById('sitemenu').classList.contains('open')) overlay.hidden = true; }, 220);
-}
 
 let currentLeague = (function(){
   try { return localStorage.getItem('bossFarmLeague') || null; } catch(e) { return null; }
@@ -1219,7 +1376,7 @@ function populateLeagueOptions(data){
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE · BOSS ECONOMY',
-  menu_title: 'Menu', menu_main: 'Boss Farm',
+  menu_title: 'Menu', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   btn_refresh: 'Refresh', btn_syncing: 'Syncing…',
   legend_currency: 'currency / fragment', legend_unique: 'unique',
@@ -1241,6 +1398,7 @@ en: {
   loot_label: 'Loot pool · chance',
   profit_avg_run: 'Avg. profit/run', profit_avg_mult: 'Avg. profit · {n} runs',
   profit_entry_na: 'entry n/a', ev_drops: 'EV drops', entry_word: 'entry',
+  pchance_label: 'Chance of profit',
   quant_altar_label: 'Eldritch Altar qty', quant_iiq_label: 'Map IIQ',
   time_label: 'Time/run',
   tt_no_price: 'no price · poewiki', tt_ninja: 'poe.ninja',
@@ -1263,6 +1421,7 @@ en: {
   quant_iiq: 'T17 Nightmare map fragment yield scales with map <b>Item Quantity (IIQ)</b>: base drop (no IIQ affix) is always 1-3 fragments; at 235-250% IIQ it’s 2-3; at 250%+ it’s 2-4, averaging ~2.5 fragments/kill at 235%+. Set this to roughly match your map’s IIQ — it scales this card’s EV/average/ranking accordingly, since GGG doesn’t publish exact per-fragment odds.',
   time: 'Editable seconds per run, including any map navigation and the fight itself. Defaults: 60s for a direct spawn, 120s if you have to navigate to the boss, 90s where that isn’t confirmed yet. GGG doesn’t publish kill times — they’re entirely gear/build dependent — so this is deliberately a plain input you set, not a calculated guess. It drives the <b>≈c/hr</b> rate: average profit per run ÷ time per run × 3600.',
   rate: 'Average profit per run ÷ time per run, expressed per hour. Uses the <b>average</b> (not worst/best), and ignores the ×1/×10/×100 control since it’s already a rate — running the boss 10× doesn’t change your chaos-per-hour.',
+  pchance: 'Simulated probability that your <b>total</b> profit is positive after this many runs (×1/×10/×100), not whether any single run is profitable. Simulated 1,000 times from each item’s independent drop chance — a small pool with one high-value item can show a low chance even when the average is positive, since most runs miss and only a lucky one carries it.',
   ev: '<b>Expected value of the loot pool</b>: Σ(chance × price × qty) for every drop — the price used is the realistic floor (poe.watch’s unidentified price when available, otherwise the lowest poe.ninja listing), not a lucky-roll outlier. Multiplied by the quantity control if this boss has one. This is the same number behind "avg" above; entry cost is subtracted separately to get profit.',
   note: `Bosses are grouped into three categories — <b>Pinnacle</b>, <b>Uber</b>
     (opens with <b>4 fragments</b>), and <b>Nightmare</b> (T17 map bosses) —
@@ -1315,7 +1474,7 @@ en: {
 },
 pt: {
   tagline: 'PATH OF EXILE · ECONOMIA DE BOSS',
-  menu_title: 'Menu', menu_main: 'Farm de Bosses',
+  menu_title: 'Menu', menu_bosses: 'Farm de Bosses', menu_snipe: 'Caçador de Ofertas',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   btn_refresh: 'Atualizar', btn_syncing: 'Sincronizando…',
   legend_currency: 'moeda / fragmento', legend_unique: 'único',
@@ -1337,6 +1496,7 @@ pt: {
   loot_label: 'Pool de loot · chance',
   profit_avg_run: 'Lucro médio/run', profit_avg_mult: 'Lucro médio · {n} runs',
   profit_entry_na: 'entrada n/d', ev_drops: 'EV dos drops', entry_word: 'entrada',
+  pchance_label: 'Chance de lucro',
   quant_altar_label: 'Qtd. Altar Eldritch', quant_iiq_label: 'IIQ do Mapa',
   time_label: 'Tempo/run',
   tt_no_price: 'sem preço · poewiki', tt_ninja: 'poe.ninja',
@@ -1359,6 +1519,7 @@ pt: {
   quant_iiq: 'O rendimento de fragmentos dos mapas T17 Nightmare escala com o <b>Item Quantity (IIQ)</b> do mapa: o drop base (sem afixo de IIQ) é sempre 1-3 fragmentos; em 235-250% de IIQ fica 2-3; em 250%+ fica 2-4, com média de ~2,5 fragmentos/kill em 235%+. Ajuste isso pra bater aproximadamente com o IIQ do seu mapa — isso escala o EV/média/ranking desse card de acordo, já que a GGG não publica as odds exatas por fragmento.',
   time: 'Segundos por run, editável, incluindo qualquer navegação de mapa e a luta em si. Padrões: 60s pra spawn direto, 120s se precisar navegar até o boss, 90s onde isso ainda não foi confirmado. A GGG não publica tempos de kill — dependem totalmente do build/equipamento — então esse é propositalmente um campo que você mesmo preenche, não uma estimativa calculada. Ele alimenta a taxa <b>≈c/h</b>: lucro médio por run ÷ tempo por run × 3600.',
   rate: 'Lucro médio por run ÷ tempo por run, expresso por hora. Usa a <b>média</b> (não pior/melhor), e ignora o controle ×1/×10/×100 já que isso já é uma taxa — rodar o boss 10× não muda seu chaos-por-hora.',
+  pchance: 'Probabilidade simulada de que seu lucro <b>total</b> seja positivo depois desse número de runs (×1/×10/×100), não se um único run é lucrativo. Simulado 1.000 vezes a partir da chance de drop independente de cada item — um pool pequeno com um item de alto valor pode mostrar uma chance baixa mesmo com a média positiva, já que a maioria dos runs erra e só um run de sorte carrega o resultado.',
   ev: '<b>Valor esperado do loot pool</b>: Σ(chance × preço × qtd) de cada drop — o preço usado é o piso realista (o preço "não identificado" do poe.watch quando disponível, senão a listagem mais baixa do poe.ninja), não um outlier de sorte. Multiplicado pelo controle de quantidade se esse boss tiver um. É o mesmo número por trás da "média" acima; o custo de entrada é subtraído separadamente pra chegar no lucro.',
   note: `Bosses são agrupados em três categorias — <b>Pinnacle</b>, <b>Uber</b>
     (abre com <b>4 fragmentos</b>), e <b>Nightmare</b> (bosses de mapa T17) —
@@ -1417,44 +1578,6 @@ pt: {
 },
 };
 
-let lang = (function(){
-  try { return localStorage.getItem('bossFarmLang') || 'pt'; } catch(e) { return 'pt'; }
-})();
-function t(key){ return (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key; }
-
-function showPopover(target){
-  const pop = document.getElementById('popover');
-  const html = target.dataset.infoText || t(target.dataset.info);
-  if(!html) return;
-  pop.innerHTML = html;
-  pop.classList.add('show');
-  const r = target.getBoundingClientRect();
-  const pw = pop.offsetWidth, ph = pop.offsetHeight;
-  let left = r.left + r.width/2 - pw/2;
-  left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
-  let top = r.top - ph - 8;
-  if(top < 8) top = r.bottom + 8;
-  pop.style.left = left+'px';
-  pop.style.top = top+'px';
-}
-function hidePopover(){ document.getElementById('popover').classList.remove('show'); }
-const INFO_SEL = '[data-info], [data-info-text]';
-document.addEventListener('mouseover', e => {
-  const el = e.target.closest(INFO_SEL);
-  if(el) showPopover(el);
-});
-document.addEventListener('mouseout', e => {
-  const el = e.target.closest(INFO_SEL);
-  if(el && !(e.relatedTarget && e.relatedTarget.closest(INFO_SEL) === el)) hidePopover();
-});
-document.addEventListener('focusin', e => {
-  const el = e.target.closest(INFO_SEL);
-  if(el) showPopover(el);
-});
-document.addEventListener('focusout', e => {
-  if(e.target.closest(INFO_SEL)) hidePopover();
-});
-
 const fmtChaos = c => c == null ? null :
   (Math.abs(c) >= 1000 ? Math.round(c).toLocaleString('en-US') :
    Math.abs(c) >= 10 ? c.toFixed(0) : c.toFixed(1));
@@ -1479,10 +1602,6 @@ function chaosDiv(c, dr){
   let s = fmtChaos(c)+'c';
   if(dr && Math.abs(c) >= dr) s += ' <span class="div">('+(c/dr).toFixed(1)+' div)</span>';
   return s;
-}
-function escAttr(s){
-  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;')
-                             .replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 function nmeClass(typ){ return escAttr((typ||'').toLowerCase()); }
 function iconTag(it){ return it.icon ? `<img src="${escAttr(it.icon)}" alt="${escAttr(it.name)}" loading="lazy">`
@@ -1590,12 +1709,18 @@ const DEFAULT_TIME = {map: 120, direct: 60};
 let timeState = {};
 function timeOf(b){ return timeState[b.name] ?? (DEFAULT_TIME[b.access] || 90); }
 
-function timeCtl(b){
+function fmtRateDiv(rate, dr){
+  if(dr == null || dr <= 0) return '';
+  const div = rate / dr;
+  if(Math.abs(div) < 0.005) return '';
+  return `<span class="div">${div>=0?'+':'−'}${Math.abs(div).toFixed(2)} div/hr</span>`;
+}
+function timeCtl(b, dr){
   const secs = timeOf(b);
   const net = adjustedNet(b);
   const rate = net != null ? net / (secs/3600) : null;
   const rateTxt = rate != null
-    ? `<span class="rate ${rate>=0?'pos':'neg'}" data-info="rate">≈ ${fmtSigned(rate)}/hr</span>`
+    ? `<span class="rate ${rate>=0?'pos':'neg'}" data-info="rate">≈ ${fmtSigned(rate)}/hr${fmtRateDiv(rate, dr)}</span>`
     : '';
   return `<div class="timectl"><span class="qlbl" data-info="time">${t('time_label')}</span>
     <input type="number" min="1" step="5" value="${secs}" data-boss="${b.name}" class="timeinput"><span>s</span>
@@ -1604,6 +1729,35 @@ function timeCtl(b){
 }
 
 function fmtSigned(v){ return (v>=0?'+':'−') + fmtChaos(Math.abs(v)) + 'c'; }
+
+const PROFIT_CHANCE_TRIALS = 1000;
+// Monte Carlo, not a closed form — with dozens of low-probability items per
+// pool, simulating is far simpler and safer than deriving a Poisson-binomial
+// distribution by hand. Items are treated as independent per-run Bernoulli
+// trials, same assumption the EV sum already makes (linearity of
+// expectation holds either way) — this keeps "chance of profit" consistent
+// with the "avg" number already shown, rather than introducing a second,
+// stricter mutual-exclusivity model nothing else in this file uses.
+function simulateProfitChance(b, mult){
+  if(b.entry.total_chaos == null) return null;
+  const entryCost = b.entry.total_chaos * mult;
+  const scale = 1 + quantOf(b) / 100;
+  const items = b.drops.items
+    .filter(it => it.chaos != null && it.chance != null)
+    .map(it => ({p: it.chance, v: it.chaos * it.qty * scale}));
+  if(!items.length) return entryCost <= 0 ? 1 : 0;
+  let wins = 0;
+  for(let t = 0; t < PROFIT_CHANCE_TRIALS; t++){
+    let total = 0;
+    for(let r = 0; r < mult; r++){
+      for(const it of items){
+        if(Math.random() < it.p) total += it.v;
+      }
+    }
+    if(total > entryCost) wins++;
+  }
+  return wins / PROFIT_CHANCE_TRIALS;
+}
 
 function profitBanner(b, dr, mult){
   const lbl = mult === 1 ? t('profit_avg_run') : t('profit_avg_mult').replace('{n}', mult);
@@ -1618,13 +1772,17 @@ function profitBanner(b, dr, mult){
   const best = b.best * mult;
   const cls = net >= 0 ? 'pos' : 'neg';
   const sign = net >= 0 ? '+' : '−';
+  const chance = simulateProfitChance(b, mult);
+  const chanceTxt = chance != null
+    ? ` · <span data-info="pchance">${t('pchance_label')}</span> <span class="${chance>=0.5?'pos':'neg'}">${Math.round(chance*100)}%</span>`
+    : '';
   return `<div class="profit"><span class="lbl" data-info="avg">${lbl}</span>
       <span class="val ${cls}">${sign}${chaosDiv(Math.abs(net), dr)}</span></div>
     <div class="range">
       <span class="rw neg" data-info="worst">${t('word_worst')} ${fmtSigned(worst)}</span>
       <span class="rb pos" data-info="best">${t('word_best')} ${fmtSigned(best)}</span>
     </div>
-    <div class="evline"><span data-info="ev">${t('ev_drops')}</span> ${fmtChaos(ev)}c − ${t('entry_word')} ${fmtChaos(entryTotal)}c</div>`;
+    <div class="evline"><span data-info="ev">${t('ev_drops')}</span> ${fmtChaos(ev)}c − ${t('entry_word')} ${fmtChaos(entryTotal)}c${chanceTxt}</div>`;
 }
 
 const GROUPS = [
@@ -1664,7 +1822,7 @@ function bossCard(b, i, dr, mult){
         <span class="tier ${b.tier}">${tierWord(b.tier)}</span></h2>
     ${metaBadges(b)}
     ${quantCtl(b)}
-    ${timeCtl(b)}
+    ${timeCtl(b, dr)}
     ${profitBanner(b, dr, mult)}
     ${entrySection(b.entry, dr)}
     ${dropSection(b.drops, dr)}
@@ -1773,10 +1931,6 @@ function tick(){
   document.getElementById('next').textContent =
     Math.max(0, Math.round((POLL_MS-(Date.now()-lastUpdated))/1000))+'s';
 }
-function applyStaticI18n(){
-  document.querySelectorAll('[data-i18n]').forEach(el => { el.innerHTML = t(el.dataset.i18n); });
-  document.documentElement.lang = lang === 'pt' ? 'pt-BR' : 'en';
-}
 const langSel = document.getElementById('langsel');
 langSel.value = lang;
 applyStaticI18n();
@@ -1788,20 +1942,11 @@ langSel.addEventListener('change', () => {
   if(lastData) render(lastData);
   updateWarnUI();
 });
-document.getElementById('themetoggle').addEventListener('click', () => {
-  theme = theme === 'dark' ? 'light' : 'dark';
-  try { localStorage.setItem('bossFarmTheme', theme); } catch(e) {}
-  applyTheme();
-});
 document.getElementById('leaguesel').addEventListener('change', e => {
   currentLeague = e.target.value;
   try { localStorage.setItem('bossFarmLeague', currentLeague); } catch(e) {}
   load();
 });
-document.getElementById('menutoggle').addEventListener('click', openMenu);
-document.getElementById('sitemenu-close').addEventListener('click', closeMenu);
-document.getElementById('siteoverlay').addEventListener('click', closeMenu);
-document.addEventListener('keydown', e => { if(e.key === 'Escape') closeMenu(); });
 document.getElementById('sync').addEventListener('click', () => load());
 document.getElementById('runs').addEventListener('click', e => {
   const btn = e.target.closest('button[data-mult]');
@@ -1831,11 +1976,361 @@ document.getElementById('root').addEventListener('change', e => {
 });
 load();
 setInterval(load, POLL_MS);
-setInterval(tick, 1000);
-</script>
-</body>
-</html>
+setInterval(tick, 1000);"""
+
+
+def render_bosses_page():
+    head = (SHARED_HEAD_TEMPLATE
+            .replace("__PAGE_TITLE__", 'Boss Farm Estimator — Path of Exile Pinnacle &amp; Uber Boss Farming Profit Calculator')
+            .replace("__PAGE_DESCRIPTION__", 'Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss — real poe.ninja prices, honest worst/average/best profit ranges instead of one misleading number.')
+            .replace("__PAGE_SOCIAL_TITLE__", 'Boss Farm Estimator — PoE Boss Farming Profit Calculator')
+            .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss — real poe.ninja prices, honest worst/average/best profit ranges.')
+            .replace("__PAGE_APP_NAME__", 'Boss Farm Estimator')
+            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss, using real poe.ninja prices.'))
+    header = (SHARED_HEADER_HTML.replace("__EXTRA_CONTROLS__", BOSSES_EXTRA_CONTROLS)
+              .replace("__BRAND_ICON__", "&#128128;").replace("__BRAND_TITLE__", "Boss Farm Estimator")
+              .replace("__PRICECHIPS_ATTR__", "").replace("__DIVINE_CHIP_ATTR__", ""))
+    return (head + "\n" + SHARED_CSS + '\n</head>\n<body>' + "\n"
+            + render_sitemenu("bosses") + header + BOSSES_BODY + SHARED_FOOTER_HTML
+            + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n' + "<script>\n" + SHARED_JS_CHROME + BOSSES_JS
+            + '\n</script>\n</body>\n</html>')
+
+
+# --------------------------------------------------------------------------- #
+# Trade Sniper page (/snipe)
+# --------------------------------------------------------------------------- #
+# Watches PoE's official trade site (via a Cloudflare Durable Object relay,
+# see worker/worker.js's SnipeSession) for listings priced below the current
+# poe.ninja market floor, using the user's own POESESSID. Unlike the Boss
+# Farm page, this feature is NOT a pure static-page computation — it needs a
+# real backend holding an authenticated live-search WebSocket to PoE (see
+# CLAUDE.md's Trade Sniper section for why: browsers can't set the Origin/
+# Cookie headers PoE's live-search endpoint requires). Locally (`python
+# boss.py`), this page renders but Start/Stop/Poll calls will fail — there's
+# no local equivalent of the Durable Object relay. It only works fully once
+# deployed behind the Worker (poe-farm-helper.com or the *.workers.dev URL).
+SNIPE_EXTRA_CONTROLS = ""
+
+SNIPE_BODY = r"""
+
+<div class="wrap">
+  <div class="note" data-i18n="snipe_intro">
+    Watches Path of Exile's official trade site for listings priced below the current market
+    floor (from the same poe.ninja data the Boss Farm page uses), and lets you know the instant
+    one appears. Requires your own POESESSID — see the &#9432; button below for how to find it.
+    One item search at a time in this version.
+  </div>
+
+  <div class="snipe-form">
+    <div class="snipe-row">
+      <div class="snipe-idrow">
+        <label><span data-i18n="snipe_poessid_label">POESESSID</span>
+          <input type="password" id="poessid" autocomplete="off" placeholder="paste here">
+        </label>
+        <button type="button" class="info-btn" id="poessidHelp" aria-label="how to find your POESESSID">&#9432;</button>
+      </div>
+    </div>
+    <div class="snipe-row">
+      <label style="flex:2; min-width:220px"><span data-i18n="snipe_item_label">Item name (exact)</span>
+        <input type="text" id="itemName" placeholder="e.g. Mageblood, Exalted Orb, Headhunter">
+      </label>
+      <label><span data-i18n="snipe_category_label">Category</span>
+        <select id="itemCategory">
+          <option value="Currency">Currency</option>
+          <option value="Fragment">Fragment</option>
+          <option value="Astrolabe">Astrolabe</option>
+          <option value="UniqueWeapon">Unique Weapon</option>
+          <option value="UniqueArmour">Unique Armour</option>
+          <option value="UniqueAccessory">Unique Accessory</option>
+          <option value="UniqueJewel">Unique Jewel</option>
+          <option value="UniqueFlask">Unique Flask</option>
+          <option value="Invitation">Invitation</option>
+          <option value="Map">Map</option>
+          <option value="SkillGem">Skill Gem</option>
+        </select>
+      </label>
+      <label><span data-i18n="snipe_threshold_label">Underpriced by at least</span>
+        <input type="number" id="threshold" value="20" min="1" max="90" style="width:70px">
+      </label>
+    </div>
+    <div class="snipe-row">
+      <div class="snipe-actions">
+        <button class="sync" id="snipeStart" data-i18n="snipe_btn_start">Start watching</button>
+        <button class="stop" id="snipeStop" data-i18n="snipe_btn_stop" disabled>Stop</button>
+      </div>
+      <span class="snipe-status" id="snipeStatus" data-i18n="snipe_status_idle">idle</span>
+    </div>
+    <div class="snipe-warn" data-i18n="snipe_credential_warn">
+      Your POESESSID logs trade requests in as you — treat it like a password. It's sent straight
+      to this site's own backend over HTTPS to open the connection to pathofexile.com and is never
+      logged, stored server-side, or sent anywhere else. It's kept in this browser's local storage
+      only so you don't have to repaste it every visit — clear it any time by clearing the field
+      and clicking Start once, or clearing your browser's site data.
+    </div>
+  </div>
+
+  <div class="snipe-results">
+    <div class="slabel"><span data-i18n="snipe_results_label">Underpriced listings found</span></div>
+    <div class="snipe-list" id="snipeList"></div>
+    <div class="empty" id="snipeEmpty" data-i18n="snipe_results_empty">Nothing yet — start a search above.</div>
+  </div>
+</div>
+
+<div class="modalbg" id="poessidModal">
+  <div class="modalbox">
+    <h3 data-i18n="snipe_modal_title">How to get your POESESSID</h3>
+    <ol data-i18n="snipe_modal_steps">
+      <li>Click "Open pathofexile.com/trade" below and log in if needed.</li>
+      <li>Press <b>F12</b> to open your browser's DevTools.</li>
+      <li>Go to the <b>Application</b> tab (Chrome/Edge) or <b>Storage</b> tab (Firefox).</li>
+      <li>In the left sidebar: <b>Cookies</b> &rarr; <b>https://www.pathofexile.com</b>.</li>
+      <li>Find the row named <b>POESESSID</b> and copy its <b>Value</b>.</li>
+      <li>Paste it into the POESESSID field on this page.</li>
+    </ol>
+    <p class="snipe-warn" data-i18n="snipe_modal_warn">This value logs you in as you — treat it like a password. It only ever goes from your browser to this site's own backend, never anywhere else.</p>
+    <div class="modal-actions">
+      <button class="sync" id="poessidModalOpen" data-i18n="snipe_modal_open_btn">Open pathofexile.com/trade</button>
+      <button class="stop secondary" id="poessidModalClose" data-i18n="snipe_modal_close_btn">Close</button>
+    </div>
+  </div>
+</div>
 """
+
+SNIPE_JS = r"""const LEAGUE = __LEAGUE_JSON__;
+const POLL_MS = 3000;
+
+function populateLeagueOptions(){
+  const sel = document.getElementById('leaguesel');
+  if(sel.options.length) return;
+  let currentLeague;
+  try { currentLeague = localStorage.getItem('bossFarmLeague'); } catch(e) { currentLeague = null; }
+  const cur = currentLeague || LEAGUE;
+  const opts = [LEAGUE, 'Standard', 'Hardcore', 'Hardcore ' + LEAGUE];
+  const seen = new Set();
+  sel.innerHTML = opts.filter(o => o && !seen.has(o) && seen.add(o))
+    .map(o => `<option value="${o}" ${o===cur?'selected':''}>${o}</option>`).join('');
+  document.getElementById('league').textContent = cur;
+}
+populateLeagueOptions();
+document.getElementById('leaguesel').addEventListener('change', e => {
+  try { localStorage.setItem('bossFarmLeague', e.target.value); } catch(err) {}
+  document.getElementById('league').textContent = e.target.value;
+});
+
+const I18N = {
+en: {
+  tagline: 'PATH OF EXILE · TRADE SNIPER',
+  menu_title: 'Menu', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper',
+  chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
+  footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Uses Path of Exile’s official trade API on your behalf, with your own POESESSID — nothing is stored server-side beyond an active session.',
+  footer_made_by: 'Built by Erick Lúcio',
+  footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
+  snipe_intro: 'Watches Path of Exile’s official trade site for listings priced below the current market floor (from the same poe.ninja data the Boss Farm page uses), and lets you know the instant one appears. Requires your own POESESSID — see the ⓘ button below for how to find it. One item search at a time in this version.',
+  snipe_poessid_label: 'POESESSID',
+  snipe_item_label: 'Item name (exact)',
+  snipe_category_label: 'Category',
+  snipe_threshold_label: 'Underpriced by at least',
+  snipe_btn_start: 'Start watching',
+  snipe_btn_stop: 'Stop',
+  snipe_status_idle: 'idle',
+  snipe_status_starting: 'starting…',
+  snipe_status_running: 'watching…',
+  snipe_status_stopped: 'stopped',
+  snipe_credential_warn: 'Your POESESSID logs trade requests in as you — treat it like a password. It’s sent straight to this site’s own backend over HTTPS to open the connection to pathofexile.com and is never logged, stored server-side, or sent anywhere else. It’s kept in this browser’s local storage only so you don’t have to repaste it every visit — clear it any time by clearing the field and clicking Start once, or clearing your browser’s site data.',
+  snipe_results_label: 'Underpriced listings found',
+  snipe_results_empty: 'Nothing yet — start a search above.',
+  snipe_modal_title: 'How to get your POESESSID',
+  snipe_modal_warn: 'This value logs you in as you — treat it like a password. It only ever goes from your browser to this site’s own backend, never anywhere else.',
+  snipe_modal_open_btn: 'Open pathofexile.com/trade',
+  snipe_modal_close_btn: 'Close',
+  snipe_err_need_fields: 'fill in POESESSID and item name first',
+  snipe_err_generic: 'failed to start: ',
+  snipe_modal_steps: `<li>Click "Open pathofexile.com/trade" below and log in if needed.</li>
+    <li>Press <b>F12</b> to open your browser's DevTools.</li>
+    <li>Go to the <b>Application</b> tab (Chrome/Edge) or <b>Storage</b> tab (Firefox).</li>
+    <li>In the left sidebar: <b>Cookies</b> &rarr; <b>https://www.pathofexile.com</b>.</li>
+    <li>Find the row named <b>POESESSID</b> and copy its <b>Value</b>.</li>
+    <li>Paste it into the POESESSID field on this page.</li>`,
+},
+pt: {
+  tagline: 'PATH OF EXILE · CAÇADOR DE OFERTAS',
+  menu_title: 'Menu', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas',
+  chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
+  footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games. Usa a API oficial de troca do Path of Exile em seu nome, com seu próprio POESESSID — nada é guardado no servidor além de uma sessão ativa.',
+  footer_made_by: 'Feito por Erick Lúcio',
+  footer_dm: 'Sugestão ou opinião? Manda um DM no LinkedIn',
+  snipe_intro: 'Monitora o site oficial de troca do Path of Exile em busca de anúncios com preço abaixo do valor de mercado atual (os mesmos dados do poe.ninja usados na página de Farm de Chefes), e avisa assim que um aparecer. Precisa do seu próprio POESESSID — veja o botão ⓘ abaixo para saber como encontrá-lo. Nesta versão, uma busca por item de cada vez.',
+  snipe_poessid_label: 'POESESSID',
+  snipe_item_label: 'Nome do item (exato)',
+  snipe_category_label: 'Categoria',
+  snipe_threshold_label: 'Abaixo do preço em pelo menos',
+  snipe_btn_start: 'Começar a monitorar',
+  snipe_btn_stop: 'Parar',
+  snipe_status_idle: 'parado',
+  snipe_status_starting: 'iniciando…',
+  snipe_status_running: 'monitorando…',
+  snipe_status_stopped: 'parado',
+  snipe_credential_warn: 'Seu POESESSID faz login como você — trate como uma senha. Ele é enviado direto para o backend deste site via HTTPS para abrir a conexão com o pathofexile.com e nunca é registrado em log, guardado no servidor ou enviado a qualquer outro lugar. Ele fica salvo apenas no armazenamento local deste navegador para você não precisar colar de novo a cada visita — pode limpar a qualquer momento apagando o campo e clicando em Começar uma vez, ou limpando os dados do site no navegador.',
+  snipe_results_label: 'Ofertas abaixo do preço encontradas',
+  snipe_results_empty: 'Nada ainda — comece uma busca acima.',
+  snipe_modal_title: 'Como conseguir seu POESESSID',
+  snipe_modal_warn: 'Esse valor faz login como você — trate como uma senha. Ele só vai do seu navegador para o backend deste site, nunca para outro lugar.',
+  snipe_modal_open_btn: 'Abrir pathofexile.com/trade',
+  snipe_modal_close_btn: 'Fechar',
+  snipe_err_need_fields: 'preencha o POESESSID e o nome do item primeiro',
+  snipe_err_generic: 'falha ao iniciar: ',
+  snipe_modal_steps: `<li>Clique em "Abrir pathofexile.com/trade" abaixo e faça login se precisar.</li>
+    <li>Aperte <b>F12</b> para abrir o DevTools do navegador.</li>
+    <li>Vá na aba <b>Application</b> (Chrome/Edge) ou <b>Storage</b> (Firefox).</li>
+    <li>Na barra lateral: <b>Cookies</b> &rarr; <b>https://www.pathofexile.com</b>.</li>
+    <li>Ache a linha chamada <b>POESESSID</b> e copie o <b>Value</b>.</li>
+    <li>Cole no campo POESESSID desta página.</li>`,
+},
+};
+
+let snipeSession = null;
+let pollTimer = null;
+
+function setStatus(key, cls){
+  const el = document.getElementById('snipeStatus');
+  el.textContent = t(key);
+  el.className = 'snipe-status' + (cls ? ' ' + cls : '');
+}
+
+function renderHit(hit){
+  const div = document.createElement('div');
+  div.className = 'snipe-hit';
+  const img = hit.icon ? `<img src="${escAttr(hit.icon)}" alt="">` : '';
+  const priceTxt = `${hit.amount} ${escAttr(hit.currency)}`;
+  div.innerHTML = `${img}<span class="nm">${escAttr(hit.itemName)}</span>
+    <span class="px">${priceTxt}</span>
+    <span class="ref">ref ~${Math.round(hit.referenceChaos)}c</span>
+    <a class="whisper" href="#" data-whisper="${escAttr(hit.whisper)}">whisper</a>`;
+  return div;
+}
+
+document.getElementById('snipeList').addEventListener('click', e => {
+  const a = e.target.closest('a.whisper');
+  if(!a) return;
+  e.preventDefault();
+  const w = a.dataset.whisper;
+  if(w) navigator.clipboard && navigator.clipboard.writeText(w).catch(()=>{});
+  a.textContent = 'copied!';
+  setTimeout(() => { a.textContent = 'whisper'; }, 1500);
+});
+
+async function pollLoop(){
+  if(!snipeSession) return;
+  try{
+    const r = await fetch('/snipe/poll?session=' + encodeURIComponent(snipeSession), {signal: AbortSignal.timeout(10000)});
+    const data = await r.json();
+    if(!data.ok){ stopSniper(); setStatus('snipe_status_stopped', 'err'); return; }
+    if(data.listings && data.listings.length){
+      const list = document.getElementById('snipeList');
+      document.getElementById('snipeEmpty').hidden = true;
+      for(const hit of data.listings) list.prepend(renderHit(hit));
+    }
+    if(!data.running){ stopSniper(); setStatus('snipe_status_stopped'); return; }
+  }catch(e){ /* transient network hiccup — next poll retries */ }
+  pollTimer = setTimeout(pollLoop, POLL_MS);
+}
+
+function stopSniper(){
+  if(pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+  document.getElementById('snipeStart').disabled = false;
+  document.getElementById('snipeStop').disabled = true;
+}
+
+document.getElementById('snipeStart').addEventListener('click', async () => {
+  const poesessid = document.getElementById('poessid').value.trim();
+  const itemName = document.getElementById('itemName').value.trim();
+  const itemCategory = document.getElementById('itemCategory').value;
+  const thresholdPct = Number(document.getElementById('threshold').value) || 20;
+  const league = document.getElementById('leaguesel').value || LEAGUE;
+  if(!poesessid || !itemName){ setStatus('snipe_err_need_fields', 'err'); return; }
+  try { localStorage.setItem('bossFarmSnipeSessid', poesessid); } catch(e) {}
+
+  document.getElementById('snipeStart').disabled = true;
+  setStatus('snipe_status_starting');
+  try{
+    const r = await fetch('/snipe/start', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({poesessid, league, itemName, itemCategory, thresholdPct}),
+      signal: AbortSignal.timeout(20000),
+    });
+    const data = await r.json();
+    if(!data.ok){
+      setStatus('snipe_err_generic', 'err');
+      document.getElementById('snipeStatus').textContent = t('snipe_err_generic') + (data.error || ('HTTP '+r.status));
+      document.getElementById('snipeStart').disabled = false;
+      return;
+    }
+    snipeSession = data.session;
+    document.getElementById('snipeStop').disabled = false;
+    setStatus('snipe_status_running', 'ok');
+    pollLoop();
+  }catch(e){
+    document.getElementById('snipeStatus').textContent = t('snipe_err_generic') + e;
+    document.getElementById('snipeStatus').className = 'snipe-status err';
+    document.getElementById('snipeStart').disabled = false;
+  }
+});
+
+document.getElementById('snipeStop').addEventListener('click', async () => {
+  if(!snipeSession) return;
+  const session = snipeSession;
+  snipeSession = null;
+  stopSniper();
+  setStatus('snipe_status_stopped');
+  try{
+    await fetch('/snipe/stop', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session}), signal: AbortSignal.timeout(10000),
+    });
+  }catch(e) {}
+});
+
+document.getElementById('poessidHelp').addEventListener('click', () => {
+  document.getElementById('poessidModal').classList.add('show');
+});
+document.getElementById('poessidModalClose').addEventListener('click', () => {
+  document.getElementById('poessidModal').classList.remove('show');
+});
+document.getElementById('poessidModalOpen').addEventListener('click', () => {
+  window.open('https://www.pathofexile.com/trade', '_blank', 'noopener');
+});
+document.getElementById('poessidModal').addEventListener('click', e => {
+  if(e.target.id === 'poessidModal') document.getElementById('poessidModal').classList.remove('show');
+});
+
+(function restoreSessid(){
+  try{
+    const saved = localStorage.getItem('bossFarmSnipeSessid');
+    if(saved) document.getElementById('poessid').value = saved;
+  }catch(e) {}
+})();
+
+applyStaticI18n();
+setStatus('snipe_status_idle');
+"""
+
+
+def render_snipe_page():
+    head = (SHARED_HEAD_TEMPLATE
+            .replace("__PAGE_TITLE__", 'Trade Sniper — Path of Exile Trade API Underpriced Listing Watcher')
+            .replace("__PAGE_DESCRIPTION__", 'Watches Path of Exile’s official trade site for listings priced below the current poe.ninja market floor and alerts you the instant one appears, using your own POESESSID.')
+            .replace("__PAGE_SOCIAL_TITLE__", 'Trade Sniper — PoE Underpriced Listing Watcher')
+            .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Live Path of Exile trade-site watcher for underpriced listings, using your own POESESSID and the official trade API.')
+            .replace("__PAGE_APP_NAME__", 'Trade Sniper')
+            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Watches Path of Exile’s official trade site for underpriced listings in real time via the official trade API.'))
+    header = (SHARED_HEADER_HTML.replace("__EXTRA_CONTROLS__", SNIPE_EXTRA_CONTROLS)
+              .replace("__BRAND_ICON__", "&#127919;").replace("__BRAND_TITLE__", "Trade Sniper")
+              .replace("__PRICECHIPS_ATTR__", "hidden").replace("__DIVINE_CHIP_ATTR__", "hidden"))
+    return (head + "\n" + SHARED_CSS + '\n</head>\n<body>' + "\n"
+            + render_sitemenu("snipe") + header + SNIPE_BODY + SHARED_FOOTER_HTML
+            + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n' + "<script>\n" + SHARED_JS_CHROME + SNIPE_JS
+            + '\n</script>\n</body>\n</html>')
 
 
 # --------------------------------------------------------------------------- #
@@ -1890,8 +2385,8 @@ def minify_page(html):
 # --------------------------------------------------------------------------- #
 # Server
 # --------------------------------------------------------------------------- #
-def make_handler(league, poll_ms, page_html):
-    page_bytes = page_html.encode("utf-8")
+def make_handler(league, poll_ms, pages_html):
+    pages_bytes = {slug: html.encode("utf-8") for slug, html in pages_html.items()}
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -1912,8 +2407,9 @@ def make_handler(league, poll_ms, page_html):
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
-            if path == "/bosses":
-                self._send(200, page_bytes, "text/html; charset=utf-8")
+            slug = path[1:] if path.startswith("/") else path
+            if slug in pages_bytes:
+                self._send(200, pages_bytes[slug], "text/html; charset=utf-8")
             elif path == "/":
                 self._redirect("/bosses")
             elif path == "/api/data":
@@ -1942,15 +2438,22 @@ def main():
     args = ap.parse_args()
 
     url = f"http://localhost:{args.port}/bosses"
-    page_html = (PAGE.replace("__POLL_MS__", str(args.poll * 1000))
-                     .replace("__CANONICAL_URL__", url))
+    pages_html = {
+        "bosses": (render_bosses_page().replace("__POLL_MS__", str(args.poll * 1000))
+                   .replace("__CANONICAL_URL__", url)),
+        "snipe": (render_snipe_page().replace("__POLL_MS__", str(args.poll * 1000))
+                  .replace("__LEAGUE_JSON__", json.dumps(args.league))
+                  .replace("__CANONICAL_URL__", f"http://localhost:{args.port}/snipe")),
+    }
     if args.minify:
-        page_html = minify_page(page_html)
+        pages_html = {slug: minify_page(html) for slug, html in pages_html.items()}
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port),
-                              make_handler(args.league, args.poll * 1000, page_html))
+                              make_handler(args.league, args.poll * 1000, pages_html))
     print(f"Boss Farm Estimator at {url}  (league: {args.league}, price: exchange->stash)"
-          f"  --  Ctrl+C to stop")
+          f"  --  Ctrl+C to stop"
+          f"\nTrade Sniper (needs the deployed Worker to actually work) at "
+          f"http://localhost:{args.port}/snipe")
     try:
         webbrowser.open(url)
     except Exception:

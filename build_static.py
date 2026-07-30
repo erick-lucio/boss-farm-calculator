@@ -373,13 +373,26 @@ def render_page(league, worker_url, poll_ms):
               .replace("__CACHE_TTL_JSON__", json.dumps(boss.CACHE_TTL)))
 
     canonical_url = worker_url.rstrip("/") + "/bosses"
-    html = (boss.PAGE.replace("__POLL_MS__", str(poll_ms))
+    html = (boss.render_bosses_page().replace("__POLL_MS__", str(poll_ms))
                      .replace("__CANONICAL_URL__", canonical_url))
     if OLD_FETCH_DATA not in html:
-        raise RuntimeError("fetchData() block not found in boss.PAGE — boss.py's frontend "
-                            "JS changed shape; update OLD_FETCH_DATA in build_static.py to match.")
+        raise RuntimeError("fetchData() block not found in boss.render_bosses_page() — boss.py's "
+                            "frontend JS changed shape; update OLD_FETCH_DATA in build_static.py to match.")
     html = html.replace(OLD_FETCH_DATA, engine, 1)
     return html
+
+
+def render_snipe_page(league, worker_url, poll_ms):
+    # No FETCH_ENGINE swap needed — the Trade Sniper page talks to /snipe/*
+    # on the same origin (the Worker itself, see worker/worker.js's
+    # SnipeSession routes), which works unchanged whether that origin is the
+    # custom domain or the *.workers.dev URL. Only __LEAGUE_JSON__ (used for
+    # the league picker default) needs substituting, same as boss.py's own
+    # local dev server does in main().
+    canonical_url = worker_url.rstrip("/") + "/snipe"
+    return (boss.render_snipe_page().replace("__POLL_MS__", str(poll_ms))
+                    .replace("__LEAGUE_JSON__", json.dumps(league))
+                    .replace("__CANONICAL_URL__", canonical_url))
 
 
 # Cloudflare's static-asset layer does an implicit "look for index.html" check
@@ -415,24 +428,33 @@ def main():
 
     out_dir = Path(__file__).resolve().parent / args.out
     bosses_dir = out_dir / "bosses"
+    snipe_dir = out_dir / "snipe"
     bosses_dir.mkdir(parents=True, exist_ok=True)
+    snipe_dir.mkdir(parents=True, exist_ok=True)
 
     html = render_page(args.league, args.worker_url, args.poll * 1000)
+    snipe_html = render_snipe_page(args.league, args.worker_url, args.poll * 1000)
     if not args.no_minify:
         html = boss.minify_page(html)
+        snipe_html = boss.minify_page(snipe_html)
     (bosses_dir / "index.html").write_text(html, encoding="utf-8")
+    (snipe_dir / "index.html").write_text(snipe_html, encoding="utf-8")
     (out_dir / "index.html").write_text(ROOT_REDIRECT, encoding="utf-8")
 
     base = args.worker_url.rstrip("/")
     (out_dir / "robots.txt").write_text(
         f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n", encoding="utf-8")
     (out_dir / "sitemap.xml").write_text(
+        # /snipe deliberately left out of the sitemap while it's hidden from the site
+        # menu (see PAGES in boss.py) — the page still builds and works at that URL for
+        # direct/manual access, just isn't advertised for search engines to crawl yet.
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
         f"  <url><loc>{base}/bosses</loc></url>\n"
         "</urlset>\n", encoding="utf-8")
 
     print(f"Wrote {bosses_dir / 'index.html'} ({len(html):,} bytes)")
+    print(f"Wrote {snipe_dir / 'index.html'} ({len(snipe_html):,} bytes)")
     print(f"Wrote {out_dir / 'index.html'} (redirect -> /bosses)")
     print(f"Wrote {out_dir / 'robots.txt'} and {out_dir / 'sitemap.xml'}")
     print(f"  league={args.league}  worker={args.worker_url}  poll={args.poll}s")
