@@ -63,7 +63,7 @@ UA = "boss-dashboard/1.0 (contact: you@example.com)"
 CACHE_TTL = 300
 
 ITEM_CATEGORIES = ["UniqueWeapon", "UniqueArmour", "UniqueAccessory",
-                   "UniqueJewel", "UniqueFlask", "Invitation", "Map"]
+                   "UniqueJewel", "UniqueFlask", "Invitation", "Map", "SkillGem"]
 
 # Currency/Fragment go through the Exchange+Stash feeds (see build_index); so
 # does Astrolabe — poe.ninja only prices it via Exchange, but the shape is
@@ -75,7 +75,7 @@ OVERVIEW_SLUG = {
     "UniqueWeapon": "unique-weapons", "UniqueArmour": "unique-armours",
     "UniqueAccessory": "unique-accessories", "UniqueJewel": "unique-jewels",
     "UniqueFlask": "unique-flasks", "Invitation": "invitations",
-    "Map": "maps", "Astrolabe": "astrolabes",
+    "Map": "maps", "Astrolabe": "astrolabes", "SkillGem": "skill-gems",
 }
 
 UBER_FRAG_QTY = 4
@@ -97,8 +97,12 @@ ASTROLABE_TYPES = ["Fruiting Astrolabe", "Deceptive Astrolabe", "Templar Astrola
                    "Lightless Astrolabe", "Runic Astrolabe", "Grasping Astrolabe",
                    "Fungal Astrolabe", "Nameless Astrolabe", "Chaotic Astrolabe",
                    "Timeless Astrolabe"]
-# Sums to 1.0 — memory bosses guarantee exactly one Astrolabe per kill.
-ASTROLABE_GUARANTEED = [(nm, "Astrolabe", 0.10, "est") for nm in ASTROLABE_TYPES]
+# Sums to ~1.0 — memory bosses guarantee exactly one Astrolabe per kill.
+# Not an even 10% split: poewiki (Incarnation of Fear page) confirms Templar
+# Astrolabe is weighted at 33%, with the other 9 types splitting the rest
+# evenly at 7.5% each — Templar is the simplest/most basic type.
+ASTROLABE_GUARANTEED = [(nm, "Astrolabe", 0.33 if nm == "Templar Astrolabe" else 0.075, "wiki")
+                        for nm in ASTROLABE_TYPES]
 # Curated low estimate (GGG publishes no rate) for the map-boss chance source.
 ASTROLABE_MAP_CHANCE = [(nm, "Astrolabe", 0.005, "est") for nm in ASTROLABE_TYPES]
 
@@ -272,60 +276,66 @@ ENTITIES = [
     # Confirmed direct spawn, no invulnerability phase, for all 3 (normal+uber).
     {"name": "Incarnation of Fear", "tier": "normal", "access": "direct",
      "entry": [("Echo of Trauma", "Currency", 1)],
-     "drops": [("Orb of Intention", "Currency", 0.12, "est"),
-               ("Starcaller", "UniqueWeapon", 0.35, "est"),
-               ("Coiling Whisper", "UniqueAccessory", 0.30, "est"),
-               ("Servant of Decay", "UniqueAccessory", 0.20, "est"),
-               ("Enmity's Embrace", "UniqueAccessory", 0.08, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
+     "drops": [("Servant of Decay", "UniqueArmour", 0.50, "wiki"),
+               ("The Unseen Hue", "UniqueAccessory", 0.40, "wiki"),
+               ("Enmity's Embrace", "UniqueAccessory", 0.08, "wiki"),
+               ("Starcaller", "UniqueWeapon", 0.02, "wiki"),
+               ("Bound By Destiny", "UniqueJewel", 0.10, "wiki"),
+               ("Greater Devour Support", "SkillGem", 0.05, "wiki"),
+               ("Orb of Intention", "Currency", 0.50, "wiki"),
                *ASTROLABE_GUARANTEED]},
     {"name": "Uber Incarnation of Fear", "tier": "uber", "access": "direct",
      "entry": [("Traumatic Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Traumatic Reliquary Key", "Fragment", 0.05, "est"),
-               ("Orb of Intention", "Currency", 0.12, "est"),
-               ("Starcaller", "UniqueWeapon", 0.35, "est"),
-               ("Coiling Whisper", "UniqueAccessory", 0.30, "est"),
-               ("Servant of Decay", "UniqueAccessory", 0.20, "est"),
-               ("Enmity's Embrace", "UniqueAccessory", 0.08, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
+     "drops": [("The Caged Mammoth", "UniqueArmour", 0.60, "wiki"),
+               ("Coiling Whisper", "UniqueAccessory", 0.36, "wiki"),
+               ("Wing of the Wyvern", "UniqueWeapon", 0.02, "wiki"),
+               ("Woespike", "UniqueAccessory", 0.02, "wiki"),
+               ("Traumatic Reliquary Key", "Fragment", 0.01, "wiki"),
+               ("Bound By Destiny", "UniqueJewel", 0.10, "wiki"),
+               ("Greater Devour Support", "SkillGem", 0.05, "wiki"),
+               ("Orb of Intention", "Currency", 0.50, "wiki"),
                *ASTROLABE_GUARANTEED]},
     {"name": "Incarnation of Dread", "tier": "normal", "access": "direct",
      "entry": [("Echo of Reverence", "Currency", 1)],
-     "drops": [("Orb of Unravelling", "Currency", 0.12, "est"),
-               ("Whispers of Infinity", "UniqueAccessory", 0.45, "est"),
-               ("The Dark Monarch", "UniqueArmour", 0.45, "est"),
-               ("Seven Teachings", "UniqueAccessory", 0.08, "est"),
-               ("Wine of the Prophet", "UniqueFlask", 0.02, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
+     "drops": [("Bonemeld", "UniqueAccessory", 0.55, "wiki"),
+               ("The Dark Monarch", "UniqueArmour", 0.35, "wiki"),
+               ("Seven Teachings", "UniqueAccessory", 0.08, "wiki"),
+               ("Wine of the Prophet", "UniqueFlask", 0.02, "wiki"),
+               ("Bound By Destiny", "UniqueJewel", 0.10, "wiki"),
+               ("Congregation Support", "SkillGem", 0.05, "est"),
+               ("Orb of Unravelling", "Currency", 0.33, "wiki"),
                *ASTROLABE_GUARANTEED]},
     {"name": "Uber Incarnation of Dread", "tier": "uber", "access": "direct",
      "entry": [("Reverent Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Reverent Reliquary Key", "Fragment", 0.05, "est"),
-               ("Orb of Unravelling", "Currency", 0.12, "est"),
-               ("Whispers of Infinity", "UniqueAccessory", 0.45, "est"),
-               ("The Dark Monarch", "UniqueArmour", 0.45, "est"),
-               ("Seven Teachings", "UniqueAccessory", 0.08, "est"),
-               ("Wine of the Prophet", "UniqueFlask", 0.02, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
+     "drops": [("The Hallowed Monarch", "UniqueArmour", 0.54, "wiki"),
+               ("Whispers of Infinity", "UniqueAccessory", 0.30, "wiki"),
+               ("Wellwater Phylactery", "UniqueFlask", 0.14, "wiki"),
+               ("The Golden Charlatan", "UniqueWeapon", 0.02, "wiki"),
+               ("Reverent Reliquary Key", "Fragment", 0.01, "wiki"),
+               ("Bound By Destiny", "UniqueJewel", 0.10, "wiki"),
+               ("Congregation Support", "SkillGem", 0.05, "est"),
+               ("Orb of Unravelling", "Currency", 0.33, "wiki"),
                *ASTROLABE_GUARANTEED]},
     {"name": "Incarnation of Neglect", "tier": "normal", "access": "direct",
      "entry": [("Echo of Loneliness", "Currency", 1)],
-     "drops": [("Orb of Remembrance", "Currency", 0.12, "est"),
-               ("Betrayal's Sting", "UniqueAccessory", 0.45, "est"),
-               ("Arkhon's Tools", "UniqueAccessory", 0.45, "est"),
-               ("Venarius' Astrolabe", "UniqueAccessory", 0.08, "est"),
-               ("Legacy of the Rose", "UniqueWeapon", 0.02, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
+     "drops": [("Betrayal's Sting", "UniqueAccessory", 0.50, "wiki"),
+               ("The Arkhon's Tools", "UniqueAccessory", 0.38, "wiki"),
+               ("Venarius' Astrolabe", "UniqueAccessory", 0.10, "wiki"),
+               ("Legacy of the Rose", "UniqueWeapon", 0.02, "wiki"),
+               ("Bound By Destiny", "UniqueJewel", 0.10, "wiki"),
+               ("Frostmage Support", "SkillGem", 0.05, "wiki"),
+               ("Orb of Remembrance", "Currency", 0.33, "wiki"),
                *ASTROLABE_GUARANTEED]},
     {"name": "Uber Incarnation of Neglect", "tier": "uber", "access": "direct",
      "entry": [("Lonely Fragment", "Fragment", UBER_FRAG_QTY)],
-     "drops": [("Lonely Reliquary Key", "Fragment", 0.05, "est"),
-               ("Orb of Remembrance", "Currency", 0.12, "est"),
-               ("Betrayal's Sting", "UniqueAccessory", 0.45, "est"),
-               ("Arkhon's Tools", "UniqueAccessory", 0.45, "est"),
-               ("Venarius' Astrolabe", "UniqueAccessory", 0.08, "est"),
-               ("Legacy of the Rose", "UniqueWeapon", 0.02, "est"),
-               ("Bound By Destiny", "UniqueJewel", 0.05, "est"),
+     "drops": [("Refuge in Isolation", "UniqueArmour", 0.55, "wiki"),
+               ("Bitter Instinct", "UniqueArmour", 0.30, "wiki"),
+               ("Haunting Memories", "UniqueAccessory", 0.13, "wiki"),
+               ("Festering Resentment", "UniqueWeapon", 0.02, "wiki"),
+               ("Lonely Reliquary Key", "Fragment", 0.01, "wiki"),
+               ("Bound By Destiny", "UniqueJewel", 0.10, "wiki"),
+               ("Frostmage Support", "SkillGem", 0.05, "wiki"),
+               ("Orb of Remembrance", "Currency", 0.33, "wiki"),
                *ASTROLABE_GUARANTEED]},
 
     # -------------------- T17 Nightmare Maps (area level 84) ----------------- #
@@ -744,14 +754,28 @@ def build_payload(league):
 PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
+<meta name="google-adsense-account" content="ca-pub-7517572231491496">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Boss Farm Estimator</title>
+<title>Boss Farm Estimator — Path of Exile Pinnacle &amp; Uber Boss Farming Profit Calculator</title>
+<meta name="description" content="Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss — real poe.ninja prices, honest worst/average/best profit ranges instead of one misleading number.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="__CANONICAL_URL__">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Boss Farm Estimator — PoE Boss Farming Profit Calculator">
+<meta property="og:description" content="Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss — real poe.ninja prices, honest worst/average/best profit ranges.">
+<meta property="og:url" content="__CANONICAL_URL__">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Boss Farm Estimator — PoE Boss Farming Profit Calculator">
+<meta name="twitter:description" content="Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss — real poe.ninja prices, honest worst/average/best profit ranges.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%92%80%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Spectral:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7517572231491496"
      crossorigin="anonymous"></script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"WebApplication","name":"Boss Farm Estimator","description":"Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss, using real poe.ninja prices.","applicationCategory":"UtilitiesApplication","operatingSystem":"Any","url":"__CANONICAL_URL__","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
+</script>
 <style>
 :root{
   --bg:#0b0b0f; --panel:#14141c; --panel2:#1b1b26; --line:#2a2a38;
@@ -784,7 +808,7 @@ header{border-bottom:1px solid var(--line);
 .head{display:flex; align-items:center; gap:20px; padding:18px 20px; flex-wrap:wrap}
 .brand-block{display:flex; flex-direction:column; gap:6px}
 .brand{font-family:"Cinzel",serif; font-weight:700; letter-spacing:.14em; text-transform:uppercase}
-.brand b{display:block; color:var(--gold-bright); font-weight:700; font-size:20px}
+.brand h1{display:block; margin:0; color:var(--gold-bright); font-weight:700; font-size:20px}
 .brand span{color:var(--ink-dim); font-size:11px; letter-spacing:.28em}
 .meta-left{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
 .chip-sm{display:flex; align-items:center; gap:6px; font-size:10.5px; color:var(--ink-dim);
@@ -1025,7 +1049,7 @@ footer{border-top:1px solid var(--line); margin-top:24px;
   <div class="head">
     <button class="menutoggle" id="menutoggle" title="menu" aria-label="open menu">&#9776;</button>
     <div class="brand-block">
-      <div class="brand"><b>&#128128; Boss Farm Estimator</b><span data-i18n="tagline">PATH OF EXILE · BOSS ECONOMY</span></div>
+      <div class="brand"><h1>&#128128; Boss Farm Estimator</h1><span data-i18n="tagline">PATH OF EXILE · BOSS ECONOMY</span></div>
       <div class="meta-left">
         <span class="chip-sm"><span data-i18n="chip_price">Price</span> <b id="src">—</b></span>
         <span class="chip-sm"><span data-i18n="chip_sync">Sync</span> <b id="ago">—</b> · <span data-i18n="chip_next">next</span> <b id="next">—</b></span>
@@ -1461,7 +1485,7 @@ function escAttr(s){
                              .replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 function nmeClass(typ){ return escAttr((typ||'').toLowerCase()); }
-function iconTag(it){ return it.icon ? `<img src="${escAttr(it.icon)}" alt="" loading="lazy">`
+function iconTag(it){ return it.icon ? `<img src="${escAttr(it.icon)}" alt="${escAttr(it.name)}" loading="lazy">`
                                      : `<span style="width:26px"></span>`; }
 
 function entryRow(it, dr){
@@ -1848,8 +1872,9 @@ def _minify_js(js):
 
 def minify_page(html):
     """Shrinks the <style>/<script> blocks of a fully-rendered PAGE (i.e.
-    __POLL_MS__ already substituted). Safe to call on any HTML string; falls
-    back to returning it unchanged if minification isn't possible right now.
+    __POLL_MS__/__CANONICAL_URL__ already substituted). Safe to call on any
+    HTML string; falls back to returning it unchanged if minification isn't
+    possible right now.
     """
     def sub_style(m):
         return "<style>" + _minify_css(m.group(1)) + "</style>"
@@ -1916,13 +1941,14 @@ def main():
                     "keeps working with zero dependencies beyond stdlib Python out of the box.")
     args = ap.parse_args()
 
-    page_html = PAGE.replace("__POLL_MS__", str(args.poll * 1000))
+    url = f"http://localhost:{args.port}/bosses"
+    page_html = (PAGE.replace("__POLL_MS__", str(args.poll * 1000))
+                     .replace("__CANONICAL_URL__", url))
     if args.minify:
         page_html = minify_page(page_html)
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port),
                               make_handler(args.league, args.poll * 1000, page_html))
-    url = f"http://localhost:{args.port}/bosses"
     print(f"Boss Farm Estimator at {url}  (league: {args.league}, price: exchange->stash)"
           f"  --  Ctrl+C to stop")
     try:

@@ -38,12 +38,15 @@ one Cloudflare Worker (`worker/worker.js`) for two jobs at once:
    cd worker
    wrangler deploy
    ```
-   This prints the Worker's URL, e.g. `https://boss-farm-calculator.<you>.workers.dev`.
+   This prints the Worker's `*.workers.dev` URL — this deployment also has a custom domain,
+   [poe-farm-helper.com](https://poe-farm-helper.com), bound via `routes` in `wrangler.toml`
+   (`workers_dev = true` there keeps the `.workers.dev` URL alive too — useful for things like
+   AdSense site verification that were set up against it before the custom domain existed).
 
 2. **Generate the static build** — `ENTITIES` in `boss.py` stays the single source of truth;
    this reads it directly and embeds it, it isn't duplicated anywhere:
    ```bash
-   python build_static.py --worker-url https://boss-farm-calculator.<you>.workers.dev --league Allflame --poll 120 --out build
+   python build_static.py --worker-url https://poe-farm-helper.com --league Allflame --poll 120 --out build
    ```
    Writes `build/bosses/index.html` (the dashboard) and `build/index.html` (a redirect stub —
    Cloudflare's static-asset layer does its own "look for index.html" check at the bare root that

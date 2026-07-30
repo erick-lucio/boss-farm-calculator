@@ -2,8 +2,21 @@ name = "boss-farm-calculator"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
+# Kept on alongside the custom domain below on purpose — Wrangler disables
+# workers_dev by default as soon as a custom domain route is added, which
+# would break the existing boss-farm-calculator.<account>.workers.dev URL
+# (e.g. anything already pointing at it, like AdSense site verification).
+workers_dev = true
+
+# Custom domain — requires poe-farm-helper.com to already be an active zone
+# in this Cloudflare account (DNS pointed at Cloudflare's nameservers) before
+# `wrangler deploy` can bind it here.
+routes = [
+  { pattern = "poe-farm-helper.com", custom_domain = true }
+]
+
 [build]
-command = "python ../build_static.py --worker-url https://boss-farm-calculator.ericklucio-suv.workers.dev --league Allflame --poll 120 --out build"
+command = "python ../build_static.py --worker-url https://poe-farm-helper.com --league Allflame --poll 120 --out build"
 
 # The built static dashboard (see ../build_static.py -> build/bosses/index.html).
 # Cloudflare tries to match a static asset first; only unmatched requests

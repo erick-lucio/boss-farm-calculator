@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://poe-farm-helper.com/sitemap.xml

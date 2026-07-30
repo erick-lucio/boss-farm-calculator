@@ -372,7 +372,9 @@ def render_page(league, worker_url, poll_ms):
               .replace("__PRICE_OVERRIDE_JSON__", json.dumps(boss.PRICE_OVERRIDE))
               .replace("__CACHE_TTL_JSON__", json.dumps(boss.CACHE_TTL)))
 
-    html = boss.PAGE.replace("__POLL_MS__", str(poll_ms))
+    canonical_url = worker_url.rstrip("/") + "/bosses"
+    html = (boss.PAGE.replace("__POLL_MS__", str(poll_ms))
+                     .replace("__CANONICAL_URL__", canonical_url))
     if OLD_FETCH_DATA not in html:
         raise RuntimeError("fetchData() block not found in boss.PAGE — boss.py's frontend "
                             "JS changed shape; update OLD_FETCH_DATA in build_static.py to match.")
@@ -387,6 +389,7 @@ def render_page(league, worker_url, poll_ms):
 # A real index.html file sidesteps that entirely.
 ROOT_REDIRECT = """<!doctype html>
 <html><head><meta charset="utf-8">
+<meta name="google-adsense-account" content="ca-pub-7517572231491496">
 <meta http-equiv="refresh" content="0; url=/bosses">
 <script>location.replace('/bosses');</script>
 <title>Boss Farm Estimator</title>
@@ -397,8 +400,9 @@ ROOT_REDIRECT = """<!doctype html>
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--worker-url", default="https://boss-farm-calculator.ericklucio-suv.workers.dev",
-                    help="Cloudflare Worker base URL, e.g. https://boss-farm-calculator.you.workers.dev")
+    ap.add_argument("--worker-url", default="https://poe-farm-helper.com",
+                    help="Public site URL (custom domain if you have one, otherwise the "
+                    "Cloudflare Worker's *.workers.dev URL)")
     ap.add_argument("--league", default="Allflame")
     ap.add_argument("--poll", type=int, default=120,
                     help="browser auto-refresh interval, in seconds")
@@ -419,8 +423,18 @@ def main():
     (bosses_dir / "index.html").write_text(html, encoding="utf-8")
     (out_dir / "index.html").write_text(ROOT_REDIRECT, encoding="utf-8")
 
+    base = args.worker_url.rstrip("/")
+    (out_dir / "robots.txt").write_text(
+        f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n", encoding="utf-8")
+    (out_dir / "sitemap.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"  <url><loc>{base}/bosses</loc></url>\n"
+        "</urlset>\n", encoding="utf-8")
+
     print(f"Wrote {bosses_dir / 'index.html'} ({len(html):,} bytes)")
     print(f"Wrote {out_dir / 'index.html'} (redirect -> /bosses)")
+    print(f"Wrote {out_dir / 'robots.txt'} and {out_dir / 'sitemap.xml'}")
     print(f"  league={args.league}  worker={args.worker_url}  poll={args.poll}s")
     print(f"  {len(boss.ENTITIES)} boss entities embedded")
     print("Redeploy: cd worker && wrangler deploy   (or push, if Git auto-deploy is set up)")
