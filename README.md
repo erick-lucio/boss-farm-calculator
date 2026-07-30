@@ -40,6 +40,10 @@ CORS-proxy role, and the pricing math moves into client-side JS instead of runni
    ```bash
    python build_static.py --worker-url https://boss-farm-calculator.<you>.workers.dev
    # optional: --league Standard --poll 120 --out docs
+
+
+   full command
+   python build_static.py --worker-url https://boss-farm-calculator.ericklucio-suv.workers.dev --league Allflame --poll 120 --out docs
    ```
    This writes `docs/index.html` (plus `docs/.nojekyll`).
 

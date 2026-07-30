@@ -2,11 +2,11 @@
 """
 build_static.py
 ----------------
-Generates a static (no-backend) build of the Boss Farm Estimator dashboard,
-deployable to GitHub Pages (or any static host). boss.py's ENTITIES stays the
-single hand-maintained source of truth: this script imports it directly and
-embeds it as JSON, and reuses boss.py's PAGE (same CSS/HTML/rendering JS)
-unchanged except for one swap — the data-fetching layer.
+Generates a static (no-backend) build of the Boss Farm Estimator dashboard.
+boss.py's ENTITIES stays the single hand-maintained source of truth: this
+script imports it directly and embeds it as JSON, and reuses boss.py's PAGE
+(same CSS/HTML/rendering JS) unchanged except for one swap — the
+data-fetching layer.
 
 boss.py's build_index()/build_payload() run server-side because poe.ninja
 sends no CORS header, so a browser can't call it directly from a
@@ -15,6 +15,13 @@ Cloudflare Worker (see worker/worker.js) that reverse-proxies poe.ninja and
 poe.watch with CORS enabled, and ports build_index()/build_payload()'s exact
 pricing logic into client-side JS (the FETCH_ENGINE block below) that calls
 the Worker instead.
+
+The whole deployment (this build's output + the proxy) is one Cloudflare
+Worker: worker.js serves docs/ as static assets (see [assets] in
+worker/wrangler.toml) and only runs its own fetch() handler for the /ninja,
+/watch proxy routes and the redirect-everything-else-to-/ladder behavior —
+so the dashboard's real URL is host/ladder, written here to
+docs/ladder/index.html.
 
 Usage:
     python build_static.py --worker-url https://boss-farm-calculator.<you>.workers.dev
@@ -371,6 +378,20 @@ def render_page(league, worker_url, poll_ms):
     return html
 
 
+# Cloudflare's static-asset layer does an implicit "look for index.html" check
+# at the bare root that returns its own 404 without ever invoking worker.js's
+# fetch() handler (confirmed live — every other unmatched path correctly
+# falls through to the Worker's redirect-to-/ladder logic, only "/" doesn't).
+# A real index.html file sidesteps that entirely.
+ROOT_REDIRECT = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="0; url=/ladder">
+<script>location.replace('/ladder');</script>
+<title>Boss Farm Estimator</title>
+</head><body>Redirecting to <a href="/ladder">/ladder</a>...</body></html>
+"""
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -379,20 +400,23 @@ def main():
     ap.add_argument("--league", default="Allflame")
     ap.add_argument("--poll", type=int, default=120,
                     help="browser auto-refresh interval, in seconds")
-    ap.add_argument("--out", default="docs", help="output directory (default: docs, for GitHub "
-                    "Pages' 'Deploy from branch -> /docs' option)")
+    ap.add_argument("--out", default="docs", help="output directory (default: docs — the same "
+                    "directory worker/wrangler.toml's [assets] block points at)")
     args = ap.parse_args()
 
     out_dir = Path(__file__).resolve().parent / args.out
-    out_dir.mkdir(parents=True, exist_ok=True)
+    ladder_dir = out_dir / "ladder"
+    ladder_dir.mkdir(parents=True, exist_ok=True)
 
     html = render_page(args.league, args.worker_url, args.poll * 1000)
-    (out_dir / "index.html").write_text(html, encoding="utf-8")
-    (out_dir / ".nojekyll").write_text("", encoding="utf-8")
+    (ladder_dir / "index.html").write_text(html, encoding="utf-8")
+    (out_dir / "index.html").write_text(ROOT_REDIRECT, encoding="utf-8")
 
-    print(f"Wrote {out_dir / 'index.html'} ({len(html):,} bytes)")
+    print(f"Wrote {ladder_dir / 'index.html'} ({len(html):,} bytes)")
+    print(f"Wrote {out_dir / 'index.html'} (redirect -> /ladder)")
     print(f"  league={args.league}  worker={args.worker_url}  poll={args.poll}s")
     print(f"  {len(boss.ENTITIES)} boss entities embedded")
+    print("Redeploy: cd worker && wrangler deploy   (or push, if Git auto-deploy is set up)")
 
 
 if __name__ == "__main__":
