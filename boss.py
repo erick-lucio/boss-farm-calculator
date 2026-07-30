@@ -543,7 +543,11 @@ def build_index(league):
     # Different structure from the stash API:
     #   metadata is in "items" (not "currencyDetails"): id, name, detailsId
     #   price is in "lines": id + primaryValue (no chaosEquivalent/chaosValue)
-    #   "items.image" is a relative path (/gen/image/...) — ignored; icon comes from stash
+    #   "items.image" is a relative path (/gen/image/...) — ignored for Currency/
+    #   Fragment (icon comes from stash there, see section 2 below), but
+    #   Astrolabe has no stash feed data at all (confirmed empty on poe.ninja),
+    #   so its exchange-feed image — prefixed into a full poecdn URL — is the
+    #   only icon source available for it.
     for typ in EXCHANGE_CATEGORIES:
         data = exchange_data[typ]
         id_to_meta = {d["id"]: d for d in data.get("items", []) if d.get("id")}
@@ -555,7 +559,8 @@ def build_index(league):
                 continue
             chaos = line.get("primaryValue")
             details = meta.get("detailsId") or item_id
-            put(nm, typ, chaos, None, None, details, "chaos")
+            icon = "https://web.poecdn.com" + meta["image"] if typ == "Astrolabe" and meta.get("image") else None
+            put(nm, typ, chaos, None, icon, details, "chaos")
 
     # 2) Stash — secondary price (the "chaos_alt" field); becomes "chaos" if exchange has none
     for typ in EXCHANGE_CATEGORIES:

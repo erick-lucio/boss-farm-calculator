@@ -17,7 +17,7 @@ pricing logic into client-side JS (the FETCH_ENGINE block below) that calls
 the Worker instead.
 
 Usage:
-    python build_static.py --worker-url https://boss-farm-proxy.<you>.workers.dev
+    python build_static.py --worker-url https://boss-farm-calculato.<you>.workers.dev
     python build_static.py --worker-url https://... --league Standard --poll 120 --out docs
 """
 
@@ -46,6 +46,7 @@ FETCH_ENGINE = r"""const WORKER_URL = __WORKER_URL_JSON__;
 const LEAGUE = __LEAGUE_JSON__;
 const ENTITIES = __ENTITIES_JSON__;
 const ITEM_CATEGORIES = __ITEM_CATEGORIES_JSON__;
+const EXCHANGE_CATEGORIES = __EXCHANGE_CATEGORIES_JSON__;
 const OVERVIEW_SLUG = __OVERVIEW_SLUG_JSON__;
 const DEFAULT_CHANCE = __DEFAULT_CHANCE_JSON__;
 const PRICE_OVERRIDE = __PRICE_OVERRIDE_JSON__;
@@ -108,8 +109,8 @@ async function buildIndex(league){
   const CURRENCY_URL = WORKER_URL+'/ninja/stash/current/currency/overview';
   const ITEM_URL = WORKER_URL+'/ninja/stash/current/item/overview';
 
-  const exchangeTypes = ['Currency', 'Fragment'];
-  const stashTypes = ['Currency', 'Fragment'];
+  const exchangeTypes = EXCHANGE_CATEGORIES;
+  const stashTypes = EXCHANGE_CATEGORIES;
   const itemTypes = ITEM_CATEGORIES;
 
   const [exchangeResults, stashResults, itemResults, watchUnided] = await Promise.all([
@@ -155,7 +156,11 @@ async function buildIndex(league){
       if(!nm) continue;
       const chaos = line.primaryValue;
       const details = meta.detailsId || itemId;
-      put(nm, typ, chaos == null ? null : chaos, null, null, details, 'chaos');
+      // Astrolabe has no stash feed data at all, so its exchange-feed image
+      // (a relative path) is the only icon source; prefixed into a full
+      // poecdn URL. Currency/Fragment still rely on stash's icon (below).
+      const icon = (typ === 'Astrolabe' && meta.image) ? 'https://web.poecdn.com'+meta.image : null;
+      put(nm, typ, chaos == null ? null : chaos, null, icon, details, 'chaos');
     }
   }
 
@@ -352,6 +357,7 @@ def render_page(league, worker_url, poll_ms):
               .replace("__LEAGUE_JSON__", json.dumps(league))
               .replace("__ENTITIES_JSON__", json.dumps(boss.ENTITIES))
               .replace("__ITEM_CATEGORIES_JSON__", json.dumps(boss.ITEM_CATEGORIES))
+              .replace("__EXCHANGE_CATEGORIES_JSON__", json.dumps(boss.EXCHANGE_CATEGORIES))
               .replace("__OVERVIEW_SLUG_JSON__", json.dumps(boss.OVERVIEW_SLUG))
               .replace("__DEFAULT_CHANCE_JSON__", json.dumps(boss.DEFAULT_CHANCE))
               .replace("__PRICE_OVERRIDE_JSON__", json.dumps(boss.PRICE_OVERRIDE))
@@ -369,7 +375,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--worker-url", required=True,
-                    help="Cloudflare Worker base URL, e.g. https://boss-farm-proxy.you.workers.dev")
+                    help="Cloudflare Worker base URL, e.g. https://boss-farm-calculato.you.workers.dev")
     ap.add_argument("--league", default="Allflame")
     ap.add_argument("--poll", type=int, default=120,
                     help="browser auto-refresh interval, in seconds")
