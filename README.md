@@ -33,12 +33,12 @@ CORS-proxy role, and the pricing math moves into client-side JS instead of runni
    cd worker
    wrangler deploy
    ```
-   This prints your Worker's URL, e.g. `https://boss-farm-calculato.<you>.workers.dev`.
+   This prints your Worker's URL, e.g. `https://boss-farm-calculator.<you>.workers.dev`.
 
 2. **Generate the static page** — `ENTITIES` in `boss.py` stays the single source of truth;
    this reads it directly and embeds it, it isn't duplicated anywhere:
    ```bash
-   python build_static.py --worker-url https://boss-farm-calculato.<you>.workers.dev
+   python build_static.py --worker-url https://boss-farm-calculator.<you>.workers.dev
    # optional: --league Standard --poll 120 --out docs
    ```
    This writes `docs/index.html` (plus `docs/.nojekyll`).

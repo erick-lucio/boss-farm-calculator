@@ -17,7 +17,7 @@ pricing logic into client-side JS (the FETCH_ENGINE block below) that calls
 the Worker instead.
 
 Usage:
-    python build_static.py --worker-url https://boss-farm-calculato.<you>.workers.dev
+    python build_static.py --worker-url https://boss-farm-calculator.<you>.workers.dev
     python build_static.py --worker-url https://... --league Standard --poll 120 --out docs
 """
 
@@ -375,7 +375,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--worker-url", required=True,
-                    help="Cloudflare Worker base URL, e.g. https://boss-farm-calculato.you.workers.dev")
+                    help="Cloudflare Worker base URL, e.g. https://boss-farm-calculator.you.workers.dev")
     ap.add_argument("--league", default="Allflame")
     ap.add_argument("--poll", type=int, default=120,
                     help="browser auto-refresh interval, in seconds")
