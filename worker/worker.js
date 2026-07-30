@@ -68,9 +68,11 @@ export class SnipeSession {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.watchlist = [];       // [{name, chaos}] — chaos is the poe.ninja floor reference price
+    this.watchlist = [];       // [{name, chaos, icon}] — chaos is the poe.ninja floor reference price
     this.rotationIndex = 0;
     this.buffer = [];
+    this.checkLog = [];        // rolling log of every item checked this rotation — see checkOneItem
+    this.currentItem = null;   // {name, icon} of the item the rotation is checking right now, else null
     this.league = null;
     this.divineRate = null;
     this.exaltedRate = null;
@@ -117,13 +119,26 @@ export class SnipeSession {
     this.exaltedRate = data.exaltedRate;
     this.rotationIndex = 0;
     this.buffer = [];
+    this.checkLog = [];
+    this.currentItem = null;
     this.lastPolledAt = Date.now();
 
     await this.state.storage.setAlarm(Date.now() + 1000);
     return new Response(JSON.stringify({ ok: true, watchlistSize: this.watchlist.length }), { status: 200 });
   }
 
+  // Checks one watchlist item and appends one entry to `checkLog` regardless
+  // of outcome (found nothing, found listings but none underpriced, or found
+  // an underpriced hit) — this is what lets the frontend show "which item is
+  // being checked, its live price vs. the poe.ninja reference price" instead
+  // of only ever surfacing actual hits.
   async checkOneItem(item) {
+    const logEntry = {
+      name: item.name, icon: item.icon || null,
+      referenceChaos: item.chaos, checkedAt: Date.now(),
+      listingsSeen: 0, cheapestAmount: null, cheapestCurrency: null, cheapestChaosEquiv: null,
+      underpriced: false,
+    };
     let searchResp;
     try {
       searchResp = await fetch(`https://www.pathofexile.com/api/trade/search/${encodeURIComponent(this.league)}`, {
@@ -131,10 +146,10 @@ export class SnipeSession {
         headers: { "Content-Type": "application/json", "User-Agent": TRADE_UA },
         body: JSON.stringify({ query: { status: { option: "online" }, name: item.name }, sort: { price: "asc" } }),
       });
-    } catch (e) { return; }
-    if (!searchResp.ok) return;
+    } catch (e) { this.pushLog(logEntry); return; }
+    if (!searchResp.ok) { this.pushLog(logEntry); return; }
     const searchData = await searchResp.json();
-    if (!searchData.id || !Array.isArray(searchData.result) || !searchData.result.length) return;
+    if (!searchData.id || !Array.isArray(searchData.result) || !searchData.result.length) { this.pushLog(logEntry); return; }
 
     const ids = searchData.result.slice(0, 5).join(",");
     let fetchResp;
@@ -142,8 +157,8 @@ export class SnipeSession {
       fetchResp = await fetch(`https://www.pathofexile.com/api/trade/fetch/${ids}?query=${searchData.id}`, {
         headers: { "User-Agent": TRADE_UA },
       });
-    } catch (e) { return; }
-    if (!fetchResp.ok) return;
+    } catch (e) { this.pushLog(logEntry); return; }
+    if (!fetchResp.ok) { this.pushLog(logEntry); return; }
     const fetchData = await fetchResp.json();
 
     for (const r of (fetchData.result || [])) {
@@ -155,11 +170,18 @@ export class SnipeSession {
         : (currency === "exalted" && this.exaltedRate) ? amount * this.exaltedRate
         : null;
       if (chaosEquiv == null) continue; // unsupported currency for comparison, skip
+      logEntry.listingsSeen++;
+      if (logEntry.cheapestChaosEquiv == null || chaosEquiv < logEntry.cheapestChaosEquiv) {
+        logEntry.cheapestChaosEquiv = Math.round(chaosEquiv * 100) / 100;
+        logEntry.cheapestAmount = amount;
+        logEntry.cheapestCurrency = currency;
+      }
       if (chaosEquiv > item.chaos * (1 - this.thresholdPct / 100)) continue; // not underpriced enough
+      logEntry.underpriced = true;
       this.buffer.push({
         id: r.id,
         itemName: (r.item && (r.item.name || r.item.typeLine || r.item.baseType)) || item.name,
-        icon: (r.item && r.item.icon) || null,
+        icon: (r.item && r.item.icon) || item.icon || null,
         amount, currency,
         chaosEquiv: Math.round(chaosEquiv * 100) / 100,
         referenceChaos: item.chaos,
@@ -169,6 +191,12 @@ export class SnipeSession {
       });
     }
     if (this.buffer.length > 200) this.buffer = this.buffer.slice(-200);
+    this.pushLog(logEntry);
+  }
+
+  pushLog(entry) {
+    this.checkLog.push(entry);
+    if (this.checkLog.length > 50) this.checkLog = this.checkLog.slice(-50);
   }
 
   async handlePoll() {
@@ -176,14 +204,18 @@ export class SnipeSession {
     const running = !!this.watchlist.length;
     const listings = this.buffer;
     this.buffer = [];
+    const checks = this.checkLog;
+    this.checkLog = [];
     return new Response(JSON.stringify({
-      ok: true, running, listings,
+      ok: true, running, listings, checks,
+      checking: this.currentItem,
       progress: running ? { index: this.rotationIndex, total: this.watchlist.length } : null,
     }), { status: 200 });
   }
 
   async handleStop() {
     this.watchlist = [];
+    this.currentItem = null;
     await this.state.storage.deleteAlarm();
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   }
@@ -192,11 +224,15 @@ export class SnipeSession {
     if (!this.watchlist.length) return;
     if (Date.now() - this.lastPolledAt > 10 * 60 * 1000) {
       this.watchlist = []; // no poll in 10+ min — stop rotating, matches handleStop's end state
+      this.currentItem = null;
       return;
     }
+    const item = this.watchlist[this.rotationIndex];
+    this.currentItem = { name: item.name, icon: item.icon || null };
     try {
-      await this.checkOneItem(this.watchlist[this.rotationIndex]);
+      await this.checkOneItem(item);
     } catch (e) { /* transient failure on this one item — keep the rotation going */ }
+    this.currentItem = null;
     this.rotationIndex = (this.rotationIndex + 1) % this.watchlist.length;
     await this.state.storage.setAlarm(Date.now() + 3000);
   }
@@ -220,29 +256,31 @@ async function fetchTopUniqueWatchlist(league) {
     return resp.json();
   }));
 
-  const byName = new Map(); // name -> {chaos, listingCount}
+  const byName = new Map(); // name -> {chaos, listingCount, icon}
   for (const data of results) {
     for (const line of (data.lines || [])) {
       if (!line.name) continue;
       const chaos = line.chaosValue ?? line.chaosEquivalent;
       if (chaos == null) continue;
       const count = line.listingCount ?? line.count ?? 0;
+      const icon = line.icon || null;
       const cur = byName.get(line.name);
-      if (!cur) byName.set(line.name, { chaos, listingCount: count });
+      if (!cur) byName.set(line.name, { chaos, listingCount: count, icon });
       else {
         if (chaos < cur.chaos) cur.chaos = chaos;
         cur.listingCount += count;
+        if (!cur.icon && icon) cur.icon = icon;
       }
     }
   }
 
-  const all = Array.from(byName.entries()).map(([name, v]) => ({ name, chaos: v.chaos, listingCount: v.listingCount }));
+  const all = Array.from(byName.entries()).map(([name, v]) => ({ name, chaos: v.chaos, listingCount: v.listingCount, icon: v.icon }));
   const byMostSold = [...all].sort((a, b) => b.listingCount - a.listingCount).slice(0, 50);
   const byMostExpensive = [...all].sort((a, b) => b.chaos - a.chaos).slice(0, 50);
 
   const watchlistMap = new Map();
-  for (const it of [...byMostSold, ...byMostExpensive]) watchlistMap.set(it.name, it.chaos);
-  const watchlist = Array.from(watchlistMap.entries()).map(([name, chaos]) => ({ name, chaos }));
+  for (const it of [...byMostSold, ...byMostExpensive]) watchlistMap.set(it.name, { chaos: it.chaos, icon: it.icon });
+  const watchlist = Array.from(watchlistMap.entries()).map(([name, v]) => ({ name, chaos: v.chaos, icon: v.icon }));
 
   let divineRate = null, exaltedRate = null;
   const curResp = await fetch(`${NINJA_BASE}/exchange/current/overview?${new URLSearchParams({ league, type: "Currency" })}`, { headers: { "User-Agent": UA } });

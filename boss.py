@@ -1126,6 +1126,30 @@ button.sync:disabled, button.stop:disabled{opacity:.4; cursor:default}
 .snipe-hit a.whisper{font-family:ui-monospace,monospace; font-size:11px; color:var(--uber);
   border:1px solid var(--line); border-radius:2px; padding:4px 9px; white-space:nowrap}
 .snipe-hit a.whisper:hover{color:var(--ink); border-color:var(--uber)}
+
+.snipe-current{display:flex; align-items:center; gap:12px; background:var(--panel2);
+  border:1px dashed var(--line); border-radius:3px; padding:10px 14px; margin-top:14px}
+.snipe-current img{width:28px; height:28px; object-fit:contain; flex:0 0 auto}
+.snipe-current .dot{width:8px; height:8px; border-radius:50%; background:var(--ok);
+  flex:0 0 auto; animation:snipe-pulse 1.2s ease-in-out infinite}
+@keyframes snipe-pulse{0%,100%{opacity:1} 50%{opacity:.25}}
+.snipe-current .nm{font-family:ui-monospace,monospace; font-size:12.5px; color:var(--ink)}
+.snipe-current .lbl{font-family:ui-monospace,monospace; font-size:11px; color:var(--ink-dim);
+  text-transform:uppercase; letter-spacing:.05em}
+
+.snipe-log{display:flex; flex-direction:column; gap:6px; margin-top:10px;
+  max-height:340px; overflow-y:auto}
+.snipe-log-row{display:flex; align-items:center; gap:10px; background:var(--panel);
+  border:1px solid var(--line); border-radius:3px; padding:7px 12px; font-size:12px}
+.snipe-log-row img{width:24px; height:24px; object-fit:contain; flex:0 0 auto}
+.snipe-log-row .nm{flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  font-family:"Spectral",Georgia,serif}
+.snipe-log-row .prices{font-family:ui-monospace,monospace; font-size:11px; color:var(--ink-dim);
+  white-space:nowrap}
+.snipe-log-row .prices b{color:var(--ink); font-weight:600}
+.snipe-log-row.hit{border-color:var(--ok)}
+.snipe-log-row.hit .prices b{color:var(--ok)}
+.snipe-log-row .prices .none{opacity:.6}
 </style>"""
 
 SHARED_HEADER_HTML = r"""<header>
@@ -2083,10 +2107,23 @@ SNIPE_BODY = r"""
     </div>
   </div>
 
+  <div class="snipe-current" id="snipeCurrent" hidden>
+    <span class="dot"></span>
+    <span class="lbl" data-i18n="snipe_checking_now">checking now</span>
+    <img id="snipeCurrentIcon" src="" alt="" hidden>
+    <span class="nm" id="snipeCurrentName"></span>
+  </div>
+
   <div class="snipe-results">
     <div class="slabel"><span data-i18n="snipe_results_label">Underpriced listings found</span></div>
     <div class="snipe-list" id="snipeList"></div>
     <div class="empty" id="snipeEmpty" data-i18n="snipe_results_empty">Nothing yet — start watching above.</div>
+  </div>
+
+  <div class="snipe-results">
+    <div class="slabel"><span data-i18n="snipe_log_label">Live check log — reference price vs. cheapest live listing</span></div>
+    <div class="snipe-log" id="snipeLog"></div>
+    <div class="empty" id="snipeLogEmpty" data-i18n="snipe_log_empty">No items checked yet — start watching above.</div>
   </div>
 </div>
 """
@@ -2133,6 +2170,10 @@ en: {
   snipe_results_label: 'Underpriced listings found',
   snipe_results_empty: 'Nothing yet — start watching above.',
   snipe_err_generic: 'failed to start: ',
+  snipe_checking_now: 'checking now',
+  snipe_log_label: 'Live check log — reference price vs. cheapest live listing',
+  snipe_log_empty: 'No items checked yet — start watching above.',
+  snipe_log_none_found: 'no listings found',
 },
 pt: {
   tagline: 'PATH OF EXILE · CAÇADOR DE OFERTAS',
@@ -2154,6 +2195,10 @@ pt: {
   snipe_results_label: 'Ofertas abaixo do preço encontradas',
   snipe_results_empty: 'Nada ainda — comece a monitorar acima.',
   snipe_err_generic: 'falha ao iniciar: ',
+  snipe_checking_now: 'checando agora',
+  snipe_log_label: 'Log de checagens ao vivo — preço de referência vs. menor anúncio ao vivo',
+  snipe_log_empty: 'Nenhum item checado ainda — comece a monitorar acima.',
+  snipe_log_none_found: 'nenhum anúncio encontrado',
 },
 };
 
@@ -2186,6 +2231,47 @@ function renderHit(hit){
   return div;
 }
 
+function setCurrent(item){
+  const box = document.getElementById('snipeCurrent');
+  if(!item){ box.hidden = true; return; }
+  box.hidden = false;
+  const img = document.getElementById('snipeCurrentIcon');
+  if(item.icon){ img.src = item.icon; img.hidden = false; } else { img.hidden = true; img.src = ''; }
+  document.getElementById('snipeCurrentName').textContent = item.name;
+}
+
+function renderLogRow(chk){
+  const div = document.createElement('div');
+  div.className = 'snipe-log-row' + (chk.underpriced ? ' hit' : '');
+  const img = chk.icon ? `<img src="${escAttr(chk.icon)}" alt="">` : '';
+  const refTxt = `${Math.round(chk.referenceChaos)}c`;
+  const actualTxt = chk.cheapestChaosEquiv != null
+    ? `${chk.cheapestAmount} ${escAttr(chk.cheapestCurrency)} (~${chk.cheapestChaosEquiv}c)`
+    : `<span class="none">${t('snipe_log_none_found')}</span>`;
+  div.innerHTML = `${img}<span class="nm">${escAttr(chk.name)}</span>
+    <span class="prices">ref ${refTxt} &rarr; <b>${actualTxt}</b></span>`;
+  return div;
+}
+
+// Every entry here is one real trade-API round-trip: `referenceChaos` is the
+// poe.ninja market-floor price this watchlist item was queued with,
+// `cheapestChaosEquiv` is the actual cheapest currently-listed price found
+// live on pathofexile.com/trade just now — logged so it's visible exactly
+// which item was checked and how its live price compares to the reference.
+function logCheck(chk){
+  console.log(
+    `[Trade Sniper] checked "${chk.name}" — reference (poe.ninja floor): ~${Math.round(chk.referenceChaos)}c` +
+    (chk.cheapestChaosEquiv != null
+      ? ` | cheapest live listing: ${chk.cheapestAmount} ${chk.cheapestCurrency} (~${chk.cheapestChaosEquiv}c, ${chk.listingsSeen} listing(s) seen)` + (chk.underpriced ? ' — UNDERPRICED HIT' : ''
+      ) : ' | no live listings found'),
+    chk
+  );
+  const list = document.getElementById('snipeLog');
+  document.getElementById('snipeLogEmpty').hidden = true;
+  list.prepend(renderLogRow(chk));
+  while(list.children.length > 40) list.removeChild(list.lastChild);
+}
+
 document.getElementById('snipeList').addEventListener('click', e => {
   const a = e.target.closest('a.whisper');
   if(!a) return;
@@ -2202,10 +2288,15 @@ async function pollLoop(){
     const r = await fetch('/snipe/poll?session=' + encodeURIComponent(snipeSession), {signal: AbortSignal.timeout(10000)});
     const data = await r.json();
     if(!data.ok){ stopSniper(); setStatus('snipe_status_stopped', 'err'); return; }
+    if(data.checks && data.checks.length) for(const chk of data.checks) logCheck(chk);
+    setCurrent(data.checking);
     if(data.listings && data.listings.length){
       const list = document.getElementById('snipeList');
       document.getElementById('snipeEmpty').hidden = true;
-      for(const hit of data.listings) list.prepend(renderHit(hit));
+      for(const hit of data.listings){
+        console.log(`[Trade Sniper] UNDERPRICED HIT: "${hit.itemName}" listed for ${hit.amount} ${hit.currency} (~${hit.chaosEquiv}c) vs. reference ~${Math.round(hit.referenceChaos)}c`, hit);
+        list.prepend(renderHit(hit));
+      }
     }
     setProgress(data.progress);
     if(!data.running){ stopSniper(); setStatus('snipe_status_stopped'); return; }
@@ -2219,6 +2310,7 @@ function stopSniper(){
   document.getElementById('snipeStart').disabled = false;
   document.getElementById('snipeStop').disabled = true;
   setProgress(null);
+  setCurrent(null);
 }
 
 document.getElementById('snipeStart').addEventListener('click', async () => {
@@ -2243,6 +2335,12 @@ document.getElementById('snipeStart').addEventListener('click', async () => {
     snipeSession = data.session;
     document.getElementById('snipeStop').disabled = false;
     setStatus('snipe_status_running', 'ok');
+    document.getElementById('snipeList').innerHTML = '';
+    document.getElementById('snipeEmpty').hidden = false;
+    document.getElementById('snipeLog').innerHTML = '';
+    document.getElementById('snipeLogEmpty').hidden = false;
+    console.log(`[Trade Sniper] session started — league="${league}", threshold=${thresholdPct}% below reference, watchlist size=${data.watchlistSize} unique items.`);
+    console.log('[Trade Sniper] every ~3s the rotation checks the next watchlist item live on pathofexile.com/trade (one search + one fetch call) and compares its cheapest currently-listed price against the poe.ninja market-floor reference price for that item. A full lap through the watchlist takes ~5 minutes. Every check — hit or not — is logged here.');
     pollLoop();
   }catch(e){
     document.getElementById('snipeStatus').textContent = t('snipe_err_generic') + e;
