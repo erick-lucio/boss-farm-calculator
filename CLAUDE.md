@@ -355,8 +355,9 @@ A personal "PoE Helper Admin" Chrome extension (unpublished, loaded unpacked —
 `admin-extension/manifest.json`) flags the site's owner as admin in their own browser. **This is
 not real authentication** — it's a client-side convenience flag with nothing sensitive behind it
 (this repo has no login/database/write endpoints, see Security below). Currently gates: showing
-the hidden Trade Sniper link in the site menu (see the "hidden from menu" note on `PAGES` above)
-and a small `ADMIN` chip in the header.
+the hidden Trade Sniper link in the site menu (see the "hidden from menu" note on `PAGES` above),
+a small `ADMIN` chip in the header, and — new — redirecting non-admin visitors away from any page
+marked `PAGE_REQUIRES_ADMIN` (currently just `/snipe`) back to `/bosses`.
 
 - **Handshake, not a plain flag**: the extension's content script runs in an isolated JS world and
   can't set a property directly on the page's own `window` — a `CustomEvent` dispatched on
@@ -380,6 +381,19 @@ and a small `ADMIN` chip in the header.
   consistently — the injected menu link and badge are built via plain DOM methods at runtime
   (`enableAdminUI()`), not through `render_sitemenu()`/`PAGES`, since those are baked into the
   static HTML at build time and can't reflect a client-side-only signal.
+- **Redirect gate is a UX convenience, not access control** — the redirect is a client-side
+  `setTimeout` (600ms) that sends the visitor to `/bosses` via `location.replace()` if the admin
+  handshake hasn't confirmed them by then; it does **not** protect anything (there's nothing
+  sensitive server-side to protect — see Security below), it just keeps a stray/unlisted-page
+  visitor from landing on unfinished UI. `PAGE_REQUIRES_ADMIN` is a plain `const` prepended before
+  `SHARED_JS_CHROME` in each `render_<page>_page()` (`true` for `/snipe`, `false` for `/bosses`) —
+  add the same line (with the right value) to any future page's own `render_*` function; there's no
+  automatic per-page default. Since `PAGE_REQUIRES_ADMIN` must exist before `SHARED_JS_CHROME`'s own
+  top-level code reads it, and everything here is one concatenated `<script>` block (see "shared
+  chrome only *defines*... never calls ... at its own top level" rule above), it's declared as the
+  very first line of that block, before `SHARED_JS_CHROME` — not inside `SHARED_JS_CHROME` itself
+  (which is identical text on every page and can't hardcode a per-page value) and not inside each
+  page's own JS (which is concatenated *after* `SHARED_JS_CHROME`, too late for this).
 
 ### Security
 

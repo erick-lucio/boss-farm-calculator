@@ -1316,11 +1316,29 @@ function enableAdminUI(){
     menu.appendChild(a);
   }
 }
+let isAdmin = false;
+let adminGateTimer = null;
 window.addEventListener('poe-helper-admin-response', async e => {
   const hash = await sha256Hex(e.detail || '');
-  if(hash === EXPECTED_ADMIN_HASH) enableAdminUI();
+  if(hash === EXPECTED_ADMIN_HASH){
+    isAdmin = true;
+    if(adminGateTimer){ clearTimeout(adminGateTimer); adminGateTimer = null; }
+    enableAdminUI();
+  }
 });
 window.dispatchEvent(new CustomEvent('poe-helper-admin-request'));
+
+// Hidden pages (PAGE_REQUIRES_ADMIN, set per-page — see render_snipe_page())
+// aren't secured server-side (nothing sensitive behind them, see CLAUDE.md's
+// Security section), so this is a UX convenience gate, not real access
+// control — it just sends a visitor who stumbles onto an unlisted page
+// somewhere real instead of leaving them on unfinished/unadvertised UI. Give
+// the admin-extension handshake a brief window to respond (content scripts
+// normally answer near-instantly) before deciding "not admin" and sending
+// them home.
+if(typeof PAGE_REQUIRES_ADMIN !== 'undefined' && PAGE_REQUIRES_ADMIN){
+  adminGateTimer = setTimeout(() => { if(!isAdmin) location.replace('/bosses'); }, 600);
+}
 """
 
 # --------------------------------------------------------------------------- #
@@ -2059,7 +2077,8 @@ def render_bosses_page():
               .replace("__PRICECHIPS_ATTR__", "").replace("__DIVINE_CHIP_ATTR__", ""))
     return (head + "\n" + SHARED_CSS + '\n</head>\n<body>' + "\n"
             + render_sitemenu("bosses") + header + BOSSES_BODY + SHARED_FOOTER_HTML
-            + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n' + "<script>\n" + SHARED_JS_CHROME + BOSSES_JS
+            + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n'
+            + "<script>\nconst PAGE_REQUIRES_ADMIN = false;\n" + SHARED_JS_CHROME + BOSSES_JS
             + '\n</script>\n</body>\n</html>')
 
 
@@ -2466,7 +2485,8 @@ def render_snipe_page():
               .replace("__PRICECHIPS_ATTR__", "hidden").replace("__DIVINE_CHIP_ATTR__", "hidden"))
     return (head + "\n" + SHARED_CSS + '\n</head>\n<body>' + "\n"
             + render_sitemenu("snipe") + header + SNIPE_BODY + SHARED_FOOTER_HTML
-            + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n' + "<script>\n" + SHARED_JS_CHROME + SNIPE_JS
+            + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n'
+            + "<script>\nconst PAGE_REQUIRES_ADMIN = true;\n" + SHARED_JS_CHROME + SNIPE_JS
             + '\n</script>\n</body>\n</html>')
 
 
