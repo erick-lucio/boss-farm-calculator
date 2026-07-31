@@ -1110,6 +1110,9 @@ footer{border-top:1px solid var(--line); margin-top:24px;
 .snipe-status{font-family:ui-monospace,monospace; font-size:12px; color:var(--ink-dim)}
 .snipe-status.err{color:var(--neg)}
 .snipe-status.ok{color:var(--ok)}
+.snipe-status.warn{color:var(--warn)}
+.snipe-poesessid-warn{padding:8px 10px; margin:0; font-size:11px; border-left:2px solid var(--warn);
+  background:var(--overlay-soft)}
 button.stop{font-family:"Cinzel",serif; font-weight:700; font-size:11px; letter-spacing:.18em;
   text-transform:uppercase; color:var(--ink); background:var(--panel); border:1px solid var(--line);
   padding:8px 16px; cursor:pointer; border-radius:2px}
@@ -1123,9 +1126,11 @@ button.sync:disabled, button.stop:disabled{opacity:.4; cursor:default}
 .snipe-hit .nm{flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 .snipe-hit .px{font-family:ui-monospace,monospace; color:var(--gold-bright); font-weight:700; white-space:nowrap}
 .snipe-hit .ref{font-family:ui-monospace,monospace; color:var(--ink-dim); font-size:11px; white-space:nowrap}
-.snipe-hit a.whisper{font-family:ui-monospace,monospace; font-size:11px; color:var(--uber);
+.snipe-hit .variant{font-family:ui-monospace,monospace; font-size:11px; color:var(--ok)}
+.snipe-hit .variant.unsure{color:var(--warn)}
+.snipe-hit a.tradelink{font-family:ui-monospace,monospace; font-size:11px; color:var(--uber);
   border:1px solid var(--line); border-radius:2px; padding:4px 9px; white-space:nowrap}
-.snipe-hit a.whisper:hover{color:var(--ink); border-color:var(--uber)}
+.snipe-hit a.tradelink:hover{color:var(--ink); border-color:var(--uber)}
 
 .snipe-current{display:flex; align-items:center; gap:12px; background:var(--panel2);
   border:1px dashed var(--line); border-radius:3px; padding:10px 14px; margin-top:14px}
@@ -1150,6 +1155,7 @@ button.sync:disabled, button.stop:disabled{opacity:.4; cursor:default}
 .snipe-log-row .prices{font-family:ui-monospace,monospace; font-size:11px; color:var(--ink-dim);
   white-space:nowrap}
 .snipe-log-row .prices b{color:var(--ink); font-weight:600}
+.snipe-log-row .prices .variants{opacity:.65}
 .snipe-log-row.hit{border-color:var(--ok)}
 .snipe-log-row.hit .prices b{color:var(--ok)}
 .snipe-log-row .prices .none{opacity:.6}
@@ -2082,7 +2088,7 @@ SNIPE_BODY = r"""
     ("most sold" proxy) plus the top 50 by poe.ninja price ("most expensive"), deduped — for
     trade-site listings priced below the current market floor. Rotates through the whole list
     roughly once every 5 minutes, one item at a time, to stay well within Path of Exile's trade
-    API rate limits. No POESESSID needed.
+    API rate limits. POESESSID is optional — see below.
   </div>
   <div class="note" data-i18n="snipe_scope_note">
     Uniques only — Currency, Fragments, Scarabs, and other stackable currency-type goods are
@@ -2097,6 +2103,29 @@ SNIPE_BODY = r"""
       <label><span data-i18n="snipe_threshold_label">Underpriced by at least</span>
         <input type="number" id="threshold" value="20" min="1" max="90" style="width:70px">
       </label>
+      <label><span data-i18n="snipe_minprice_label">Min price</span>
+        <input type="number" id="minPrice" min="0" style="width:90px" placeholder="0">
+      </label>
+      <label><span data-i18n="snipe_maxprice_label">Max price</span>
+        <input type="number" id="maxPrice" min="0" style="width:90px" placeholder="&#8734;">
+      </label>
+      <label><span data-i18n="snipe_priceunit_label">Unit</span>
+        <select id="priceUnit" style="width:90px">
+          <option value="chaos" data-i18n="snipe_unit_chaos">Chaos</option>
+          <option value="divine" data-i18n="snipe_unit_divine">Divine</option>
+        </select>
+      </label>
+    </div>
+    <div class="snipe-row">
+      <label style="flex:2; min-width:260px"><span data-i18n="snipe_poesessid_label">POESESSID (optional)</span>
+        <input type="password" id="poesessid" autocomplete="off" placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;">
+      </label>
+    </div>
+    <div class="note snipe-poesessid-warn" data-i18n="snipe_poesessid_warn">
+      Optional. This is your Path of Exile account's session cookie — treat it like a password.
+      It's sent only to this Worker when you click Start, held in memory only for the life of this
+      watch, never logged or written to storage, and cleared the moment you stop watching or the
+      session times out. Leave it blank to use Trade Sniper fully anonymously (the default).
     </div>
     <div class="snipe-row">
       <div class="snipe-actions">
@@ -2160,7 +2189,7 @@ en: {
   footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Uses Path of Exile’s official, unauthenticated trade API to check a curated list of items on a rotation — nothing is stored server-side beyond an active session.',
   footer_made_by: 'Built by Erick Lúcio',
   footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
-  snipe_intro: 'Watches a curated list of Path of Exile Unique items — the top 50 by poe.ninja listing count ("most sold" proxy) plus the top 50 by poe.ninja price ("most expensive"), deduped — for trade-site listings priced below the current market floor. Rotates through the whole list roughly once every 5 minutes, one item at a time, to stay well within Path of Exile’s trade API rate limits. No POESESSID needed.',
+  snipe_intro: 'Watches a curated list of Path of Exile Unique items — the top 50 by poe.ninja listing count ("most sold" proxy) plus the top 50 by poe.ninja price ("most expensive"), deduped — for trade-site listings priced below the current market floor. Rotates through the whole list roughly once every 5 minutes, one item at a time, to stay well within Path of Exile’s trade API rate limits. POESESSID is optional — see below.',
   snipe_scope_note: 'Uniques only — Currency, Fragments, Scarabs, and other stackable currency-type goods are intentionally left out (buy those from Faustus in-game instead, at a fixed Artifacts price). Also: every listing found here requires whispering the seller in-game to complete the trade — Path of Exile’s Instant Buyout / Asynchronous Trade system has no public API, so this can’t show or filter to instant-buyout-only listings.',
   snipe_threshold_label: 'Underpriced by at least',
   snipe_btn_start: 'Start watching',
@@ -2170,6 +2199,7 @@ en: {
   snipe_status_running: 'watching…',
   snipe_status_stopped: 'stopped',
   snipe_progress: 'checked {i} / {n} — full lap ≈5 min',
+  snipe_status_ratelimited: 'rate limited by pathofexile.com/trade — paused, resuming in {mins}m {secs}s',
   snipe_results_label: 'Underpriced listings found',
   snipe_results_empty: 'Nothing yet — start watching above.',
   snipe_err_generic: 'failed to start: ',
@@ -2177,6 +2207,16 @@ en: {
   snipe_log_label: 'Live check log — reference price vs. cheapest live listing',
   snipe_log_empty: 'No items checked yet — start watching above.',
   snipe_log_none_found: 'no listings found',
+  snipe_view_trade: 'view on trade ↗',
+  snipe_minprice_label: 'Min price',
+  snipe_maxprice_label: 'Max price',
+  snipe_priceunit_label: 'Unit',
+  snipe_unit_chaos: 'Chaos',
+  snipe_unit_divine: 'Divine',
+  snipe_poesessid_label: 'POESESSID (optional)',
+  snipe_poesessid_warn: 'Optional. This is your Path of Exile account’s session cookie — treat it like a password. It’s sent only to this Worker when you click Start, held in memory only for the life of this watch, never logged or written to storage, and cleared the moment you stop watching or the session times out. Leave it blank to use Trade Sniper fully anonymously (the default).',
+  snipe_variant_unsure: '⚠ variant unconfirmed',
+  snipe_log_variants: '{n} price tiers',
 },
 pt: {
   tagline: 'PATH OF EXILE · CAÇADOR DE OFERTAS',
@@ -2185,7 +2225,7 @@ pt: {
   footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games. Usa a API oficial e não-autenticada de troca do Path of Exile para checar uma lista selecionada de itens em rodízio — nada é guardado no servidor além de uma sessão ativa.',
   footer_made_by: 'Feito por Erick Lúcio',
   footer_dm: 'Sugestão ou opinião? Manda um DM no LinkedIn',
-  snipe_intro: 'Monitora uma lista selecionada de itens Únicos do Path of Exile — os 50 mais listados no poe.ninja (indicador de "mais vendidos") mais os 50 de maior preço no poe.ninja ("mais caros"), sem repetição — em busca de anúncios com preço abaixo do valor de mercado atual. Passa pela lista inteira a cada ~5 minutos, um item de cada vez, para ficar bem dentro dos limites de requisição da API de troca do Path of Exile. Não precisa de POESESSID.',
+  snipe_intro: 'Monitora uma lista selecionada de itens Únicos do Path of Exile — os 50 mais listados no poe.ninja (indicador de "mais vendidos") mais os 50 de maior preço no poe.ninja ("mais caros"), sem repetição — em busca de anúncios com preço abaixo do valor de mercado atual. Passa pela lista inteira a cada ~5 minutos, um item de cada vez, para ficar bem dentro dos limites de requisição da API de troca do Path of Exile. POESESSID é opcional — veja abaixo.',
   snipe_scope_note: 'Apenas itens Únicos — Moedas, Fragmentos, Scarabs e outros itens empilháveis do tipo moeda ficam de fora de propósito (compre esses do Faustus dentro do jogo, por um preço fixo em Artefatos). Além disso: todo anúncio encontrado aqui exige sussurrar para o vendedor dentro do jogo para completar a troca — o sistema de Compra Instantânea / Troca Assíncrona do Path of Exile não tem API pública, então isso não consegue mostrar ou filtrar só os anúncios de compra instantânea.',
   snipe_threshold_label: 'Abaixo do preço em pelo menos',
   snipe_btn_start: 'Começar a monitorar',
@@ -2195,6 +2235,7 @@ pt: {
   snipe_status_running: 'monitorando…',
   snipe_status_stopped: 'parado',
   snipe_progress: 'checado {i} / {n} — volta completa ≈5 min',
+  snipe_status_ratelimited: 'limite de taxa do pathofexile.com/trade — pausado, retomando em {mins}m {secs}s',
   snipe_results_label: 'Ofertas abaixo do preço encontradas',
   snipe_results_empty: 'Nada ainda — comece a monitorar acima.',
   snipe_err_generic: 'falha ao iniciar: ',
@@ -2202,11 +2243,22 @@ pt: {
   snipe_log_label: 'Log de checagens ao vivo — preço de referência vs. menor anúncio ao vivo',
   snipe_log_empty: 'Nenhum item checado ainda — comece a monitorar acima.',
   snipe_log_none_found: 'nenhum anúncio encontrado',
+  snipe_view_trade: 'ver na trade ↗',
+  snipe_minprice_label: 'Preço mín.',
+  snipe_maxprice_label: 'Preço máx.',
+  snipe_priceunit_label: 'Unidade',
+  snipe_unit_chaos: 'Caos',
+  snipe_unit_divine: 'Divino',
+  snipe_poesessid_label: 'POESESSID (opcional)',
+  snipe_poesessid_warn: 'Opcional. Este é o cookie de sessão da sua conta do Path of Exile — trate como uma senha. Ele é enviado só para este Worker quando você clica em Começar, fica em memória apenas durante essa monitoração, nunca é registrado em log nem gravado em armazenamento, e é apagado assim que você parar ou a sessão expirar. Deixe em branco para usar o Caçador de Ofertas de forma totalmente anônima (o padrão).',
+  snipe_variant_unsure: '⚠ variante não confirmada',
+  snipe_log_variants: '{n} faixas de preço',
 },
 };
 
 let snipeSession = null;
 let pollTimer = null;
+let rateLimitWarned = false;
 
 function setStatus(key, cls){
   const el = document.getElementById('snipeStatus');
@@ -2227,10 +2279,13 @@ function renderHit(hit){
   div.className = 'snipe-hit';
   const img = hit.icon ? `<img src="${escAttr(hit.icon)}" alt="">` : '';
   const priceTxt = `${hit.amount} ${escAttr(hit.currency)}`;
-  div.innerHTML = `${img}<span class="nm">${escAttr(hit.itemName)}</span>
+  const variantTxt = hit.variantLabel
+    ? ` <span class="variant">(${escAttr(hit.variantLabel)})</span>`
+    : (hit.variantUncertain ? ` <span class="variant unsure">${t('snipe_variant_unsure')}</span>` : '');
+  div.innerHTML = `${img}<span class="nm">${escAttr(hit.itemName)}${variantTxt}</span>
     <span class="px">${priceTxt}</span>
     <span class="ref">ref ~${Math.round(hit.referenceChaos)}c</span>
-    <a class="whisper" href="#" data-whisper="${escAttr(hit.whisper)}">whisper</a>`;
+    <a class="tradelink" href="${escAttr(hit.tradeUrl)}" target="_blank" rel="noopener noreferrer">${t('snipe_view_trade')}</a>`;
   return div;
 }
 
@@ -2247,7 +2302,8 @@ function renderLogRow(chk){
   const div = document.createElement('div');
   div.className = 'snipe-log-row' + (chk.underpriced ? ' hit' : '');
   const img = chk.icon ? `<img src="${escAttr(chk.icon)}" alt="">` : '';
-  const refTxt = `${Math.round(chk.referenceChaos)}c`;
+  const refTxt = `${Math.round(chk.referenceChaos)}c` + (chk.variantCount
+    ? ` <span class="variants">(${t('snipe_log_variants').replace('{n}', chk.variantCount)})</span>` : '');
   const actualTxt = chk.cheapestChaosEquiv != null
     ? `${chk.cheapestAmount} ${escAttr(chk.cheapestCurrency)} (~${chk.cheapestChaosEquiv}c)`
     : `<span class="none">${t('snipe_log_none_found')}</span>`;
@@ -2259,18 +2315,23 @@ function renderLogRow(chk){
 }
 
 // Every entry here is one real trade-API round-trip: `referenceChaos` is the
-// poe.ninja market-floor price this watchlist item was queued with,
-// `cheapestChaosEquiv` is the actual cheapest currently-listed price found
-// live on pathofexile.com/trade just now — logged so it's visible exactly
-// which item was checked and how its live price compares to the reference.
-// `debug` (set server-side whenever no price was found) explains *why* —
-// a trade-API HTTP error, an empty search result, or an unparseable
-// listing — instead of leaving an unexplained zero.
+// poe.ninja market-floor price this watchlist item was queued with (the
+// floor across all its price tiers when `variantCount` is set — e.g.
+// Mageblood's cheapest flask-count tier), `cheapestChaosEquiv` is the actual
+// cheapest currently-listed price found live on pathofexile.com/trade just
+// now — logged so it's visible exactly which item was checked and how its
+// live price compares to the reference. Individual underpriced HITS (below)
+// use a more accurate per-tier reference when the specific listing's mods
+// could be matched to one of poe.ninja's known tiers — this log-level
+// reference stays floor-based since it's describing the whole check, not
+// one listing. `debug` (set server-side whenever no price was found)
+// explains *why* — a trade-API HTTP error, an empty search result, or an
+// unparseable listing — instead of leaving an unexplained zero.
 function logCheck(chk){
   console.log(
-    `[Trade Sniper] checked "${chk.name}" — reference (poe.ninja floor): ~${Math.round(chk.referenceChaos)}c` +
+    `[Trade Sniper] checked "${chk.name}"${chk.variantCount ? ` (${chk.variantCount} price tiers)` : ''} — reference (poe.ninja floor): ~${Math.round(chk.referenceChaos)}c` +
     (chk.cheapestChaosEquiv != null
-      ? ` | cheapest live listing: ${chk.cheapestAmount} ${chk.cheapestCurrency} (~${chk.cheapestChaosEquiv}c, ${chk.listingsSeen} listing(s) seen)` + (chk.underpriced ? ' — UNDERPRICED HIT' : '')
+      ? ` | cheapest live listing: ${chk.cheapestAmount} ${chk.cheapestCurrency} (~${chk.cheapestChaosEquiv}c, ${chk.listingsSeen} listing(s) seen)` + (chk.underpriced ? ' — UNDERPRICED HIT (see hit list for per-tier reference price)' : '')
       : ` | no price found${chk.debug ? ' — ' + chk.debug : ''}`),
     chk
   );
@@ -2279,16 +2340,6 @@ function logCheck(chk){
   list.prepend(renderLogRow(chk));
   while(list.children.length > 40) list.removeChild(list.lastChild);
 }
-
-document.getElementById('snipeList').addEventListener('click', e => {
-  const a = e.target.closest('a.whisper');
-  if(!a) return;
-  e.preventDefault();
-  const w = a.dataset.whisper;
-  if(w) navigator.clipboard && navigator.clipboard.writeText(w).catch(()=>{});
-  a.textContent = 'copied!';
-  setTimeout(() => { a.textContent = 'whisper'; }, 1500);
-});
 
 async function pollLoop(){
   if(!snipeSession) return;
@@ -2306,7 +2357,22 @@ async function pollLoop(){
         list.prepend(renderHit(hit));
       }
     }
-    setProgress(data.progress);
+    if(data.rateLimitedUntil){
+      const remainMs = Math.max(0, data.rateLimitedUntil - Date.now());
+      const mins = Math.floor(remainMs / 60000);
+      const secs = Math.floor((remainMs % 60000) / 1000);
+      document.getElementById('snipeProgressRow').hidden = false;
+      document.getElementById('snipeProgress').textContent =
+        t('snipe_status_ratelimited').replace('{mins}', mins).replace('{secs}', secs);
+      setStatus('snipe_status_running', 'warn');
+      if(!rateLimitWarned){
+        console.warn(`[Trade Sniper] pathofexile.com/trade rate-limited this session — pausing ALL requests until ${new Date(data.rateLimitedUntil).toLocaleTimeString()} (~${mins}m ${secs}s). The rotation resumes automatically once the cooldown clears.`);
+        rateLimitWarned = true;
+      }
+    }else{
+      rateLimitWarned = false;
+      setProgress(data.progress);
+    }
     if(!data.running){ stopSniper(); setStatus('snipe_status_stopped'); return; }
   }catch(e){ /* transient network hiccup — next poll retries */ }
   pollTimer = setTimeout(pollLoop, POLL_MS);
@@ -2319,18 +2385,27 @@ function stopSniper(){
   document.getElementById('snipeStop').disabled = true;
   setProgress(null);
   setCurrent(null);
+  rateLimitWarned = false;
 }
 
 document.getElementById('snipeStart').addEventListener('click', async () => {
   const thresholdPct = Number(document.getElementById('threshold').value) || 20;
   const league = document.getElementById('leaguesel').value || LEAGUE;
+  const minRaw = document.getElementById('minPrice').value;
+  const maxRaw = document.getElementById('maxPrice').value;
+  const minPrice = minRaw !== '' ? Number(minRaw) : null;
+  const maxPrice = maxRaw !== '' ? Number(maxRaw) : null;
+  const priceUnit = document.getElementById('priceUnit').value || 'chaos';
+  const poesessidEl = document.getElementById('poesessid');
+  const poesessid = poesessidEl.value.trim() || null;
+  poesessidEl.value = ''; // never keep it sitting in the DOM longer than needed to send it once
 
   document.getElementById('snipeStart').disabled = true;
   setStatus('snipe_status_starting');
   try{
     const r = await fetch('/snipe/start', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({league, thresholdPct}),
+      body: JSON.stringify({league, thresholdPct, minPrice, maxPrice, priceUnit, poesessid}),
       signal: AbortSignal.timeout(20000),
     });
     const data = await r.json();
@@ -2347,8 +2422,10 @@ document.getElementById('snipeStart').addEventListener('click', async () => {
     document.getElementById('snipeEmpty').hidden = false;
     document.getElementById('snipeLog').innerHTML = '';
     document.getElementById('snipeLogEmpty').hidden = false;
-    console.log(`[Trade Sniper] session started — league="${league}", threshold=${thresholdPct}% below reference, watchlist size=${data.watchlistSize} unique items.`);
-    console.log('[Trade Sniper] every ~3s the rotation checks the next watchlist item live on pathofexile.com/trade (one search + one fetch call) and compares its cheapest currently-listed price against the poe.ninja market-floor reference price for that item. A full lap through the watchlist takes ~5 minutes. Every check — hit or not — is logged here.');
+    const rangeTxt = (minPrice != null || maxPrice != null)
+      ? `, price range=${minPrice != null ? minPrice : '0'}-${maxPrice != null ? maxPrice : '∞'} ${priceUnit}` : '';
+    console.log(`[Trade Sniper] session started — league="${league}", threshold=${thresholdPct}% below reference${rangeTxt}, watchlist size=${data.watchlistSize} unique items, POESESSID=${poesessid ? 'provided (not logged)' : 'none — anonymous'}.`);
+    console.log('[Trade Sniper] every ~3s the rotation checks the next watchlist item live on pathofexile.com/trade (one search + one fetch call) and compares its cheapest currently-listed price against the poe.ninja reference price for that item — the per-tier price when the listing\'s mods could be matched to a known variant (e.g. Mageblood\'s flask count), otherwise the floor price across all tiers. A full lap through the watchlist takes ~5 minutes. Every check — hit or not — is logged here.');
     pollLoop();
   }catch(e){
     document.getElementById('snipeStatus').textContent = t('snipe_err_generic') + e;

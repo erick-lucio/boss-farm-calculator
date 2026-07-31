@@ -55,15 +55,20 @@ function withCors(body, status, contentType) {
 // down would mean fetching full details on nearly every unique listed
 // site-wide just to check the name, blowing through the fetch-endpoint rate
 // limit under real volume). Neither is a good trade-off, so this uses
-// **rotation polling** instead: no WebSocket, no POESESSID, no live-search at
-// all. `alarm()` re-fires every ~3s, checks the single next item in the
+// **rotation polling** instead: no WebSocket, no live-search at all.
+// `alarm()` re-fires every ~3s, checks the single next item in the
 // watchlist (one `search` + one `fetch` call), and moves on — a full lap
 // through a 100-item list takes ~5 minutes. That's comfortably inside GGG's
 // documented rate limits (search 5/12s, fetch 12/6s — this uses one of each
-// per 3s, an order of magnitude under both) and needs no credential at all,
-// since plain trade search + fetch work fully unauthenticated (confirmed
-// live). Trades instant push for a ~5-minute-average staleness, which is the
-// deliberate, user-approved choice here over the two risky alternatives above.
+// per 3s, an order of magnitude under both), and plain trade search + fetch
+// work fully unauthenticated (confirmed live) — so a credential was never
+// required. Trades instant push for a ~5-minute-average staleness, which is
+// the deliberate, user-approved choice here over the two risky alternatives
+// above. POESESSID is still optional (see `poesessid` below): under heavy
+// personal use GGG's anonymous rate-limit bucket can get exhausted (a real
+// 429 seen in testing), and supplying your own account's session cookie may
+// use a separate, more generous bucket — never required, never persisted to
+// storage, only held in this instance's memory for the life of the watch.
 export class SnipeSession {
   constructor(state, env) {
     this.state = state;
@@ -78,6 +83,8 @@ export class SnipeSession {
     this.exaltedRate = null;
     this.thresholdPct = 20;
     this.lastPolledAt = 0;
+    this.rateLimitedUntil = 0;  // ms epoch; while in the future, alarm() makes zero trade-API calls
+    this.poesessid = null;      // optional; never written to storage, never echoed in any response
   }
 
   async fetch(request) {
@@ -98,21 +105,28 @@ export class SnipeSession {
     } catch (e) {
       return new Response(JSON.stringify({ ok: false, error: "bad JSON body" }), { status: 400 });
     }
-    const { league, thresholdPct } = body;
+    const { league, thresholdPct, minPrice, maxPrice, priceUnit, poesessid } = body;
     if (!league) {
       return new Response(JSON.stringify({ ok: false, error: "need league" }), { status: 400 });
     }
     this.league = league;
     this.thresholdPct = Math.min(90, Math.max(1, Number(thresholdPct) || 20));
+    // In-memory only for this DO instance's lifetime — never storage.put(),
+    // never included in any /poll or /start response, never logged.
+    this.poesessid = (typeof poesessid === "string" && poesessid.trim()) ? poesessid.trim() : null;
 
     let data;
     try {
-      data = await fetchTopUniqueWatchlist(league);
+      data = await fetchTopUniqueWatchlist(league, {
+        minPrice: minPrice != null && minPrice !== "" ? Number(minPrice) : null,
+        maxPrice: maxPrice != null && maxPrice !== "" ? Number(maxPrice) : null,
+        priceUnit: priceUnit === "divine" ? "divine" : "chaos",
+      });
     } catch (e) {
       return new Response(JSON.stringify({ ok: false, error: "poe.ninja lookup failed: " + e }), { status: 502 });
     }
     if (!data.watchlist.length) {
-      return new Response(JSON.stringify({ ok: false, error: "no current poe.ninja unique price data found for that league" }), { status: 400 });
+      return new Response(JSON.stringify({ ok: false, error: "no poe.ninja unique items matched (check the league name, or widen the price range)" }), { status: 400 });
     }
     this.watchlist = data.watchlist;
     this.divineRate = data.divineRate;
@@ -121,6 +135,7 @@ export class SnipeSession {
     this.buffer = [];
     this.checkLog = [];
     this.currentItem = null;
+    this.rateLimitedUntil = 0;
     this.lastPolledAt = Date.now();
 
     await this.state.storage.setAlarm(Date.now() + 1000);
@@ -138,19 +153,28 @@ export class SnipeSession {
       referenceChaos: item.chaos, checkedAt: Date.now(),
       listingsSeen: 0, cheapestAmount: null, cheapestCurrency: null, cheapestChaosEquiv: null,
       underpriced: false, debug: null,
+      variantCount: item.variants ? item.variants.length : null,
     };
+    const tradeHeaders = { "User-Agent": TRADE_UA };
+    if (this.poesessid) tradeHeaders["Cookie"] = `POESESSID=${this.poesessid}`;
     let searchResp;
     try {
       searchResp = await fetch(`https://www.pathofexile.com/api/trade/search/${encodeURIComponent(this.league)}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "User-Agent": TRADE_UA },
+        headers: { "Content-Type": "application/json", ...tradeHeaders },
         body: JSON.stringify({ query: { status: { option: "online" }, name: item.name }, sort: { price: "asc" } }),
       });
     } catch (e) { logEntry.debug = `search request threw: ${e}`; this.pushLog(logEntry); return; }
     if (!searchResp.ok) {
       let snippet = "";
       try { snippet = (await searchResp.text()).slice(0, 200); } catch (e) {}
-      logEntry.debug = `search HTTP ${searchResp.status} ${searchResp.statusText}: ${snippet}`;
+      if (searchResp.status === 429) {
+        const waitSec = parseRetrySeconds(searchResp, snippet);
+        this.rateLimitedUntil = Date.now() + waitSec * 1000;
+        logEntry.debug = `rate limited by pathofexile.com/trade — pausing the whole rotation for ${waitSec}s (no more requests until then)`;
+      } else {
+        logEntry.debug = `search HTTP ${searchResp.status} ${searchResp.statusText}: ${snippet}`;
+      }
       this.pushLog(logEntry); return;
     }
     const searchData = await searchResp.json();
@@ -165,17 +189,28 @@ export class SnipeSession {
     let fetchResp;
     try {
       fetchResp = await fetch(`https://www.pathofexile.com/api/trade/fetch/${ids}?query=${searchData.id}`, {
-        headers: { "User-Agent": TRADE_UA },
+        headers: tradeHeaders,
       });
     } catch (e) { logEntry.debug = `fetch request threw: ${e}`; this.pushLog(logEntry); return; }
     if (!fetchResp.ok) {
       let snippet = "";
       try { snippet = (await fetchResp.text()).slice(0, 200); } catch (e) {}
-      logEntry.debug = `fetch HTTP ${fetchResp.status} ${fetchResp.statusText}: ${snippet}`;
+      if (fetchResp.status === 429) {
+        const waitSec = parseRetrySeconds(fetchResp, snippet);
+        this.rateLimitedUntil = Date.now() + waitSec * 1000;
+        logEntry.debug = `rate limited by pathofexile.com/trade — pausing the whole rotation for ${waitSec}s (no more requests until then)`;
+      } else {
+        logEntry.debug = `fetch HTTP ${fetchResp.status} ${fetchResp.statusText}: ${snippet}`;
+      }
       this.pushLog(logEntry); return;
     }
     const fetchData = await fetchResp.json();
     if (fetchData.error) logEntry.debug = `fetch error: ${JSON.stringify(fetchData.error)}`;
+
+    // Same searchId reopens this exact name-filtered query on the real trade
+    // site — since the query only ever matches this one item name, the page
+    // it lands on shows just this item's listings, not a generic browse.
+    const tradeUrl = `https://www.pathofexile.com/trade/search/${encodeURIComponent(this.league)}/${searchData.id}`;
 
     for (const r of (fetchData.result || [])) {
       if (!r || !r.listing || !r.listing.price) continue;
@@ -192,7 +227,31 @@ export class SnipeSession {
         logEntry.cheapestAmount = amount;
         logEntry.cheapestCurrency = currency;
       }
-      if (chaosEquiv > item.chaos * (1 - this.thresholdPct / 100)) continue; // not underpriced enough
+
+      // item.chaos is the FLOOR across every poe.ninja-priced variant of this
+      // name (e.g. Mageblood's cheapest "2 Flasks" tier) — safe as a
+      // fallback (never produces a false "underpriced" claim) but blind to
+      // real deals on pricier tiers. When this name has known variants, try
+      // to identify which one THIS listing actually is by matching its real
+      // mod text against each variant's discriminator (see
+      // findDiscriminator), and compare against that variant's own price.
+      let referenceChaos = item.chaos;
+      let variantLabel = null, variantUncertain = false;
+      if (item.variants) {
+        const modTexts = [
+          ...((r.item && r.item.implicitMods) || []),
+          ...((r.item && r.item.explicitMods) || []),
+        ].map((m) => m.description);
+        const matches = item.variants.filter((v) => v.discriminator && modTexts.includes(v.discriminator));
+        if (matches.length === 1) {
+          referenceChaos = matches[0].chaos;
+          variantLabel = matches[0].label;
+        } else {
+          variantUncertain = true; // no reliable discriminator, or ambiguous — fall back to the safe floor above
+        }
+      }
+
+      if (chaosEquiv > referenceChaos * (1 - this.thresholdPct / 100)) continue; // not underpriced enough
       logEntry.underpriced = true;
       this.buffer.push({
         id: r.id,
@@ -200,9 +259,11 @@ export class SnipeSession {
         icon: (r.item && r.item.icon) || item.icon || null,
         amount, currency,
         chaosEquiv: Math.round(chaosEquiv * 100) / 100,
-        referenceChaos: item.chaos,
+        referenceChaos,
+        variantLabel,
+        variantUncertain,
         account: (r.listing.account && r.listing.account.name) || "?",
-        whisper: r.listing.whisper || "",
+        tradeUrl,
         seenAt: Date.now(),
       });
     }
@@ -228,6 +289,7 @@ export class SnipeSession {
     return new Response(JSON.stringify({
       ok: true, running, listings, checks,
       checking: this.currentItem,
+      rateLimitedUntil: this.rateLimitedUntil > Date.now() ? this.rateLimitedUntil : null,
       progress: running ? { index: this.rotationIndex, total: this.watchlist.length } : null,
     }), { status: 200 });
   }
@@ -235,6 +297,8 @@ export class SnipeSession {
   async handleStop() {
     this.watchlist = [];
     this.currentItem = null;
+    this.rateLimitedUntil = 0;
+    this.poesessid = null;
     await this.state.storage.deleteAlarm();
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   }
@@ -244,6 +308,16 @@ export class SnipeSession {
     if (Date.now() - this.lastPolledAt > 10 * 60 * 1000) {
       this.watchlist = []; // no poll in 10+ min — stop rotating, matches handleStop's end state
       this.currentItem = null;
+      this.poesessid = null;
+      return;
+    }
+    // While rate-limited, make ZERO trade-API calls until the cooldown clears
+    // — retrying every 3s during the ban window would just keep re-triggering
+    // it. Check back periodically (capped at 30s) only to keep the
+    // 10-minute-idle abandonment check above alive.
+    if (Date.now() < this.rateLimitedUntil) {
+      this.currentItem = null;
+      await this.state.storage.setAlarm(Math.min(this.rateLimitedUntil + 500, Date.now() + 30000));
       return;
     }
     const item = this.watchlist[this.rotationIndex];
@@ -252,22 +326,66 @@ export class SnipeSession {
       await this.checkOneItem(item);
     } catch (e) { /* transient failure on this one item — keep the rotation going */ }
     this.currentItem = null;
+    if (Date.now() < this.rateLimitedUntil) {
+      // just entered a rate-limit ban from the check above — don't advance
+      // rotationIndex, so the same item gets re-checked first once cleared
+      await this.state.storage.setAlarm(Math.min(this.rateLimitedUntil + 500, Date.now() + 30000));
+      return;
+    }
     this.rotationIndex = (this.rotationIndex + 1) % this.watchlist.length;
     await this.state.storage.setAlarm(Date.now() + 3000);
   }
 }
 
+function parseRetrySeconds(resp, bodyText) {
+  const header = resp.headers.get("Retry-After");
+  if (header && !isNaN(Number(header))) return Number(header);
+  const m = bodyText && bodyText.match(/wait (\d+) seconds/i);
+  if (m) return Number(m[1]);
+  return 60; // conservative fallback if PoE didn't tell us how long
+}
+
 const TRADE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+
+// A discriminator is a mod line (explicit preferred, then implicit) present
+// on `row` but on NONE of the other poe.ninja rows for the same item name —
+// the one line that reliably identifies this specific variant. Returns null
+// (unmatchable) when no such line exists, or when the only candidate is a
+// "(min-max)" rolled-range template: a live trade listing shows the
+// concrete rolled number ("+37 to Strength"), which won't literal-match the
+// template text, so that can't be used as a reliable discriminator.
+function findDiscriminator(row, allRows) {
+  const otherLines = new Set();
+  for (const o of allRows) {
+    if (o === row) continue;
+    for (const m of [...(o.explicitModifiers || []), ...(o.implicitModifiers || [])]) otherLines.add(m.text);
+  }
+  const ownLines = [...(row.explicitModifiers || []), ...(row.implicitModifiers || [])].map((m) => m.text);
+  for (const text of ownLines) {
+    if (otherLines.has(text)) continue;
+    if (/\(\d+(\.\d+)?-\d+(\.\d+)?\)/.test(text)) continue; // rolled range, not reliably matchable
+    return text;
+  }
+  return null;
+}
 
 // Builds the curated watchlist: top 50 uniques by poe.ninja listingCount
 // ("most sold" proxy — GGG publishes no real sales data, listing count is
 // the best available liquidity signal) plus top 50 by chaos value ("most
-// expensive"), deduped by name. Reference price per name is the FLOOR chaos
-// value across all its poe.ninja rows (matches this project's established
-// floor-price philosophy — see boss.py's build_index() — since a name like
-// "Mageblood" has several rows, one per flask-count variant, and the trade
-// search-by-name below returns all of them mixed together).
-async function fetchTopUniqueWatchlist(league) {
+// expensive"), deduped by name, optionally restricted to a chaos price
+// range via `priceFilter` (directly shrinks the watchlist — the main lever
+// against trade-API rate limits/timeouts under heavy use).
+//
+// Reference price per name is still the FLOOR chaos value across all its
+// poe.ninja rows (matches this project's established floor-price philosophy
+// — see boss.py's build_index()), used as the safe fallback. But for names
+// poe.ninja splits into multiple *priced* variants (e.g. "Mageblood" has a
+// "2/3/4/5 Flasks" row each, worth wildly different amounts — see
+// findDiscriminator's docs above), the floor alone is misleading: a live
+// listing could be any tier. `variants` captures each tier's own price plus
+// its discriminator, so checkOneItem() can identify which tier a specific
+// live listing actually is and compare against ITS price instead.
+async function fetchTopUniqueWatchlist(league, priceFilter) {
   const categories = ["UniqueWeapon", "UniqueArmour", "UniqueAccessory", "UniqueJewel", "UniqueFlask"];
   const results = await Promise.all(categories.map(async (cat) => {
     const qs = new URLSearchParams({ league, type: cat });
@@ -275,32 +393,8 @@ async function fetchTopUniqueWatchlist(league) {
     return resp.json();
   }));
 
-  const byName = new Map(); // name -> {chaos, listingCount, icon}
-  for (const data of results) {
-    for (const line of (data.lines || [])) {
-      if (!line.name) continue;
-      const chaos = line.chaosValue ?? line.chaosEquivalent;
-      if (chaos == null) continue;
-      const count = line.listingCount ?? line.count ?? 0;
-      const icon = line.icon || null;
-      const cur = byName.get(line.name);
-      if (!cur) byName.set(line.name, { chaos, listingCount: count, icon });
-      else {
-        if (chaos < cur.chaos) cur.chaos = chaos;
-        cur.listingCount += count;
-        if (!cur.icon && icon) cur.icon = icon;
-      }
-    }
-  }
-
-  const all = Array.from(byName.entries()).map(([name, v]) => ({ name, chaos: v.chaos, listingCount: v.listingCount, icon: v.icon }));
-  const byMostSold = [...all].sort((a, b) => b.listingCount - a.listingCount).slice(0, 50);
-  const byMostExpensive = [...all].sort((a, b) => b.chaos - a.chaos).slice(0, 50);
-
-  const watchlistMap = new Map();
-  for (const it of [...byMostSold, ...byMostExpensive]) watchlistMap.set(it.name, { chaos: it.chaos, icon: it.icon });
-  const watchlist = Array.from(watchlistMap.entries()).map(([name, v]) => ({ name, chaos: v.chaos, icon: v.icon }));
-
+  // Currency rates are needed up front now — a "divine" priceFilter has to
+  // be converted to chaos before it can filter poe.ninja's chaos-valued rows.
   let divineRate = null, exaltedRate = null;
   const curResp = await fetch(`${NINJA_BASE}/exchange/current/overview?${new URLSearchParams({ league, type: "Currency" })}`, { headers: { "User-Agent": UA } });
   const curData = await curResp.json();
@@ -311,6 +405,51 @@ async function fetchTopUniqueWatchlist(league) {
     if (nm === "Divine Orb") divineRate = line.primaryValue;
     if (nm === "Exalted Orb") exaltedRate = line.primaryValue;
   }
+
+  let minChaos = null, maxChaos = null;
+  if (priceFilter) {
+    const unitRate = priceFilter.priceUnit === "divine" ? divineRate : 1;
+    if (unitRate) {
+      if (priceFilter.minPrice != null && !isNaN(priceFilter.minPrice)) minChaos = priceFilter.minPrice * unitRate;
+      if (priceFilter.maxPrice != null && !isNaN(priceFilter.maxPrice)) maxChaos = priceFilter.maxPrice * unitRate;
+    }
+  }
+
+  const byName = new Map(); // name -> raw poe.ninja rows for that name (kept whole, not pre-collapsed)
+  for (const data of results) {
+    for (const line of (data.lines || [])) {
+      if (!line.name) continue;
+      const chaos = line.chaosValue ?? line.chaosEquivalent;
+      if (chaos == null) continue;
+      if (!byName.has(line.name)) byName.set(line.name, []);
+      byName.get(line.name).push(line);
+    }
+  }
+
+  let all = [];
+  for (const [name, rows] of byName) {
+    const chaosOf = (l) => l.chaosValue ?? l.chaosEquivalent;
+    const floorChaos = Math.min(...rows.map(chaosOf));
+    const listingCount = rows.reduce((s, l) => s + (l.listingCount ?? l.count ?? 0), 0);
+    const icon = (rows.find((l) => l.icon) || {}).icon || null;
+    const variants = rows.length > 1
+      ? rows.map((row) => ({ label: row.variant || null, chaos: chaosOf(row), discriminator: findDiscriminator(row, rows) }))
+      : null;
+    all.push({ name, chaos: floorChaos, listingCount, icon, variants });
+  }
+
+  if (minChaos != null) all = all.filter((it) => it.chaos >= minChaos);
+  if (maxChaos != null) all = all.filter((it) => it.chaos <= maxChaos);
+
+  const byMostSold = [...all].sort((a, b) => b.listingCount - a.listingCount).slice(0, 50);
+  const byMostExpensive = [...all].sort((a, b) => b.chaos - a.chaos).slice(0, 50);
+
+  const watchlistMap = new Map();
+  for (const it of [...byMostSold, ...byMostExpensive]) {
+    watchlistMap.set(it.name, { chaos: it.chaos, icon: it.icon, variants: it.variants });
+  }
+  const watchlist = Array.from(watchlistMap.entries())
+    .map(([name, v]) => ({ name, chaos: v.chaos, icon: v.icon, variants: v.variants }));
 
   return { watchlist, divineRate, exaltedRate };
 }
