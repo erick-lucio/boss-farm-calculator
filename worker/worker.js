@@ -483,6 +483,23 @@ async function fetchTopUniqueWatchlist(league, priceFilter) {
   return { watchlist, divineRate, exaltedRate };
 }
 
+// SnipeSession is intentionally a SINGLETON: pathofexile.com/trade's rate
+// limit is keyed by the shared Cloudflare Workers egress IP, not by whatever
+// "session" string a browser holds — so multiple independently-routed
+// rotations (e.g. a page reload that starts a new watch without stopping the
+// old one, or several tabs) would each poll the trade API on their own
+// schedule, blind to each other, and collectively blow past the real shared
+// limit even though each one paces itself conservatively in isolation. That
+// was a real, reproduced bug: routing every /snipe/start to a fresh
+// crypto.randomUUID()-derived DO id meant handleStart's own
+// "session already running" 409 guard could never fire (the DO it checked
+// was always brand new), so unlimited concurrent rotations could pile up and
+// perpetually re-trigger each other's bans. Fixed by always routing to one
+// fixed id, so that guard is finally live and only one rotation ever runs —
+// correct for this feature anyway, since /snipe is a hidden admin-only page
+// (see CLAUDE.md's admin-detection section), not a multi-tenant one.
+const SNIPE_SESSION_NAME = "singleton";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -493,21 +510,16 @@ export default {
       let payload;
       try { payload = await request.json(); } catch (e) { return withCors(JSON.stringify({ ok: false, error: "bad JSON" }), 400); }
 
+      const id = env.SNIPE_SESSION.idFromName(SNIPE_SESSION_NAME);
+      const stub = env.SNIPE_SESSION.get(id);
       if (url.pathname === "/snipe/start") {
-        const token = crypto.randomUUID();
-        const id = env.SNIPE_SESSION.idFromName(token);
-        const stub = env.SNIPE_SESSION.get(id);
         const doResp = await stub.fetch("https://do/start", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
         });
         const data = await doResp.json();
         if (!data.ok) return withCors(JSON.stringify(data), doResp.status);
-        return withCors(JSON.stringify({ ok: true, session: token, watchlistSize: data.watchlistSize }), 200);
+        return withCors(JSON.stringify({ ok: true, session: SNIPE_SESSION_NAME, watchlistSize: data.watchlistSize }), 200);
       } else {
-        const token = payload.session;
-        if (!token) return withCors(JSON.stringify({ ok: false, error: "missing session" }), 400);
-        const id = env.SNIPE_SESSION.idFromName(token);
-        const stub = env.SNIPE_SESSION.get(id);
         const doResp = await stub.fetch("https://do/stop", { method: "POST" });
         return withCors(await doResp.text(), doResp.status, "application/json");
       }
@@ -516,9 +528,7 @@ export default {
     if (url.pathname === "/snipe/poll") {
       if (request.method === "OPTIONS") return withCors(null, 204);
       if (request.method !== "GET") return withCors(JSON.stringify({ ok: false, error: "method not allowed" }), 405);
-      const token = url.searchParams.get("session");
-      if (!token) return withCors(JSON.stringify({ ok: false, error: "missing session" }), 400);
-      const id = env.SNIPE_SESSION.idFromName(token);
+      const id = env.SNIPE_SESSION.idFromName(SNIPE_SESSION_NAME);
       const stub = env.SNIPE_SESSION.get(id);
       const doResp = await stub.fetch("https://do/poll");
       return withCors(await doResp.text(), doResp.status, "application/json");
