@@ -216,7 +216,16 @@ export class SnipeSession {
   }
 
   async handleStart(request) {
-    if (this.watchlist.length) {
+    // A "running" session only really blocks a new start if someone is
+    // actually still polling it (the frontend polls every 3s while a tab is
+    // open — see SNIPE_JS's POLL_MS) — this was a real, reported bug: a
+    // closed tab that never called /snipe/stop left the singleton "running"
+    // for the full 10-minute idle-abandon window (see alarm()), locking out
+    // every other attempt to start with a 409 the whole time. 20s (~6x the
+    // normal poll interval, a generous margin for a slow network/backgrounded
+    // tab) is long enough to still reject a genuinely-concurrent second tab,
+    // short enough that closing a tab doesn't lock the page for minutes.
+    if (this.watchlist.length && Date.now() - this.lastPolledAt < 20000) {
       return new Response(JSON.stringify({ ok: false, error: "session already running" }), { status: 409 });
     }
     let body;

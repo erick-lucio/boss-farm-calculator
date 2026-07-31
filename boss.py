@@ -2699,7 +2699,10 @@ async function pollLoop(){
     // nothing left to clean it up afterward (this was the exact bug behind
     // the indicator getting stuck visible/green after Stop).
     if(session !== snipeSession) return;
-    if(!data.ok){ stopSniper(); setStatus('snipe_status_stopped', 'err'); return; }
+    if(!data.ok){
+      console.error('[Trade Sniper] /snipe/poll returned ok:false — stopping.', {httpStatus: r.status, data});
+      stopSniper(); setStatus('snipe_status_stopped', 'err'); return;
+    }
     if(data.checks && data.checks.length) for(const chk of data.checks) logCheck(chk);
     setCurrent(data.checking);
     if(data.listings && data.listings.length){
@@ -2721,8 +2724,17 @@ async function pollLoop(){
       rateLimitWarned = false;
       setProgress(data.progress);
     }
-    if(!data.running){ stopSniper(); setStatus('snipe_status_stopped'); return; }
-  }catch(e){ /* transient network hiccup — next poll retries */ }
+    if(!data.running){
+      console.warn('[Trade Sniper] /snipe/poll reports running:false — session ended server-side (stopped, or the 10-min idle timeout hit). Stopping locally.', data);
+      stopSniper(); setStatus('snipe_status_stopped'); return;
+    }
+  }catch(e){
+    // Real diagnostic instead of silently swallowing this — a fetch that
+    // throws here (network error, timeout, non-JSON response) previously
+    // left no trace anywhere, which was exactly why "why did it just stop
+    // working" was impossible to diagnose from the console.
+    console.error('[Trade Sniper] /snipe/poll request failed — will retry next tick.', e);
+  }
   if(session === snipeSession) pollTimer = setTimeout(pollLoop, POLL_MS);
 }
 
@@ -2758,6 +2770,7 @@ document.getElementById('snipeStart').addEventListener('click', async () => {
     });
     const data = await r.json();
     if(!data.ok){
+      console.error('[Trade Sniper] /snipe/start failed.', {httpStatus: r.status, data});
       document.getElementById('snipeStatus').textContent = t('snipe_err_generic') + (data.error || ('HTTP '+r.status));
       document.getElementById('snipeStatus').className = 'snipe-status err';
       document.getElementById('snipeStart').disabled = false;
@@ -2776,6 +2789,7 @@ document.getElementById('snipeStart').addEventListener('click', async () => {
     console.log('[Trade Sniper] every ~3s the rotation checks the next watchlist item live on pathofexile.com/trade (one search + one fetch call) and compares its cheapest currently-listed price against the poe.ninja reference price for that item — the per-tier price when the listing\'s mods could be matched to a known variant (e.g. Mageblood\'s flask count), otherwise the floor price across all tiers. A full lap through the watchlist takes ~5 minutes. Every check — hit or not — is logged here.');
     pollLoop();
   }catch(e){
+    console.error('[Trade Sniper] /snipe/start request threw.', e);
     document.getElementById('snipeStatus').textContent = t('snipe_err_generic') + e;
     document.getElementById('snipeStatus').className = 'snipe-status err';
     document.getElementById('snipeStart').disabled = false;
