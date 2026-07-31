@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 import concurrent.futures
+import html as html_module  # aliased — this file uses `html` as a local var name everywhere
 import json
 import os
 import re
@@ -486,6 +487,118 @@ def _get_watch_unidentified(league):
     return result
 
 
+# Both games' patch notes live on the same classic server-rendered
+# pathofexile.com forum software (confirmed live) — pathofexile2.com itself is
+# a client-rendered SPA (just a <div id="app"> plus a JS bundle import) with no
+# scrapeable HTML, a dead end ruled out before picking these URLs. PoE2's forum
+# is a sub-forum ("Early Access Patch Notes") of the SAME pathofexile.com
+# domain, id 2212 — found via the forum index page, not guessed.
+PATCH_NOTES_URLS = {
+    "poe1": "https://www.pathofexile.com/forum/view-forum/patch-notes",
+    "poe2": "https://www.pathofexile.com/forum/view-forum/2212",
+}
+# The forum's WAF treats requests without a real browser User-Agent
+# differently than the plain JSON APIs do — confirmed live, a generic/blank UA
+# risked a different (bot-challenge) response, so this uses a real Chrome UA
+# string rather than boss.py's own UA constant.
+_FORUM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+_PATCH_TITLE_RE = re.compile(r'<div class="title">\s*<a href="(/forum/view-thread/\d+)">\s*([^<]+?)\s*</a>', re.DOTALL)
+_PATCH_DATE_RE = re.compile(r'class="post_date">([^<]*)</span>')
+# The OP's own post body starts right after this marker on a thread page
+# (confirmed live) — every reply after it also has its own "content" div, but
+# this is the only one preceded by "contentStart", which only the first post
+# in the whole thread has.
+_PATCH_BODY_RE = re.compile(r'<div class="contentStart"></div>\s*<div class="content">(.*?)(?:<div class="signature"|</td>)', re.DOTALL)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_SNIPPET_LEN = 400
+
+
+def _snippet_from_thread(thread_url):
+    """Plain-text excerpt of a patch note thread's own first post — a real
+    (truncated) excerpt of the actual patch text, not a generated summary
+    (this project has no LLM to summarize with). Best-effort: any failure
+    here just means that one item's popup has no snippet, never blocks the
+    rest of the listing.
+    """
+    try:
+        req = urllib.request.Request(thread_url, headers={"User-Agent": _FORUM_UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read().decode("utf-8", errors="replace")
+        m = _PATCH_BODY_RE.search(html)
+        if not m:
+            return ""
+        # The real post body can be 10,000+ chars (long bulleted category
+        # lists) — only look at a generous prefix, since we're truncating to
+        # _SNIPPET_LEN anyway; avoids stripping tags across the whole thing.
+        raw = m.group(1)[:_SNIPPET_LEN * 4]
+        text = _HTML_TAG_RE.sub(" ", raw)
+        text = html_module.unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > _SNIPPET_LEN:
+            text = text[:_SNIPPET_LEN].rsplit(" ", 1)[0] + "…"
+        return text
+    except Exception as e:
+        print(f"  [warning] patch note snippet ({thread_url}): {e}")
+        return ""
+
+
+def _get_patch_notes(game):
+    """Live patch-note listing for `game` ("poe1"/"poe2"), newest first, top 8,
+    each with a real (truncated) excerpt of its own thread body for the
+    hover-popup preview.
+
+    Filtered to titles starting with a digit — patch titles are consistently
+    version-numbered (e.g. "3.29.1 Maintenance", "0.5.4e Maintenance",
+    confirmed on both real listings) — to skip pinned non-patch threads like
+    "Code of Conduct" that the forum always shows first. The listing's own
+    row order is already newest-first (the forum's default sort), so no
+    separate date-based sort is needed; the parsed date is display-only.
+    """
+    now = time.time()
+    key = ("patchnotes", game)
+    with _lock:
+        c = _cache.get(key)
+        if c and now - c[0] < CACHE_TTL:
+            return c[1]
+    result = []
+    try:
+        url = PATCH_NOTES_URLS[game]
+        req = urllib.request.Request(url, headers={"User-Agent": _FORUM_UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read().decode("utf-8", errors="replace")
+        for m in _PATCH_TITLE_RE.finditer(html):
+            thread_path, title = m.group(1), m.group(2).strip()
+            if not title or not title[0].isdigit():
+                continue
+            # A wide window — the "postBy" block (which holds post_date) can sit
+            # far past the title on a heavily-paginated thread (each page-number
+            # link adds ~60 chars; an 8-page thread pushed it past 600 chars in
+            # testing, so 3000 is a safe margin).
+            window = html[m.end():m.end() + 3000]
+            date_m = _PATCH_DATE_RE.search(window)
+            date_text = date_m.group(1).strip().lstrip(",").strip() if date_m else ""
+            result.append({
+                "title": title,
+                "url": "https://www.pathofexile.com" + thread_path,
+                "date": date_text,
+            })
+            if len(result) >= 8:
+                break
+        # One extra request per item to fetch its own thread page for a real
+        # snippet — fired concurrently (matches build_index()'s own pattern
+        # for the same reason: 8 sequential ~1-2s forum fetches would make
+        # the whole page wait 8-16s for no benefit).
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            snippets = list(ex.map(_snippet_from_thread, [it["url"] for it in result]))
+        for it, snippet in zip(result, snippets):
+            it["snippet"] = snippet
+    except Exception as e:
+        print(f"  [warning] patch notes ({game}): {e}")
+    with _lock:
+        _cache[key] = (now, result)
+    return result
+
+
 def build_index(league):
     """(name, type) -> {chaos, chaos_max, chaos_n, chaos_alt, divine, icon,
     detailsId, type, chaos_unided}.
@@ -782,29 +895,61 @@ def build_payload(league):
 # speculative).
 
 PAGES = [
-    {"slug": "bosses", "icon": "&#128128;", "menu_key": "menu_bosses", "label_en": "Boss Farm"},
-    # Trade Sniper ("snipe") intentionally not listed here — hidden from the site menu for
-    # now (not ready to publish/advertise), but the /snipe route itself still renders and
-    # works once deployed; only the nav link is suppressed. Re-add the entry when it's ready
-    # to be public.
+    # "game" is None for game-neutral pages (rendered as plain top-level links, always
+    # above both game groups) or "poe1"/"poe2" for game-specific ones — those render
+    # inside a dedicated <div class="sitemenu-group" data-game="..."> container (see
+    # render_sitemenu() below), and it's the two CONTAINERS that get reordered by
+    # reorderSiteMenuByGame() (in SHARED_JS_CHROME) based on the visitor's stored
+    # bossFarmGame preference — not the individual links inside them. A group with no
+    # links (e.g. "poe2" for a non-admin visitor, before enableAdminUI() ever injects
+    # anything into it) hides itself entirely via CSS (:has() — see SHARED_CSS).
+    {"slug": "home", "icon": "&#129517;", "menu_key": "menu_home", "label_en": "Home", "game": None},
+    {"slug": "bosses", "icon": "&#128128;", "menu_key": "menu_bosses", "label_en": "Boss Farm", "game": "poe1"},
+    # Admin-only pages (Trade Sniper, PoE2 Campaign) intentionally not listed here —
+    # hidden from the site menu for everyone else, injected client-side (into the
+    # matching game's <div class="sitemenu-group">) by enableAdminUI() only once the
+    # admin handshake confirms. Their /slug routes still render and work for anyone
+    # with the direct URL; only the nav link is suppressed.
 ]
+
+GAME_GROUP_LABELS = {"poe1": "Path of Exile 1", "poe2": "Path of Exile 2"}
+
+
+def _sitemenu_link(pg, current_slug):
+    cls = "sitemenu-link active" if pg["slug"] == current_slug else "sitemenu-link"
+    aria = ' aria-current="page"' if pg["slug"] == current_slug else ""
+    return (f'  <a class="{cls}" href="/{pg["slug"]}"{aria}>{pg["icon"]} '
+            f'<span data-i18n="{pg["menu_key"]}">{pg["label_en"]}</span></a>')
 
 
 def render_sitemenu(current_slug):
-    items = []
-    for pg in PAGES:
-        cls = "sitemenu-link active" if pg["slug"] == current_slug else "sitemenu-link"
-        aria = ' aria-current="page"' if pg["slug"] == current_slug else ""
-        items.append(f'  <a class="{cls}" href="/{pg["slug"]}"{aria}>{pg["icon"]} '
-                     f'<span data-i18n="{pg["menu_key"]}">{pg["label_en"]}</span></a>')
+    neutral = [_sitemenu_link(pg, current_slug) for pg in PAGES if not pg["game"]]
+    groups = []
+    for game, label in GAME_GROUP_LABELS.items():
+        links = [_sitemenu_link(pg, current_slug) for pg in PAGES if pg["game"] == game]
+        groups.append(f'  <div class="sitemenu-group" data-game="{game}">\n'
+                       f'    <div class="sitemenu-group-label">{label}</div>\n'
+                       + "\n".join(links) + ("\n" if links else "") +
+                       '  </div>')
     return ('<div class="siteoverlay" id="siteoverlay" hidden></div>\n'
             '<nav class="sitemenu" id="sitemenu" aria-label="site menu">\n'
             '  <div class="sitemenu-head">\n'
             '    <span class="sitemenu-title" data-i18n="menu_title">Menu</span>\n'
             '    <button class="sitemenu-close" id="sitemenu-close" aria-label="close menu">&#10005;</button>\n'
             '  </div>\n'
-            + "\n".join(items) + "\n"
+            + "\n".join(neutral) + "\n"
+            + "\n".join(groups) + "\n"
             "</nav>\n")
+
+
+def _favicon_data_uri(emoji):
+    """Builds an inline SVG favicon from a raw emoji character — each page
+    substitutes its own via __FAVICON_URL__ so the browser tab icon matches
+    that page's own brand icon (__BRAND_ICON__) instead of one hardcoded
+    icon (a skull) for every page site-wide, which is what this used to be
+    before the multi-page split."""
+    svg = f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>{emoji}</text></svg>"
+    return "data:image/svg+xml," + urllib.parse.quote(svg)
 
 
 SHARED_HEAD_TEMPLATE = r"""<!doctype html>
@@ -824,7 +969,7 @@ SHARED_HEAD_TEMPLATE = r"""<!doctype html>
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="__PAGE_SOCIAL_TITLE__">
 <meta name="twitter:description" content="__PAGE_SOCIAL_DESCRIPTION__">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%92%80%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="__FAVICON_URL__">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Spectral:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7517572231491496"
@@ -849,12 +994,22 @@ SHARED_CSS = r"""<style>
   --neg:#b5462a; --warn:#8a5a12; --body-weight:600;
 }
 *{box-sizing:border-box}
+/* Any element toggled via the plain `hidden` attribute/property must stay
+   hidden regardless of its own class's `display` value — an author rule like
+   `.foo{display:flex}` normally beats the UA stylesheet's `[hidden]{display:
+   none}` outright (author rules always win over UA rules at equal
+   importance, independent of specificity), which silently broke
+   .page-card[hidden] (admin-only home cards showing for everyone),
+   .snipe-current[hidden], and .snipe-row[hidden] — real bugs, not just this
+   one. One global !important rule here fixes the whole class of bug instead
+   of patching each conflicting class individually. */
+[hidden]{display:none!important}
 html,body{margin:0}
 html{scroll-behavior:smooth}
 body{
   background:radial-gradient(1200px 600px at 50% -10%, var(--bg-glow) 0%, transparent 60%), var(--bg);
   color:var(--ink); font-family:"Spectral",Georgia,serif; font-size:15px; font-weight:var(--body-weight);
-  line-height:1.4; padding:0 0 64px;
+  line-height:1.4; display:flex; flex-direction:column; min-height:100vh;
 }
 a{color:inherit; text-decoration:none}
 .wrap{max-width:1240px; margin:0 auto; padding:0 20px}
@@ -1060,7 +1215,7 @@ button.sync:disabled{opacity:.5; cursor:default}
 .note{color:var(--ink-dim); font-size:12.5px; padding:18px 0; line-height:1.6}
 .err{color:var(--neg); padding:16px 0}
 
-footer{border-top:1px solid var(--line); margin-top:24px;
+footer{border-top:1px solid var(--line); margin-top:auto; padding-top:24px;
   background:linear-gradient(0deg,var(--panel),var(--bg))}
 .foot{max-width:1240px; margin:0 auto; padding:16px 20px; display:flex;
   justify-content:space-between; align-items:center; gap:20px; flex-wrap:wrap;
@@ -1091,6 +1246,10 @@ footer{border-top:1px solid var(--line); margin-top:24px;
   color:var(--ink-dim); font-size:13px}
 .sitemenu-link:hover{background:var(--overlay); color:var(--ink)}
 .sitemenu-link.active{color:var(--gold-bright); background:var(--overlay-soft); font-weight:600}
+.sitemenu-group{margin-top:14px; padding-top:10px; border-top:1px solid var(--line)}
+.sitemenu-group:not(:has(.sitemenu-link)){display:none}
+.sitemenu-group-label{font-family:"Cinzel",serif; font-weight:700; font-size:10.5px; letter-spacing:.1em;
+  text-transform:uppercase; color:var(--ink-dim); padding:0 10px 6px}
 @media (prefers-reduced-motion:reduce){*{animation:none!important} .sitemenu{transition:none}}
 
 .meta-left[hidden]{display:none}
@@ -1142,23 +1301,69 @@ button.sync:disabled, button.stop:disabled{opacity:.4; cursor:default}
 .snipe-current .lbl{font-family:ui-monospace,monospace; font-size:11px; color:var(--ink-dim);
   text-transform:uppercase; letter-spacing:.05em}
 
-.snipe-log{display:flex; flex-direction:column; gap:6px; margin-top:10px;
-  max-height:340px; overflow-y:auto}
-.snipe-log-row{display:flex; flex-direction:column; gap:3px; background:var(--panel);
-  border:1px solid var(--line); border-radius:3px; padding:7px 12px; font-size:12px}
-.snipe-log-row .row-main{display:flex; align-items:center; gap:10px}
-.snipe-log-row img{width:24px; height:24px; object-fit:contain; flex:0 0 auto}
-.snipe-log-row .nm{flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-  font-family:"Spectral",Georgia,serif}
-.snipe-log-row .dbg{font-family:ui-monospace,monospace; font-size:10px; color:var(--ink-dim);
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:.7; padding-left:34px}
-.snipe-log-row .prices{font-family:ui-monospace,monospace; font-size:11px; color:var(--ink-dim);
-  white-space:nowrap}
-.snipe-log-row .prices b{color:var(--ink); font-weight:600}
-.snipe-log-row .prices .variants{opacity:.65}
-.snipe-log-row.hit{border-color:var(--ok)}
-.snipe-log-row.hit .prices b{color:var(--ok)}
-.snipe-log-row .prices .none{opacity:.6}
+.slabel-row{display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap}
+.log-toggle{font-family:ui-monospace,monospace; font-size:11px; color:var(--ink-dim); cursor:pointer;
+  border:1px solid var(--line); border-radius:2px; padding:3px 8px; background:none}
+.log-toggle:hover{color:var(--ink); border-color:var(--uber)}
+.snipe-log{display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:10px;
+  margin-top:10px; max-height:480px; overflow-y:auto}
+.snipe-log.collapsed{display:none}
+.snipe-log-card{display:flex; flex-direction:column; gap:7px; background:var(--panel);
+  border:1px solid var(--line); border-radius:4px; padding:10px 12px; font-size:12px}
+.snipe-log-card .card-head{display:flex; align-items:center; gap:8px}
+.snipe-log-card img{width:28px; height:28px; object-fit:contain; flex:0 0 auto}
+.snipe-log-card .nm{flex:1; min-width:0; font-family:"Spectral",Georgia,serif; font-size:12.5px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.snipe-log-card .idbadge{font-family:ui-monospace,monospace; font-size:9.5px; text-transform:uppercase;
+  letter-spacing:.04em; padding:2px 5px; border-radius:2px; border:1px solid var(--line);
+  color:var(--ink-dim); white-space:nowrap}
+.snipe-log-card .idbadge.unid{color:var(--ok); border-color:var(--ok)}
+.snipe-log-card .price-grid{display:grid; grid-template-columns:auto 1fr; gap:3px 8px;
+  font-family:ui-monospace,monospace; font-size:11px}
+.snipe-log-card .price-grid .lbl{color:var(--ink-dim)}
+.snipe-log-card .price-grid .val{color:var(--ink); text-align:right; white-space:nowrap}
+.snipe-log-card .price-grid .val.found{color:var(--ok); font-weight:600}
+.snipe-log-card .price-grid .val.none{opacity:.6; font-weight:400; color:var(--ink-dim)}
+.snipe-log-card .variants{opacity:.65; font-size:10px}
+.snipe-log-card .dbg{font-family:ui-monospace,monospace; font-size:10px; color:var(--ink-dim); opacity:.7}
+.snipe-log-card.hit{border-color:var(--ok)}
+
+.game-toggle{display:flex; gap:10px; margin-top:14px; flex-wrap:wrap}
+.game-toggle-btn{flex:1; min-width:200px; display:flex; align-items:center; gap:10px;
+  font-family:"Cinzel",serif; font-weight:700; font-size:13px; letter-spacing:.06em;
+  color:var(--ink-dim); background:var(--panel); border:1px solid var(--line);
+  border-radius:3px; padding:14px 18px; cursor:pointer}
+.game-toggle-btn .gt-icon{width:22px; height:22px; object-fit:contain; flex:0 0 auto}
+.game-panel h2 .panel-icon{width:18px; height:18px; object-fit:contain; vertical-align:middle}
+.game-toggle-btn:hover{color:var(--ink); border-color:var(--uber)}
+.game-toggle-btn.active{color:var(--bg); background:var(--gold); border-color:var(--gold)}
+.game-panels{display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-top:18px}
+.game-panels:has(.game-panel[hidden]){grid-template-columns:1fr}
+@media (max-width:800px){.game-panels{grid-template-columns:1fr}}
+.game-panel{background:linear-gradient(180deg,var(--panel),var(--panel2));
+  border:1px solid var(--line); border-radius:3px; padding:16px 18px}
+.game-panel h2{margin:0 0 8px; font-family:"Cinzel",serif; font-weight:700; font-size:15px;
+  letter-spacing:.04em; display:flex; align-items:center; gap:8px}
+.page-cards{display:flex; flex-direction:column; gap:10px; margin-top:14px}
+.page-card{position:relative; display:block; background:var(--panel); border:1px solid var(--line);
+  border-radius:3px; padding:12px 14px; color:var(--ink)}
+.page-card:hover{border-color:var(--uber); background:var(--overlay)}
+.page-card-head{display:flex; align-items:center; gap:8px; font-family:"Cinzel",serif; font-weight:700;
+  font-size:13px; letter-spacing:.03em}
+.page-card .pc-icon{font-size:16px}
+.page-card-desc{margin-top:6px; font-size:12px; color:var(--ink-dim); line-height:1.5}
+.page-card-badge{position:absolute; top:10px; right:12px; font-family:ui-monospace,monospace; font-size:9px;
+  text-transform:uppercase; letter-spacing:.06em; color:var(--warn); border:1px solid var(--warn);
+  border-radius:2px; padding:2px 6px}
+.patchnotes{margin-top:14px}
+.patchnotes-list{display:flex; flex-direction:column; gap:6px; margin-top:8px}
+.patch-item{display:flex; align-items:baseline; gap:10px; font-size:12.5px;
+  border-bottom:1px solid var(--line); padding-bottom:6px}
+.patch-item:last-child{border-bottom:0}
+.patch-item .patch-date{font-family:ui-monospace,monospace; font-size:10.5px;
+  color:var(--ink-dim); white-space:nowrap}
+.patch-item a{color:var(--ink); text-decoration:none; flex:1; min-width:0}
+.patch-item a:hover{color:var(--gold-bright); text-decoration:underline}
 </style>"""
 
 SHARED_HEADER_HTML = r"""<header>
@@ -1273,6 +1478,32 @@ document.getElementById('sitemenu-close').addEventListener('click', closeMenu);
 document.getElementById('siteoverlay').addEventListener('click', closeMenu);
 document.addEventListener('keydown', e => { if(e.key === 'Escape') closeMenu(); });
 
+// Reorders the site menu's two game CONTAINERS (<div class="sitemenu-group"
+// data-game="poe1"/"poe2">, built by render_sitemenu() from PAGES' game key)
+// by the visitor's stored preference — what moves is the whole group (label
+// + all its links), not the individual links inside it; Home (game-neutral)
+// stays pinned above both regardless. Re-appending a node moves it to the
+// end without removing/re-adding it, so this works as an in-place reorder.
+// Unlike applyStaticI18n()/applyTheme(), this has no per-page I18N dependency
+// (it only reads localStorage and rearranges DOM nodes render_sitemenu()
+// already put there), so — deliberately breaking from this file's usual
+// "shared chrome only defines, each page calls" rule — it's safe to call
+// once here, directly, so no future page can forget to wire it in.
+// enableAdminUI() calls it again after injecting admin-only links into their
+// group, in case that changes which group has content first.
+function reorderSiteMenuByGame(){
+  const nav = document.getElementById('sitemenu');
+  if(!nav) return;
+  let preferred;
+  try { preferred = localStorage.getItem('bossFarmGame') || 'poe1'; } catch(e) { preferred = 'poe1'; }
+  const other = preferred === 'poe1' ? 'poe2' : 'poe1';
+  const mineGroup = nav.querySelector('.sitemenu-group[data-game="' + preferred + '"]');
+  const theirsGroup = nav.querySelector('.sitemenu-group[data-game="' + other + '"]');
+  if(mineGroup) nav.appendChild(mineGroup);
+  if(theirsGroup) nav.appendChild(theirsGroup);
+}
+reorderSiteMenuByGame();
+
 // Admin detection via the "PoE Helper Admin" Chrome extension (personal-use,
 // unpublished — see admin-extension/). This is NOT real authentication: it's
 // a client-side convenience flag with nothing sensitive behind it (this repo
@@ -1306,15 +1537,32 @@ function enableAdminUI(){
     meta.insertBefore(badge, meta.firstChild);
   }
   const menu = document.getElementById('sitemenu');
-  if(menu && !menu.querySelector('a[href="/snipe"]')){
+  const poe1Group = menu && menu.querySelector('.sitemenu-group[data-game="poe1"]');
+  const poe2Group = menu && menu.querySelector('.sitemenu-group[data-game="poe2"]');
+  if(poe1Group && !poe1Group.querySelector('a[href="/snipe"]')){
     const isCurrent = location.pathname.startsWith('/snipe');
     const a = document.createElement('a');
     a.className = 'sitemenu-link' + (isCurrent ? ' active' : '');
     a.href = '/snipe';
     if(isCurrent) a.setAttribute('aria-current', 'page');
     a.innerHTML = '&#127919; <span>' + t('menu_snipe') + '</span>';
-    menu.appendChild(a);
+    poe1Group.appendChild(a);
   }
+  if(poe2Group && !poe2Group.querySelector('a[href="/poe2-campaign"]')){
+    const isCurrent = location.pathname.startsWith('/poe2-campaign');
+    const a = document.createElement('a');
+    a.className = 'sitemenu-link' + (isCurrent ? ' active' : '');
+    a.href = '/poe2-campaign';
+    if(isCurrent) a.setAttribute('aria-current', 'page');
+    a.innerHTML = '&#9876;&#65039; <span>' + t('menu_poe2_campaign') + '</span>';
+    poe2Group.appendChild(a);
+  }
+  // Generic marker for any admin-gated content beyond the sitemenu links
+  // above (e.g. the /home page's Trade Sniper / PoE2 Campaign page-cards) —
+  // just add hidden data-admin-only to an element and it reveals itself here
+  // once admin status is confirmed, no per-page wiring needed.
+  document.querySelectorAll('[data-admin-only]').forEach(el => { el.hidden = false; });
+  reorderSiteMenuByGame();
 }
 let isAdmin = false;
 let adminGateTimer = null;
@@ -1337,7 +1585,7 @@ window.dispatchEvent(new CustomEvent('poe-helper-admin-request'));
 // normally answer near-instantly) before deciding "not admin" and sending
 // them home.
 if(typeof PAGE_REQUIRES_ADMIN !== 'undefined' && PAGE_REQUIRES_ADMIN){
-  adminGateTimer = setTimeout(() => { if(!isAdmin) location.replace('/bosses'); }, 600);
+  adminGateTimer = setTimeout(() => { if(!isAdmin) location.replace('/home'); }, 600);
 }
 """
 
@@ -1461,7 +1709,7 @@ function populateLeagueOptions(data){
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE · BOSS ECONOMY',
-  menu_title: 'Menu', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   btn_refresh: 'Refresh', btn_syncing: 'Syncing…',
   legend_currency: 'currency / fragment', legend_unique: 'unique',
@@ -1559,7 +1807,7 @@ en: {
 },
 pt: {
   tagline: 'PATH OF EXILE · ECONOMIA DE BOSS',
-  menu_title: 'Menu', menu_bosses: 'Farm de Bosses', menu_snipe: 'Caçador de Ofertas',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Bosses', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   btn_refresh: 'Atualizar', btn_syncing: 'Sincronizando…',
   legend_currency: 'moeda / fragmento', legend_unique: 'único',
@@ -2071,7 +2319,8 @@ def render_bosses_page():
             .replace("__PAGE_SOCIAL_TITLE__", 'Boss Farm Estimator — PoE Boss Farming Profit Calculator')
             .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss — real poe.ninja prices, honest worst/average/best profit ranges.')
             .replace("__PAGE_APP_NAME__", 'Boss Farm Estimator')
-            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss, using real poe.ninja prices.'))
+            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Live Path of Exile 1 farming profit calculator for every pinnacle, Uber, and Tier 17 Nightmare map boss, using real poe.ninja prices.')
+            .replace("__FAVICON_URL__", _favicon_data_uri("\U0001F480")))
     header = (SHARED_HEADER_HTML.replace("__EXTRA_CONTROLS__", BOSSES_EXTRA_CONTROLS)
               .replace("__BRAND_ICON__", "&#128128;").replace("__BRAND_TITLE__", "Boss Farm Estimator")
               .replace("__PRICECHIPS_ATTR__", "").replace("__DIVINE_CHIP_ATTR__", ""))
@@ -2089,7 +2338,9 @@ def render_bosses_page():
 # top 50 poe.ninja price, deduped — see worker.js's fetchTopUniqueWatchlist)
 # for trade-site listings priced below the poe.ninja floor, via a Cloudflare
 # Durable Object (worker/worker.js's SnipeSession) that rotates through the
-# list roughly once every 5 minutes (one search+fetch call every ~3s — see
+# list roughly once every 10 minutes (two search+fetch pairs every ~6s — a
+# general pass plus an unidentified-only pass, since an unidentified item's
+# price is a more solid reference before its random rolls are revealed — see
 # CLAUDE.md for the rate-limit reasoning behind rotation-polling instead of a
 # live-search WebSocket). No POESESSID needed — plain trade search+fetch work
 # fully unauthenticated. Unlike the Boss Farm page, this still needs a real
@@ -2172,7 +2423,10 @@ SNIPE_BODY = r"""
   </div>
 
   <div class="snipe-results">
-    <div class="slabel"><span data-i18n="snipe_log_label">Live check log — reference price vs. cheapest live listing</span></div>
+    <div class="slabel slabel-row">
+      <span data-i18n="snipe_log_label">Live check log — reference price vs. cheapest live listing</span>
+      <button type="button" class="log-toggle" id="snipeLogToggle">Hide</button>
+    </div>
     <div class="snipe-log" id="snipeLog"></div>
     <div class="empty" id="snipeLogEmpty" data-i18n="snipe_log_empty">No items checked yet — start watching above.</div>
   </div>
@@ -2203,12 +2457,12 @@ document.getElementById('leaguesel').addEventListener('change', e => {
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE · TRADE SNIPER',
-  menu_title: 'Menu', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Uses Path of Exile’s official, unauthenticated trade API to check a curated list of items on a rotation — nothing is stored server-side beyond an active session.',
   footer_made_by: 'Built by Erick Lúcio',
   footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
-  snipe_intro: 'Watches a curated list of Path of Exile Unique items — the top 50 by poe.ninja listing count ("most sold" proxy) plus the top 50 by poe.ninja price ("most expensive"), deduped — for trade-site listings priced below the current market floor. Rotates through the whole list roughly once every 5 minutes, one item at a time, to stay well within Path of Exile’s trade API rate limits. POESESSID is optional — see below.',
+  snipe_intro: 'Watches a curated list of Path of Exile Unique items — the top 50 by poe.ninja listing count ("most sold" proxy) plus the top 50 by poe.ninja price ("most expensive"), deduped — for trade-site listings priced below the current market floor. Checks both the general market and unidentified-only listings (a more solid price reference, since their random rolls aren\'t revealed yet). Rotates through the whole list roughly once every 10 minutes, one item at a time, to stay well within Path of Exile’s trade API rate limits. POESESSID is optional — see below.',
   snipe_scope_note: 'Uniques only — Currency, Fragments, Scarabs, and other stackable currency-type goods are intentionally left out (buy those from Faustus in-game instead, at a fixed Artifacts price). Also: every listing found here requires whispering the seller in-game to complete the trade — Path of Exile’s Instant Buyout / Asynchronous Trade system has no public API, so this can’t show or filter to instant-buyout-only listings.',
   snipe_threshold_label: 'Underpriced by at least',
   snipe_btn_start: 'Start watching',
@@ -2217,7 +2471,7 @@ en: {
   snipe_status_starting: 'starting…',
   snipe_status_running: 'watching…',
   snipe_status_stopped: 'stopped',
-  snipe_progress: 'checked {i} / {n} — full lap ≈5 min',
+  snipe_progress: 'checked {i} / {n} — full lap ≈10 min',
   snipe_status_ratelimited: 'rate limited by pathofexile.com/trade — paused, resuming in {mins}m {secs}s',
   snipe_results_label: 'Underpriced listings found',
   snipe_results_empty: 'Nothing yet — start watching above.',
@@ -2235,16 +2489,26 @@ en: {
   snipe_poesessid_label: 'POESESSID (optional)',
   snipe_poesessid_warn: 'Optional. This is your Path of Exile account’s session cookie — treat it like a password. It’s sent only to this Worker when you click Start, held in memory only for the life of this watch, never logged or written to storage, and cleared the moment you stop watching or the session times out. Leave it blank to use Trade Sniper fully anonymously (the default).',
   snipe_variant_unsure: '⚠ variant unconfirmed',
+  snipe_unidentified_tag: 'unidentified',
   snipe_log_variants: '{n} price tiers',
+  snipe_log_hide: 'Hide',
+  snipe_log_show: 'Show',
+  snipe_price_ninja: 'poe.ninja',
+  snipe_price_watch: 'poe.watch (unid.)',
+  snipe_price_trade: 'trade',
+  snipe_id_identified: 'identified',
+  snipe_id_unidentified: 'unidentified',
+  snipe_id_unknown: 'unknown',
+  snipe_price_notfound: 'not found',
 },
 pt: {
   tagline: 'PATH OF EXILE · CAÇADOR DE OFERTAS',
-  menu_title: 'Menu', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games. Usa a API oficial e não-autenticada de troca do Path of Exile para checar uma lista selecionada de itens em rodízio — nada é guardado no servidor além de uma sessão ativa.',
   footer_made_by: 'Feito por Erick Lúcio',
   footer_dm: 'Sugestão ou opinião? Manda um DM no LinkedIn',
-  snipe_intro: 'Monitora uma lista selecionada de itens Únicos do Path of Exile — os 50 mais listados no poe.ninja (indicador de "mais vendidos") mais os 50 de maior preço no poe.ninja ("mais caros"), sem repetição — em busca de anúncios com preço abaixo do valor de mercado atual. Passa pela lista inteira a cada ~5 minutos, um item de cada vez, para ficar bem dentro dos limites de requisição da API de troca do Path of Exile. POESESSID é opcional — veja abaixo.',
+  snipe_intro: 'Monitora uma lista selecionada de itens Únicos do Path of Exile — os 50 mais listados no poe.ninja (indicador de "mais vendidos") mais os 50 de maior preço no poe.ninja ("mais caros"), sem repetição — em busca de anúncios com preço abaixo do valor de mercado atual. Verifica tanto o mercado geral quanto anúncios não identificados (uma referência de preço mais sólida, já que as propriedades aleatórias ainda não foram reveladas). Passa pela lista inteira a cada ~10 minutos, um item de cada vez, para ficar bem dentro dos limites de requisição da API de troca do Path of Exile. POESESSID é opcional — veja abaixo.',
   snipe_scope_note: 'Apenas itens Únicos — Moedas, Fragmentos, Scarabs e outros itens empilháveis do tipo moeda ficam de fora de propósito (compre esses do Faustus dentro do jogo, por um preço fixo em Artefatos). Além disso: todo anúncio encontrado aqui exige sussurrar para o vendedor dentro do jogo para completar a troca — o sistema de Compra Instantânea / Troca Assíncrona do Path of Exile não tem API pública, então isso não consegue mostrar ou filtrar só os anúncios de compra instantânea.',
   snipe_threshold_label: 'Abaixo do preço em pelo menos',
   snipe_btn_start: 'Começar a monitorar',
@@ -2253,7 +2517,7 @@ pt: {
   snipe_status_starting: 'iniciando…',
   snipe_status_running: 'monitorando…',
   snipe_status_stopped: 'parado',
-  snipe_progress: 'checado {i} / {n} — volta completa ≈5 min',
+  snipe_progress: 'checado {i} / {n} — volta completa ≈10 min',
   snipe_status_ratelimited: 'limite de taxa do pathofexile.com/trade — pausado, retomando em {mins}m {secs}s',
   snipe_results_label: 'Ofertas abaixo do preço encontradas',
   snipe_results_empty: 'Nada ainda — comece a monitorar acima.',
@@ -2271,7 +2535,17 @@ pt: {
   snipe_poesessid_label: 'POESESSID (opcional)',
   snipe_poesessid_warn: 'Opcional. Este é o cookie de sessão da sua conta do Path of Exile — trate como uma senha. Ele é enviado só para este Worker quando você clica em Começar, fica em memória apenas durante essa monitoração, nunca é registrado em log nem gravado em armazenamento, e é apagado assim que você parar ou a sessão expirar. Deixe em branco para usar o Caçador de Ofertas de forma totalmente anônima (o padrão).',
   snipe_variant_unsure: '⚠ variante não confirmada',
+  snipe_unidentified_tag: 'não identificado',
   snipe_log_variants: '{n} faixas de preço',
+  snipe_log_hide: 'Ocultar',
+  snipe_log_show: 'Mostrar',
+  snipe_price_ninja: 'poe.ninja',
+  snipe_price_watch: 'poe.watch (não id.)',
+  snipe_price_trade: 'trade',
+  snipe_id_identified: 'identificado',
+  snipe_id_unidentified: 'não identificado',
+  snipe_id_unknown: 'desconhecido',
+  snipe_price_notfound: 'não encontrado',
 },
 };
 
@@ -2279,18 +2553,50 @@ let snipeSession = null;
 let pollTimer = null;
 let rateLimitWarned = false;
 
+// Tracked so a language switch can re-translate whatever's currently shown
+// (see refreshDynamicI18n) — these three are set purely from JS state, not
+// from data-i18n static markup, so applyStaticI18n() alone can't reach them.
+let lastStatusKey = 'snipe_status_idle', lastStatusCls = null;
+let lastProgressData = null;
+let lastRateLimitedUntil = null;
+
 function setStatus(key, cls){
+  lastStatusKey = key; lastStatusCls = cls;
   const el = document.getElementById('snipeStatus');
   el.textContent = t(key);
   el.className = 'snipe-status' + (cls ? ' ' + cls : '');
 }
 
 function setProgress(progress){
+  lastProgressData = progress; lastRateLimitedUntil = null;
   const row = document.getElementById('snipeProgressRow');
   if(!progress){ row.hidden = true; return; }
   row.hidden = false;
   document.getElementById('snipeProgress').textContent =
     t('snipe_progress').replace('{i}', progress.index + 1).replace('{n}', progress.total);
+}
+
+function setRateLimitedProgress(rateLimitedUntil){
+  lastRateLimitedUntil = rateLimitedUntil;
+  const remainMs = Math.max(0, rateLimitedUntil - Date.now());
+  const mins = Math.floor(remainMs / 60000);
+  const secs = Math.floor((remainMs % 60000) / 1000);
+  document.getElementById('snipeProgressRow').hidden = false;
+  document.getElementById('snipeProgress').textContent =
+    t('snipe_status_ratelimited').replace('{mins}', mins).replace('{secs}', secs);
+  setStatus('snipe_status_running', 'warn');
+}
+
+// Re-applies whatever dynamic (non data-i18n) text is currently on screen in
+// the new language — status line, progress/rate-limit line, log-toggle
+// label. Already-rendered log cards/hit rows keep their old-language text
+// (this is a live incremental log, not a snapshot re-rendered from stored
+// data, same limitation the Boss Farm page doesn't have since it re-renders
+// from `lastData` instead) — only what's still driven by live state redraws.
+function refreshDynamicI18n(){
+  if(lastRateLimitedUntil) setRateLimitedProgress(lastRateLimitedUntil);
+  else { setStatus(lastStatusKey, lastStatusCls); setProgress(lastProgressData); }
+  applyLogVisibility();
 }
 
 function renderHit(hit){
@@ -2301,7 +2607,8 @@ function renderHit(hit){
   const variantTxt = hit.variantLabel
     ? ` <span class="variant">(${escAttr(hit.variantLabel)})</span>`
     : (hit.variantUncertain ? ` <span class="variant unsure">${t('snipe_variant_unsure')}</span>` : '');
-  div.innerHTML = `${img}<span class="nm">${escAttr(hit.itemName)}${variantTxt}</span>
+  const unidTxt = hit.unidentified ? ` <span class="variant">${t('snipe_unidentified_tag')}</span>` : '';
+  div.innerHTML = `${img}<span class="nm">${escAttr(hit.itemName)}${variantTxt}${unidTxt}</span>
     <span class="px">${priceTxt}</span>
     <span class="ref">ref ~${Math.round(hit.referenceChaos)}c</span>
     <a class="tradelink" href="${escAttr(hit.tradeUrl)}" target="_blank" rel="noopener noreferrer">${t('snipe_view_trade')}</a>`;
@@ -2319,17 +2626,34 @@ function setCurrent(item){
 
 function renderLogRow(chk){
   const div = document.createElement('div');
-  div.className = 'snipe-log-row' + (chk.underpriced ? ' hit' : '');
+  div.className = 'snipe-log-card' + (chk.underpriced ? ' hit' : '');
   const img = chk.icon ? `<img src="${escAttr(chk.icon)}" alt="">` : '';
-  const refTxt = `${Math.round(chk.referenceChaos)}c` + (chk.variantCount
-    ? ` <span class="variants">(${t('snipe_log_variants').replace('{n}', chk.variantCount)})</span>` : '');
-  const actualTxt = chk.cheapestChaosEquiv != null
-    ? `${chk.cheapestAmount} ${escAttr(chk.cheapestCurrency)} (~${chk.cheapestChaosEquiv}c)`
+  const variantsTxt = chk.variantCount
+    ? ` <span class="variants">(${t('snipe_log_variants').replace('{n}', chk.variantCount)})</span>` : '';
+
+  const idLabel = chk.cheapestChaosEquiv == null ? null
+    : chk.cheapestIdentified === true ? t('snipe_id_identified')
+    : chk.cheapestIdentified === false ? t('snipe_id_unidentified')
+    : t('snipe_id_unknown');
+  const idBadge = idLabel
+    ? `<span class="idbadge${chk.cheapestIdentified === false ? ' unid' : ''}">${escAttr(idLabel)}</span>` : '';
+
+  const ninjaVal = `~${Math.round(chk.referenceChaos)}c`;
+  const watchVal = chk.referenceWatchChaos != null
+    ? `~${Math.round(chk.referenceWatchChaos)}c`
+    : `<span class="none">${t('snipe_price_notfound')}</span>`;
+  const tradeVal = chk.cheapestChaosEquiv != null
+    ? `<span class="found">${chk.cheapestAmount} ${escAttr(chk.cheapestCurrency)} (~${chk.cheapestChaosEquiv}c)</span>`
     : `<span class="none">${t('snipe_log_none_found')}</span>`;
+
   const dbg = (chk.cheapestChaosEquiv == null && chk.debug)
     ? `<div class="dbg">${escAttr(chk.debug)}</div>` : '';
-  div.innerHTML = `<div class="row-main">${img}<span class="nm">${escAttr(chk.name)}</span>
-    <span class="prices">ref ${refTxt} &rarr; <b>${actualTxt}</b></span></div>${dbg}`;
+  div.innerHTML = `<div class="card-head">${img}<span class="nm">${escAttr(chk.name)}${variantsTxt}</span>${idBadge}</div>
+    <div class="price-grid">
+      <span class="lbl">${t('snipe_price_ninja')}</span><span class="val">${ninjaVal}</span>
+      <span class="lbl">${t('snipe_price_watch')}</span><span class="val">${watchVal}</span>
+      <span class="lbl">${t('snipe_price_trade')}</span><span class="val">${tradeVal}</span>
+    </div>${dbg}`;
   return div;
 }
 
@@ -2362,9 +2686,19 @@ function logCheck(chk){
 
 async function pollLoop(){
   if(!snipeSession) return;
+  const session = snipeSession;
   try{
-    const r = await fetch('/snipe/poll?session=' + encodeURIComponent(snipeSession), {signal: AbortSignal.timeout(10000)});
+    const r = await fetch('/snipe/poll?session=' + encodeURIComponent(session), {signal: AbortSignal.timeout(10000)});
     const data = await r.json();
+    // The user may have clicked Stop (or Start again) while this request was
+    // in flight — snipeSession would then no longer match what we sent this
+    // poll for. Bail out before touching any DOM state: this response
+    // reflects a moment before the stop took effect (e.g. still `running:
+    // true` with a stale `checking` item), and applying it now would
+    // re-show "checking now" right after stopSniper() already hid it, with
+    // nothing left to clean it up afterward (this was the exact bug behind
+    // the indicator getting stuck visible/green after Stop).
+    if(session !== snipeSession) return;
     if(!data.ok){ stopSniper(); setStatus('snipe_status_stopped', 'err'); return; }
     if(data.checks && data.checks.length) for(const chk of data.checks) logCheck(chk);
     setCurrent(data.checking);
@@ -2377,15 +2711,10 @@ async function pollLoop(){
       }
     }
     if(data.rateLimitedUntil){
-      const remainMs = Math.max(0, data.rateLimitedUntil - Date.now());
-      const mins = Math.floor(remainMs / 60000);
-      const secs = Math.floor((remainMs % 60000) / 1000);
-      document.getElementById('snipeProgressRow').hidden = false;
-      document.getElementById('snipeProgress').textContent =
-        t('snipe_status_ratelimited').replace('{mins}', mins).replace('{secs}', secs);
-      setStatus('snipe_status_running', 'warn');
+      setRateLimitedProgress(data.rateLimitedUntil);
       if(!rateLimitWarned){
-        console.warn(`[Trade Sniper] pathofexile.com/trade rate-limited this session — pausing ALL requests until ${new Date(data.rateLimitedUntil).toLocaleTimeString()} (~${mins}m ${secs}s). The rotation resumes automatically once the cooldown clears.`);
+        const remainMs = Math.max(0, data.rateLimitedUntil - Date.now());
+        console.warn(`[Trade Sniper] pathofexile.com/trade rate-limited this session — pausing ALL requests until ${new Date(data.rateLimitedUntil).toLocaleTimeString()} (~${Math.floor(remainMs/60000)}m ${Math.floor((remainMs%60000)/1000)}s). The rotation resumes automatically once the cooldown clears.`);
         rateLimitWarned = true;
       }
     }else{
@@ -2394,7 +2723,7 @@ async function pollLoop(){
     }
     if(!data.running){ stopSniper(); setStatus('snipe_status_stopped'); return; }
   }catch(e){ /* transient network hiccup — next poll retries */ }
-  pollTimer = setTimeout(pollLoop, POLL_MS);
+  if(session === snipeSession) pollTimer = setTimeout(pollLoop, POLL_MS);
 }
 
 function stopSniper(){
@@ -2467,7 +2796,37 @@ document.getElementById('snipeStop').addEventListener('click', async () => {
   }catch(e) {}
 });
 
+let logHidden = (function(){
+  try { return localStorage.getItem('bossFarmSnipeLogHidden') === '1'; } catch(e) { return false; }
+})();
+function applyLogVisibility(){
+  document.getElementById('snipeLog').classList.toggle('collapsed', logHidden);
+  document.getElementById('snipeLogToggle').textContent = t(logHidden ? 'snipe_log_show' : 'snipe_log_hide');
+}
+document.getElementById('snipeLogToggle').addEventListener('click', () => {
+  logHidden = !logHidden;
+  try { localStorage.setItem('bossFarmSnipeLogHidden', logHidden ? '1' : '0'); } catch(e) {}
+  applyLogVisibility();
+});
+
+// SHARED_HEADER_HTML's #langsel markup is shared across pages, but (like
+// #leaguesel) each page has to wire its own change listener since each needs
+// to refresh its own dynamic content afterward — BOSSES_JS calls
+// render(lastData), this page calls refreshDynamicI18n() (see its own
+// comment for what that can and can't reach). Without this wiring at all,
+// the dropdown just changes its own selected option and nothing else
+// updates — which was exactly the reported bug on this page.
+const langSel = document.getElementById('langsel');
+langSel.value = lang;
+langSel.addEventListener('change', () => {
+  lang = langSel.value;
+  try { localStorage.setItem('bossFarmLang', lang); } catch(e) {}
+  applyStaticI18n();
+  refreshDynamicI18n();
+});
+
 applyStaticI18n();
+applyLogVisibility();
 setStatus('snipe_status_idle');
 """
 
@@ -2479,7 +2838,8 @@ def render_snipe_page():
             .replace("__PAGE_SOCIAL_TITLE__", 'Trade Sniper — PoE Underpriced Unique Watcher')
             .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Path of Exile trade-site watcher for underpriced Unique-item listings across a curated top-100 list, via the official unauthenticated trade API.')
             .replace("__PAGE_APP_NAME__", 'Trade Sniper')
-            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Watches a curated list of top Path of Exile Unique items for underpriced trade-site listings via the official trade API.'))
+            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Watches a curated list of top Path of Exile Unique items for underpriced trade-site listings via the official trade API.')
+            .replace("__FAVICON_URL__", _favicon_data_uri("\U0001F3AF")))
     header = (SHARED_HEADER_HTML.replace("__EXTRA_CONTROLS__", SNIPE_EXTRA_CONTROLS)
               .replace("__BRAND_ICON__", "&#127919;").replace("__BRAND_TITLE__", "Trade Sniper")
               .replace("__PRICECHIPS_ATTR__", "hidden").replace("__DIVINE_CHIP_ATTR__", "hidden"))
@@ -2487,6 +2847,367 @@ def render_snipe_page():
             + render_sitemenu("snipe") + header + SNIPE_BODY + SHARED_FOOTER_HTML
             + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n'
             + "<script>\nconst PAGE_REQUIRES_ADMIN = true;\n" + SHARED_JS_CHROME + SNIPE_JS
+            + '\n</script>\n</body>\n</html>')
+
+
+# --------------------------------------------------------------------------- #
+# Home page (/home) — the site's landing page, PoE1/PoE2 split
+# --------------------------------------------------------------------------- #
+# The big PoE1/PoE2 toggle both reorders the site menu (via reorderSiteMenuByGame(),
+# defined in SHARED_JS_CHROME) AND filters which game panel is shown below (only the
+# selected game's panel — the toggle buttons themselves stay visible for both, so you
+# can switch back). The toggle icons are the real official favicons GGG serves from
+# web.poecdn.com (confirmed live: stable since 2024, CORS-open, safe to hotlink — same
+# pattern this repo already uses for poe.ninja item icons, no local assets hosted).
+POE1_ICON_URL = "https://web.poecdn.com/protected/image/favicon/favicon.png?key=Iu4RwgXxfRpzGkEV729D7Q"
+POE2_ICON_URL = "https://web.poecdn.com/protected/image/favicon/poe2/favicon.png?key=rPkjGpdcBJcvx5P3el7BFg"
+
+HOME_EXTRA_CONTROLS = ""
+
+HOME_BODY = r"""
+
+<div class="wrap">
+  <div class="game-toggle" id="gameToggle" role="group" aria-label="game selector">
+    <button type="button" class="game-toggle-btn" data-game="poe1" id="gameBtnPoe1">
+      <img class="gt-icon" src="__POE1_ICON_URL__" alt="Path of Exile 1">
+      <span data-i18n="home_toggle_poe1">Path of Exile 1</span>
+    </button>
+    <button type="button" class="game-toggle-btn" data-game="poe2" id="gameBtnPoe2">
+      <img class="gt-icon" src="__POE2_ICON_URL__" alt="Path of Exile 2">
+      <span data-i18n="home_toggle_poe2">Path of Exile 2</span>
+    </button>
+  </div>
+  <div class="note" data-i18n="home_toggle_note">
+    Pick your game — this only reorders the menu on the left. Both games' info stays visible below either way.
+  </div>
+
+  <div class="game-panels">
+    <section class="game-panel" id="panelPoe1">
+      <h2><img class="panel-icon" src="__POE1_ICON_URL__" alt=""> <span data-i18n="home_panel_poe1_title">Path of Exile 1</span></h2>
+      <div class="note" data-i18n="home_poe1_blurb">
+        Path of Exile 1 is deep into its endgame content cycle — pinnacle bosses, Uber fights, and
+        Tier 17 Nightmare maps remain the most reliable currency sources late-league. Use the Boss
+        Farm Estimator to compare live profit-per-run across every encounter, based on real
+        poe.ninja prices.
+      </div>
+      <div class="page-cards">
+        <a class="page-card" href="/bosses">
+          <div class="page-card-head"><span class="pc-icon">&#128128;</span> <span data-i18n="home_card_bosses_title">Boss Farm Estimator</span></div>
+          <div class="page-card-desc" data-i18n="home_card_bosses_desc">
+            Compare live profit-per-run across every pinnacle, Uber, and Tier 17 Nightmare map
+            boss encounter, using real poe.ninja prices — worst/average/best instead of one
+            misleading number.
+          </div>
+        </a>
+        <a class="page-card" href="/snipe" hidden data-admin-only>
+          <div class="page-card-head"><span class="pc-icon">&#127919;</span> <span data-i18n="home_card_snipe_title">Trade Sniper</span></div>
+          <div class="page-card-desc" data-i18n="home_card_snipe_desc">
+            Watches a curated list of top Unique items for trade-site listings priced below the
+            current market floor, checked live against the official trade API.
+          </div>
+          <span class="page-card-badge" data-i18n="home_card_admin_badge">Admin only</span>
+        </a>
+      </div>
+      <div class="patchnotes" id="patchNotesPoe1">
+        <div class="slabel" data-i18n="home_patchnotes_label">Recent patch notes</div>
+        <div class="patchnotes-list" id="patchListPoe1"></div>
+        <div class="empty" id="patchEmptyPoe1" data-i18n="home_patchnotes_loading">Loading&hellip;</div>
+      </div>
+    </section>
+
+    <section class="game-panel" id="panelPoe2">
+      <h2><img class="panel-icon" src="__POE2_ICON_URL__" alt=""> <span data-i18n="home_panel_poe2_title">Path of Exile 2</span></h2>
+      <div class="note" data-i18n="home_poe2_blurb">
+        Path of Exile 2 is in Early Access, with new content and balance changes shipping
+        frequently. Farming tools for PoE2 are still on the roadmap here — check the patch notes
+        below to stay current in the meantime.
+      </div>
+      <div class="page-cards">
+        <a class="page-card" href="/poe2-campaign" hidden data-admin-only>
+          <div class="page-card-head"><span class="pc-icon">&#9876;&#65039;</span> <span data-i18n="home_card_poe2campaign_title">PoE2 Campaign</span></div>
+          <div class="page-card-desc" data-i18n="home_card_poe2campaign_desc">
+            Placeholder page for future Path of Exile 2 campaign notes — not built yet.
+          </div>
+          <span class="page-card-badge" data-i18n="home_card_admin_badge">Admin only</span>
+        </a>
+      </div>
+      <div class="patchnotes" id="patchNotesPoe2">
+        <div class="slabel" data-i18n="home_patchnotes_label">Recent patch notes</div>
+        <div class="patchnotes-list" id="patchListPoe2"></div>
+        <div class="empty" id="patchEmptyPoe2" data-i18n="home_patchnotes_loading">Loading&hellip;</div>
+      </div>
+    </section>
+  </div>
+</div>
+"""
+
+HOME_JS = r"""const LEAGUE = __LEAGUE_JSON__;
+const PATCH_NOTES_BASE = '/api/patchnotes';
+
+function populateLeagueOptions(){
+  const sel = document.getElementById('leaguesel');
+  if(sel.options.length) return;
+  let currentLeague;
+  try { currentLeague = localStorage.getItem('bossFarmLeague'); } catch(e) { currentLeague = null; }
+  const cur = currentLeague || LEAGUE;
+  const opts = [LEAGUE, 'Standard', 'Hardcore', 'Hardcore ' + LEAGUE];
+  const seen = new Set();
+  sel.innerHTML = opts.filter(o => o && !seen.has(o) && seen.add(o))
+    .map(o => `<option value="${o}" ${o===cur?'selected':''}>${o}</option>`).join('');
+  document.getElementById('league').textContent = cur;
+}
+populateLeagueOptions();
+document.getElementById('leaguesel').addEventListener('change', e => {
+  try { localStorage.setItem('bossFarmLeague', e.target.value); } catch(err) {}
+  document.getElementById('league').textContent = e.target.value;
+});
+
+const I18N = {
+en: {
+  tagline: 'PATH OF EXILE · HUB',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign',
+  chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
+  btn_refresh: 'Refresh', btn_syncing: 'syncing…',
+  footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games.',
+  footer_made_by: 'Built by Erick Lúcio',
+  footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
+  home_toggle_poe1: 'Path of Exile 1',
+  home_toggle_poe2: 'Path of Exile 2',
+  home_toggle_note: 'Pick your game — this only reorders the menu on the left. Both games\' info stays visible below either way.',
+  home_panel_poe1_title: 'Path of Exile 1',
+  home_panel_poe2_title: 'Path of Exile 2',
+  home_poe1_blurb: 'Path of Exile 1 is deep into its endgame content cycle — pinnacle bosses, Uber fights, and Tier 17 Nightmare maps remain the most reliable currency sources late-league. Use the Boss Farm Estimator to compare live profit-per-run across every encounter, based on real poe.ninja prices.',
+  home_poe2_blurb: 'Path of Exile 2 is in Early Access, with new content and balance changes shipping frequently. Farming tools for PoE2 are still on the roadmap here — check the patch notes below to stay current in the meantime.',
+  home_go_bosses: 'Open Boss Farm Estimator →',
+  home_card_bosses_title: 'Boss Farm Estimator',
+  home_card_bosses_desc: 'Compare live profit-per-run across every pinnacle, Uber, and Tier 17 Nightmare map boss encounter, using real poe.ninja prices — worst/average/best instead of one misleading number.',
+  home_card_snipe_title: 'Trade Sniper',
+  home_card_snipe_desc: 'Watches a curated list of top Unique items for trade-site listings priced below the current market floor, checked live against the official trade API.',
+  home_card_poe2campaign_title: 'PoE2 Campaign',
+  home_card_poe2campaign_desc: 'Placeholder page for future Path of Exile 2 campaign notes — not built yet.',
+  home_card_admin_badge: 'Admin only',
+  home_patchnotes_label: 'Recent patch notes',
+  home_patchnotes_loading: 'Loading…',
+  home_patchnotes_empty: 'No patch notes found.',
+  home_patchnotes_error: 'Could not load patch notes right now.',
+},
+pt: {
+  tagline: 'PATH OF EXILE · CENTRAL',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2',
+  chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
+  btn_refresh: 'Atualizar', btn_syncing: 'sincronizando…',
+  footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games.',
+  footer_made_by: 'Feito por Erick Lúcio',
+  footer_dm: 'Sugestão ou opinião? Manda um DM no LinkedIn',
+  home_toggle_poe1: 'Path of Exile 1',
+  home_toggle_poe2: 'Path of Exile 2',
+  home_toggle_note: 'Escolha seu jogo — isso só reordena o menu à esquerda. As informações dos dois jogos continuam visíveis abaixo de qualquer forma.',
+  home_panel_poe1_title: 'Path of Exile 1',
+  home_panel_poe2_title: 'Path of Exile 2',
+  home_poe1_blurb: 'Path of Exile 1 está no meio do seu ciclo de conteúdo de endgame — chefes pinnacle, lutas Uber e mapas Nightmare T17 continuam sendo as fontes de moeda mais confiáveis no fim de liga. Use o Boss Farm Estimator para comparar o lucro por run ao vivo entre todos os encontros, com preços reais do poe.ninja.',
+  home_poe2_blurb: 'Path of Exile 2 está em Acesso Antecipado, com conteúdo novo e mudanças de balanceamento saindo com frequência. Ferramentas de farm para PoE2 ainda estão no roadmap aqui — confira as notas de atualização abaixo para se manter atualizado enquanto isso.',
+  home_go_bosses: 'Abrir Boss Farm Estimator →',
+  home_card_bosses_title: 'Boss Farm Estimator',
+  home_card_bosses_desc: 'Compare o lucro por run ao vivo entre todos os encontros de chefes pinnacle, Uber e mapas Nightmare T17, com preços reais do poe.ninja — pior/médio/melhor em vez de um único número enganoso.',
+  home_card_snipe_title: 'Caçador de Ofertas',
+  home_card_snipe_desc: 'Monitora uma lista selecionada dos principais itens Únicos em busca de anúncios com preço abaixo do valor de mercado atual, checados ao vivo na API oficial de troca.',
+  home_card_poe2campaign_title: 'Campanha PoE2',
+  home_card_poe2campaign_desc: 'Página placeholder para futuras notas de campanha do Path of Exile 2 — ainda não construída.',
+  home_card_admin_badge: 'Somente admin',
+  home_patchnotes_label: 'Notas de atualização recentes',
+  home_patchnotes_loading: 'Carregando…',
+  home_patchnotes_empty: 'Nenhuma nota de atualização encontrada.',
+  home_patchnotes_error: 'Não foi possível carregar as notas de atualização agora.',
+},
+};
+
+let gamePref = (function(){
+  try { return localStorage.getItem('bossFarmGame') || 'poe1'; } catch(e) { return 'poe1'; }
+})();
+function applyGameToggleUI(){
+  document.getElementById('gameBtnPoe1').classList.toggle('active', gamePref === 'poe1');
+  document.getElementById('gameBtnPoe2').classList.toggle('active', gamePref === 'poe2');
+  document.getElementById('panelPoe1').hidden = gamePref !== 'poe1';
+  document.getElementById('panelPoe2').hidden = gamePref !== 'poe2';
+}
+applyGameToggleUI();
+document.getElementById('gameToggle').addEventListener('click', e => {
+  const btn = e.target.closest('.game-toggle-btn');
+  if(!btn) return;
+  gamePref = btn.dataset.game;
+  try { localStorage.setItem('bossFarmGame', gamePref); } catch(err) {}
+  applyGameToggleUI();
+  reorderSiteMenuByGame();
+});
+
+// Tracks which (if any) translated empty/error message is currently shown
+// per patch list, so a language switch can re-translate it without
+// re-fetching (the patch items themselves — title/date/url — aren't
+// translated content, only these two status messages are).
+const patchStatusKey = { patchEmptyPoe1: null, patchEmptyPoe2: null };
+
+function renderPatchList(listId, emptyId, items){
+  const list = document.getElementById(listId);
+  const empty = document.getElementById(emptyId);
+  if(!items || !items.length){
+    patchStatusKey[emptyId] = 'home_patchnotes_empty';
+    empty.textContent = t('home_patchnotes_empty');
+    empty.hidden = false;
+    list.innerHTML = '';
+    return;
+  }
+  patchStatusKey[emptyId] = null;
+  empty.hidden = true;
+  list.innerHTML = items.map(it => {
+    const infoAttr = it.snippet ? ` data-info-text="${escAttr(it.snippet)}"` : '';
+    return `<div class="patch-item"><span class="patch-date">${escAttr(it.date || '')}</span>` +
+      `<a href="${escAttr(it.url)}" target="_blank" rel="noopener noreferrer"${infoAttr}>${escAttr(it.title)}</a></div>`;
+  }).join('');
+}
+
+async function loadPatchNotes(game, listId, emptyId){
+  try{
+    const r = await fetch(PATCH_NOTES_BASE + '?game=' + game, {signal: AbortSignal.timeout(20000)});
+    const data = await r.json();
+    if(!data.ok) throw new Error(data.error || 'failed');
+    renderPatchList(listId, emptyId, data.items);
+  }catch(e){
+    patchStatusKey[emptyId] = 'home_patchnotes_error';
+    const empty = document.getElementById(emptyId);
+    empty.textContent = t('home_patchnotes_error');
+    empty.hidden = false;
+  }
+}
+loadPatchNotes('poe1', 'patchListPoe1', 'patchEmptyPoe1');
+loadPatchNotes('poe2', 'patchListPoe2', 'patchEmptyPoe2');
+
+// Re-applies whatever dynamic (non data-i18n) text is currently on screen in
+// the new language — same pattern/reasoning as the Trade Sniper page's own
+// refreshDynamicI18n(): patch-list empty/error messages are set from JS, not
+// static markup, so applyStaticI18n() alone can't reach them.
+function refreshDynamicI18n(){
+  for(const emptyId of Object.keys(patchStatusKey)){
+    const key = patchStatusKey[emptyId];
+    if(key) document.getElementById(emptyId).textContent = t(key);
+  }
+}
+
+// SHARED_HEADER_HTML's #langsel markup is shared across pages, but each page
+// has to wire its own change listener since each needs to refresh its own
+// dynamic content afterward (see refreshDynamicI18n() above) — without this
+// wiring at all, the dropdown just changes its own selected option and
+// nothing else updates, which was exactly the reported bug on this page.
+const langSel = document.getElementById('langsel');
+langSel.value = lang;
+langSel.addEventListener('change', () => {
+  lang = langSel.value;
+  try { localStorage.setItem('bossFarmLang', lang); } catch(e) {}
+  applyStaticI18n();
+  refreshDynamicI18n();
+});
+
+applyStaticI18n();
+"""
+
+
+def render_home_page():
+    head = (SHARED_HEAD_TEMPLATE
+            .replace("__PAGE_TITLE__", 'Path of Exile Helper — Boss Farm, Trade Sniper &amp; Patch Notes Hub')
+            .replace("__PAGE_DESCRIPTION__", 'Landing page for Path of Exile 1 and Path of Exile 2 tools — boss farming profit estimator, trade sniper, and live patch notes for both games.')
+            .replace("__PAGE_SOCIAL_TITLE__", 'Path of Exile Helper — PoE1 / PoE2 Hub')
+            .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Boss farming profit estimator, trade sniper, and live patch notes for Path of Exile 1 and Path of Exile 2.')
+            .replace("__PAGE_APP_NAME__", 'Path of Exile Helper')
+            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Landing page for Path of Exile 1 and Path of Exile 2 farming tools and patch notes.')
+            .replace("__FAVICON_URL__", _favicon_data_uri("\U0001F9ED")))
+    header = (SHARED_HEADER_HTML.replace("__EXTRA_CONTROLS__", HOME_EXTRA_CONTROLS)
+              .replace("__BRAND_ICON__", "&#129517;").replace("__BRAND_TITLE__", "PoE Helper")
+              .replace("__PRICECHIPS_ATTR__", "hidden").replace("__DIVINE_CHIP_ATTR__", "hidden"))
+    body = (HOME_BODY.replace("__POE1_ICON_URL__", POE1_ICON_URL)
+                      .replace("__POE2_ICON_URL__", POE2_ICON_URL))
+    return (head + "\n" + SHARED_CSS + '\n</head>\n<body>' + "\n"
+            + render_sitemenu("home") + header + body + SHARED_FOOTER_HTML
+            + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n'
+            + "<script>\nconst PAGE_REQUIRES_ADMIN = false;\n" + SHARED_JS_CHROME + HOME_JS
+            + '\n</script>\n</body>\n</html>')
+
+
+# --------------------------------------------------------------------------- #
+# PoE2 Campaign page (/poe2-campaign) — admin-only placeholder
+# --------------------------------------------------------------------------- #
+# Not listed in PAGES (same precedent as /snipe) — injected into the site menu
+# client-side by enableAdminUI() only once the admin handshake confirms.
+# Deliberately just a "coming soon" stub for now: this repo has no PoE2
+# support beyond the home page's patch-notes panel yet. Real content later.
+POE2_CAMPAIGN_EXTRA_CONTROLS = ""
+
+POE2_CAMPAIGN_BODY = r"""
+
+<div class="wrap">
+  <div class="note" data-i18n="poe2_campaign_note">
+    Path of Exile 2 campaign notes aren't built yet — this page is a placeholder so the route
+    and admin-only menu link exist ahead of real content.
+  </div>
+</div>
+"""
+
+POE2_CAMPAIGN_JS = r"""const LEAGUE = __LEAGUE_JSON__;
+
+const I18N = {
+en: {
+  tagline: 'PATH OF EXILE 2 · CAMPAIGN',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign',
+  chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
+  btn_refresh: 'Refresh', btn_syncing: 'syncing…',
+  footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games.',
+  footer_made_by: 'Built by Erick Lúcio',
+  footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
+  poe2_campaign_note: 'Path of Exile 2 campaign notes aren\'t built yet — this page is a placeholder so the route and admin-only menu link exist ahead of real content.',
+},
+pt: {
+  tagline: 'PATH OF EXILE 2 · CAMPANHA',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2',
+  chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
+  btn_refresh: 'Atualizar', btn_syncing: 'sincronizando…',
+  footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games.',
+  footer_made_by: 'Feito por Erick Lúcio',
+  footer_dm: 'Sugestão ou opinião? Manda um DM no LinkedIn',
+  poe2_campaign_note: 'As notas de campanha do Path of Exile 2 ainda não foram escritas — esta página é um placeholder para a rota e o link de menu (admin) existirem antes do conteúdo real.',
+},
+};
+
+// SHARED_HEADER_HTML's #langsel markup is shared across pages, but each page
+// has to wire its own change listener — without it, the dropdown just
+// changes its own selected option and nothing else updates. This page has
+// no other dynamic (non data-i18n) content, so applyStaticI18n() alone is
+// enough to refresh everything after a switch.
+const langSel = document.getElementById('langsel');
+langSel.value = lang;
+langSel.addEventListener('change', () => {
+  lang = langSel.value;
+  try { localStorage.setItem('bossFarmLang', lang); } catch(e) {}
+  applyStaticI18n();
+});
+
+applyStaticI18n();
+"""
+
+
+def render_poe2_campaign_page():
+    head = (SHARED_HEAD_TEMPLATE
+            .replace("__PAGE_TITLE__", 'PoE2 Campaign — Path of Exile 2 (Admin Preview)')
+            .replace("__PAGE_DESCRIPTION__", 'Placeholder page for future Path of Exile 2 campaign content.')
+            .replace("__PAGE_SOCIAL_TITLE__", 'PoE2 Campaign')
+            .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Placeholder page for future Path of Exile 2 campaign content.')
+            .replace("__PAGE_APP_NAME__", 'PoE2 Campaign')
+            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Placeholder page for future Path of Exile 2 campaign content.')
+            .replace("__FAVICON_URL__", _favicon_data_uri(chr(0x2694) + chr(0xFE0F))))
+    header = (SHARED_HEADER_HTML.replace("__EXTRA_CONTROLS__", POE2_CAMPAIGN_EXTRA_CONTROLS)
+              .replace("__BRAND_ICON__", "&#9876;&#65039;").replace("__BRAND_TITLE__", "PoE2 Campaign")
+              .replace("__PRICECHIPS_ATTR__", "hidden").replace("__DIVINE_CHIP_ATTR__", "hidden"))
+    return (head + "\n" + SHARED_CSS + '\n</head>\n<body>' + "\n"
+            + render_sitemenu("poe2-campaign") + header + POE2_CAMPAIGN_BODY + SHARED_FOOTER_HTML
+            + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n'
+            + "<script>\nconst PAGE_REQUIRES_ADMIN = true;\n" + SHARED_JS_CHROME + POE2_CAMPAIGN_JS
             + '\n</script>\n</body>\n</html>')
 
 
@@ -2568,7 +3289,7 @@ def make_handler(league, poll_ms, pages_html):
             if slug in pages_bytes:
                 self._send(200, pages_bytes[slug], "text/html; charset=utf-8")
             elif path == "/":
-                self._redirect("/bosses")
+                self._redirect("/home")
             elif path == "/api/data":
                 qs = urllib.parse.parse_qs(parsed.query)
                 req_league = (qs.get("league") or [league])[0].strip()[:64] or league
@@ -2577,6 +3298,18 @@ def make_handler(league, poll_ms, pages_html):
                     self._send(200, body, "application/json")
                 except Exception as e:
                     self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
+            elif path == "/api/patchnotes":
+                qs = urllib.parse.parse_qs(parsed.query)
+                game = (qs.get("game") or ["poe1"])[0].strip()
+                if game not in PATCH_NOTES_URLS:
+                    self._send(400, json.dumps({"ok": False, "error": "unknown game"}).encode(), "application/json")
+                else:
+                    try:
+                        items = _get_patch_notes(game)
+                        body = json.dumps({"ok": True, "items": items}).encode("utf-8")
+                        self._send(200, body, "application/json")
+                    except Exception as e:
+                        self._send(500, json.dumps({"ok": False, "error": str(e)}).encode(), "application/json")
             else:
                 self._send(404, b"not found", "text/plain")
     return H
@@ -2594,13 +3327,19 @@ def main():
                     "keeps working with zero dependencies beyond stdlib Python out of the box.")
     args = ap.parse_args()
 
-    url = f"http://localhost:{args.port}/bosses"
+    url = f"http://localhost:{args.port}/home"
     pages_html = {
+        "home": (render_home_page().replace("__POLL_MS__", str(args.poll * 1000))
+                 .replace("__LEAGUE_JSON__", json.dumps(args.league))
+                 .replace("__CANONICAL_URL__", url)),
         "bosses": (render_bosses_page().replace("__POLL_MS__", str(args.poll * 1000))
-                   .replace("__CANONICAL_URL__", url)),
+                   .replace("__CANONICAL_URL__", f"http://localhost:{args.port}/bosses")),
         "snipe": (render_snipe_page().replace("__POLL_MS__", str(args.poll * 1000))
                   .replace("__LEAGUE_JSON__", json.dumps(args.league))
                   .replace("__CANONICAL_URL__", f"http://localhost:{args.port}/snipe")),
+        "poe2-campaign": (render_poe2_campaign_page().replace("__POLL_MS__", str(args.poll * 1000))
+                          .replace("__LEAGUE_JSON__", json.dumps(args.league))
+                          .replace("__CANONICAL_URL__", f"http://localhost:{args.port}/poe2-campaign")),
     }
     if args.minify:
         pages_html = {slug: minify_page(html) for slug, html in pages_html.items()}
@@ -2609,8 +3348,10 @@ def main():
                               make_handler(args.league, args.poll * 1000, pages_html))
     print(f"Boss Farm Estimator at {url}  (league: {args.league}, price: exchange->stash)"
           f"  --  Ctrl+C to stop"
+          f"\nBoss Farm dashboard at http://localhost:{args.port}/bosses"
           f"\nTrade Sniper (needs the deployed Worker to actually work) at "
-          f"http://localhost:{args.port}/snipe")
+          f"http://localhost:{args.port}/snipe"
+          f"\nPoE2 Campaign (admin-only stub) at http://localhost:{args.port}/poe2-campaign")
     try:
         webbrowser.open(url)
     except Exception:

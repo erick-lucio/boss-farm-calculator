@@ -395,18 +395,48 @@ def render_snipe_page(league, worker_url, poll_ms):
                     .replace("__CANONICAL_URL__", canonical_url))
 
 
+# boss.py's HOME_JS hits the local dev server's own /api/patchnotes relatively;
+# the static build instead needs the Worker's /forum/patch-notes proxy
+# (absolute URL, same defensive reasoning as FETCH_ENGINE's WORKER_URL above —
+# works even if the built HTML is previewed from somewhere other than the
+# live worker origin). Small single-line swap, not a full FETCH_ENGINE-style
+# port, since the actual fetch/render logic doesn't otherwise differ between
+# deployments — only the URL prefix does.
+OLD_PATCH_NOTES_BASE = "const PATCH_NOTES_BASE = '/api/patchnotes';"
+
+
+def render_home_page(league, worker_url, poll_ms):
+    canonical_url = worker_url.rstrip("/") + "/home"
+    html = (boss.render_home_page().replace("__POLL_MS__", str(poll_ms))
+                    .replace("__LEAGUE_JSON__", json.dumps(league))
+                    .replace("__CANONICAL_URL__", canonical_url))
+    if OLD_PATCH_NOTES_BASE not in html:
+        raise RuntimeError("PATCH_NOTES_BASE line not found in boss.render_home_page() — "
+                            "boss.py's HOME_JS changed shape; update OLD_PATCH_NOTES_BASE in build_static.py to match.")
+    new_base = "const PATCH_NOTES_BASE = " + json.dumps(worker_url.rstrip("/") + "/forum/patch-notes") + ";"
+    html = html.replace(OLD_PATCH_NOTES_BASE, new_base, 1)
+    return html
+
+
+def render_poe2_campaign_page(league, worker_url, poll_ms):
+    canonical_url = worker_url.rstrip("/") + "/poe2-campaign"
+    return (boss.render_poe2_campaign_page().replace("__POLL_MS__", str(poll_ms))
+                    .replace("__LEAGUE_JSON__", json.dumps(league))
+                    .replace("__CANONICAL_URL__", canonical_url))
+
+
 # Cloudflare's static-asset layer does an implicit "look for index.html" check
 # at the bare root that returns its own 404 without ever invoking worker.js's
 # fetch() handler (confirmed live — every other unmatched path correctly
-# falls through to the Worker's redirect-to-/bosses logic, only "/" doesn't).
+# falls through to the Worker's redirect-to-/home logic, only "/" doesn't).
 # A real index.html file sidesteps that entirely.
 ROOT_REDIRECT = """<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="google-adsense-account" content="ca-pub-7517572231491496">
-<meta http-equiv="refresh" content="0; url=/bosses">
-<script>location.replace('/bosses');</script>
+<meta http-equiv="refresh" content="0; url=/home">
+<script>location.replace('/home');</script>
 <title>Boss Farm Estimator</title>
-</head><body>Redirecting to <a href="/bosses">/bosses</a>...</body></html>
+</head><body>Redirecting to <a href="/home">/home</a>...</body></html>
 """
 
 
@@ -427,35 +457,47 @@ def main():
     args = ap.parse_args()
 
     out_dir = Path(__file__).resolve().parent / args.out
+    home_dir = out_dir / "home"
     bosses_dir = out_dir / "bosses"
     snipe_dir = out_dir / "snipe"
-    bosses_dir.mkdir(parents=True, exist_ok=True)
-    snipe_dir.mkdir(parents=True, exist_ok=True)
+    poe2_dir = out_dir / "poe2-campaign"
+    for d in (home_dir, bosses_dir, snipe_dir, poe2_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
+    home_html = render_home_page(args.league, args.worker_url, args.poll * 1000)
     html = render_page(args.league, args.worker_url, args.poll * 1000)
     snipe_html = render_snipe_page(args.league, args.worker_url, args.poll * 1000)
+    poe2_html = render_poe2_campaign_page(args.league, args.worker_url, args.poll * 1000)
     if not args.no_minify:
+        home_html = boss.minify_page(home_html)
         html = boss.minify_page(html)
         snipe_html = boss.minify_page(snipe_html)
+        poe2_html = boss.minify_page(poe2_html)
+    (home_dir / "index.html").write_text(home_html, encoding="utf-8")
     (bosses_dir / "index.html").write_text(html, encoding="utf-8")
     (snipe_dir / "index.html").write_text(snipe_html, encoding="utf-8")
+    (poe2_dir / "index.html").write_text(poe2_html, encoding="utf-8")
     (out_dir / "index.html").write_text(ROOT_REDIRECT, encoding="utf-8")
 
     base = args.worker_url.rstrip("/")
     (out_dir / "robots.txt").write_text(
         f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n", encoding="utf-8")
     (out_dir / "sitemap.xml").write_text(
-        # /snipe deliberately left out of the sitemap while it's hidden from the site
-        # menu (see PAGES in boss.py) — the page still builds and works at that URL for
-        # direct/manual access, just isn't advertised for search engines to crawl yet.
+        # /snipe and /poe2-campaign deliberately left out of the sitemap while they're
+        # admin-only/hidden from the site menu (see PAGES in boss.py) — both pages still
+        # build and work at their URLs for direct/manual access, just aren't advertised
+        # for search engines to crawl yet.
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"  <url><loc>{base}/home</loc></url>\n"
         f"  <url><loc>{base}/bosses</loc></url>\n"
         "</urlset>\n", encoding="utf-8")
 
+    print(f"Wrote {home_dir / 'index.html'} ({len(home_html):,} bytes)")
     print(f"Wrote {bosses_dir / 'index.html'} ({len(html):,} bytes)")
     print(f"Wrote {snipe_dir / 'index.html'} ({len(snipe_html):,} bytes)")
-    print(f"Wrote {out_dir / 'index.html'} (redirect -> /bosses)")
+    print(f"Wrote {poe2_dir / 'index.html'} ({len(poe2_html):,} bytes)")
+    print(f"Wrote {out_dir / 'index.html'} (redirect -> /home)")
     print(f"Wrote {out_dir / 'robots.txt'} and {out_dir / 'sitemap.xml'}")
     print(f"  league={args.league}  worker={args.worker_url}  poll={args.poll}s")
     print(f"  {len(boss.ENTITIES)} boss entities embedded")

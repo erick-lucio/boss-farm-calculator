@@ -21,13 +21,90 @@
 // shapes 1:1, so the mapping is easy to eyeball against boss.py):
 //   GET /ninja/<path>?<query>  -> https://poe.ninja/poe1/api/economy/<path>?<query>
 //   GET /watch/compact?<query> -> https://api.poe.watch/compact?<query>
+//   GET /forum/patch-notes?game=poe1|poe2 -> pathofexile.com forum (see fetchPatchNotes)
 //   POST /snipe/start, GET /snipe/poll, POST /snipe/stop -> SnipeSession DO
-//   anything else (root, typos, old links) -> 302 redirect to /bosses
+//   anything else (root, typos, old links) -> 302 redirect to /home
 
 const NINJA_BASE = "https://poe.ninja/poe1/api/economy";
 const WATCH_BASE = "https://api.poe.watch";
 const UA = "boss-dashboard-static-proxy/1.0 (contact: you@example.com)";
 const CACHE_TTL = 300; // seconds; matches boss.py's CACHE_TTL
+
+// Both games' patch notes live on the same classic server-rendered
+// pathofexile.com forum software (confirmed live) — pathofexile2.com itself
+// is a client-rendered SPA with no scrapeable HTML, a dead end ruled out
+// before picking these URLs. PoE2's forum is a sub-forum ("Early Access Patch
+// Notes") of the same pathofexile.com domain, id 2212 — found via the forum
+// index page, not guessed. Mirrors boss.py's _get_patch_notes()/
+// PATCH_NOTES_URLS — same "two independent implementations, must be kept in
+// sync" caveat this repo already documents for FETCH_ENGINE/OLD_FETCH_DATA.
+const PATCH_NOTES_URLS = {
+  poe1: "https://www.pathofexile.com/forum/view-forum/patch-notes",
+  poe2: "https://www.pathofexile.com/forum/view-forum/2212",
+};
+// The forum's WAF treats requests without a real browser User-Agent
+// differently than the plain JSON APIs do — confirmed live, so this uses a
+// real Chrome UA string rather than the plain UA constant above.
+const FORUM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+
+async function fetchPatchNotes(game) {
+  const url = PATCH_NOTES_URLS[game];
+  const resp = await fetch(url, { headers: { "User-Agent": FORUM_UA }, cf: { cacheTtl: CACHE_TTL, cacheEverything: true } });
+  const html = await resp.text();
+  const items = [];
+  const titleRe = /<div class="title">\s*<a href="(\/forum\/view-thread\/\d+)">\s*([^<]+?)\s*<\/a>/gs;
+  let m;
+  while ((m = titleRe.exec(html)) !== null && items.length < 8) {
+    const threadPath = m[1];
+    const title = m[2].trim();
+    if (!title || !/^\d/.test(title)) continue; // skip pinned non-patch threads (e.g. "Code of Conduct")
+    // A wide window — the "postBy" block (which holds post_date, a <span> not
+    // a <div>) can sit far past the title on a heavily-paginated thread (each
+    // page-number link adds ~60 chars; an 8-page thread pushed it past 600
+    // chars in testing, so 3000 is a safe margin).
+    const window = html.slice(titleRe.lastIndex, titleRe.lastIndex + 3000);
+    const dateM = /class="post_date">([^<]*)<\/span>/.exec(window);
+    const date = dateM ? dateM[1].trim().replace(/^,\s*/, "") : "";
+    items.push({ title, url: "https://www.pathofexile.com" + threadPath, date });
+  }
+  // One extra request per item to fetch its own thread page for a real
+  // snippet — fired concurrently via Promise.all (mirrors boss.py's
+  // ThreadPoolExecutor for the same reason: 8 sequential forum fetches would
+  // make the whole page wait several seconds for no benefit).
+  const snippets = await Promise.all(items.map((it) => fetchPatchSnippet(it.url)));
+  items.forEach((it, i) => { it.snippet = snippets[i]; });
+  return items;
+}
+
+const PATCH_BODY_RE = /<div class="contentStart"><\/div>\s*<div class="content">([\s\S]*?)(?:<div class="signature"|<\/td>)/;
+const SNIPPET_LEN = 400;
+
+// Plain-text excerpt of a patch note thread's own first post — a real
+// (truncated) excerpt of the actual patch text, not a generated summary (no
+// LLM available here). Best-effort: any failure just means that one item's
+// popup has no snippet, never blocks the rest of the listing.
+async function fetchPatchSnippet(threadUrl) {
+  try {
+    const resp = await fetch(threadUrl, { headers: { "User-Agent": FORUM_UA }, cf: { cacheTtl: CACHE_TTL, cacheEverything: true } });
+    const html = await resp.text();
+    const m = PATCH_BODY_RE.exec(html);
+    if (!m) return "";
+    // The real post body can be 10,000+ chars — only look at a generous
+    // prefix, since we're truncating to SNIPPET_LEN anyway.
+    let text = m[1].slice(0, SNIPPET_LEN * 4).replace(/<[^>]+>/g, " ");
+    text = text.replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+               .replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#039;/g, "'")
+               .replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+    text = text.replace(/\s+/g, " ").trim();
+    if (text.length > SNIPPET_LEN) {
+      const cut = text.slice(0, SNIPPET_LEN);
+      text = cut.slice(0, cut.lastIndexOf(" ")) + "…";
+    }
+    return text;
+  } catch (e) {
+    return "";
+  }
+}
 
 function withCors(body, status, contentType) {
   return new Response(body, {
@@ -56,24 +133,37 @@ function withCors(body, status, contentType) {
 // site-wide just to check the name, blowing through the fetch-endpoint rate
 // limit under real volume). Neither is a good trade-off, so this uses
 // **rotation polling** instead: no WebSocket, no live-search at all.
-// `alarm()` re-fires every ~3s, checks the single next item in the
-// watchlist (one `search` + one `fetch` call), and moves on — a full lap
-// through a 100-item list takes ~5 minutes. That's comfortably inside GGG's
-// documented rate limits (search 5/12s, fetch 12/6s — this uses one of each
-// per 3s, an order of magnitude under both), and plain trade search + fetch
-// work fully unauthenticated (confirmed live) — so a credential was never
-// required. Trades instant push for a ~5-minute-average staleness, which is
-// the deliberate, user-approved choice here over the two risky alternatives
-// above. POESESSID is still optional (see `poesessid` below): under heavy
-// personal use GGG's anonymous rate-limit bucket can get exhausted (a real
-// 429 seen in testing), and supplying your own account's session cookie may
-// use a separate, more generous bucket — never required, never persisted to
+// `alarm()` re-fires every ~6s, checks the single next item in the
+// watchlist — two search+fetch pairs, see checkOneItem's general +
+// unidentified-only passes — and moves on — a full lap through a 100-item
+// list takes ~10 minutes. That's comfortably inside GGG's documented rate
+// limits (search 5/12s, fetch 12/6s — this uses two of each per 6s), and
+// plain trade search + fetch work fully unauthenticated (confirmed live) —
+// so a credential was never required. Trades instant push for a
+// ~10-minute-average staleness, which is the deliberate, user-approved
+// choice here over the two risky alternatives above. POESESSID is still
+// optional (see `poesessid` below): under heavy personal use GGG's
+// anonymous rate-limit bucket can get exhausted (a real 429 seen in
+// testing), and supplying your own account's session cookie may use a
+// separate, more generous bucket — never required, never persisted to
 // storage, only held in this instance's memory for the life of the watch.
-// `rotationIntervalMs` starts at 3s but grows (capped, see applyRateLimit())
+// `rotationIntervalMs` starts at 6s but grows (capped, see applyRateLimit())
 // every time a 429 happens — GGG's own bans escalate on repeat violations
 // shortly after a previous one clears, so resuming at the original fast pace
 // right when a ban expires reliably re-triggers a longer one; this session's
 // pace permanently backs off instead of oscillating back into that loop.
+// Fields whose loss breaks the rotation, persisted via persist()/rehydrated
+// via blockConcurrencyWhile below. Deliberately excludes: `poesessid` (must
+// never survive to storage at all, see its own comment), `buffer`/
+// `checkLog`/`currentItem` (transient display-only queues capped at 200/50
+// entries and drained on every poll — losing a few isn't a correctness bug,
+// and persisting them on every single check would add needless storage
+// writes to the hot path).
+const PERSISTED_KEYS = [
+  "watchlist", "rotationIndex", "league", "divineRate", "exaltedRate",
+  "thresholdPct", "lastPolledAt", "rateLimitedUntil", "consecutiveBans", "rotationIntervalMs",
+];
+
 export class SnipeSession {
   constructor(state, env) {
     this.state = state;
@@ -91,7 +181,30 @@ export class SnipeSession {
     this.rateLimitedUntil = 0;  // ms epoch; while in the future, alarm() makes zero trade-API calls
     this.poesessid = null;      // optional; never written to storage, never echoed in any response
     this.consecutiveBans = 0;   // resets to 0 on any check that doesn't itself get 429'd
-    this.rotationIntervalMs = 3000; // grows (capped) after each ban — see checkOneItem's 429 handling
+    this.rotationIntervalMs = 6000; // grows (capped) after each ban — see checkOneItem's 429 handling
+
+    // Durable Objects can be evicted from memory between requests when idle
+    // — Cloudflare's own hibernation, not something this code controls. This
+    // was a real, reproduced bug: a session sitting on a long rate-limit
+    // cooldown (its alarm just re-checks every ~30s during the wait, see
+    // alarm() below) got silently wiped mid-cooldown; the constructor
+    // re-ran with the defaults above, and since alarm()'s first line
+    // no-ops when watchlist is empty, the rotation died permanently with
+    // no error anywhere — `running` just silently went false. This makes
+    // every fetch()/alarm() wait for storage-backed state to be restored
+    // first, so no request can observe a half-evicted session.
+    this.state.blockConcurrencyWhile(async () => {
+      const stored = await this.state.storage.get(PERSISTED_KEYS);
+      for (const key of PERSISTED_KEYS) {
+        if (stored.has(key)) this[key] = stored.get(key);
+      }
+    });
+  }
+
+  async persist() {
+    const snapshot = {};
+    for (const key of PERSISTED_KEYS) snapshot[key] = this[key];
+    await this.state.storage.put(snapshot);
   }
 
   async fetch(request) {
@@ -144,9 +257,10 @@ export class SnipeSession {
     this.currentItem = null;
     this.rateLimitedUntil = 0;
     this.consecutiveBans = 0;
-    this.rotationIntervalMs = 3000;
+    this.rotationIntervalMs = 6000;
     this.lastPolledAt = Date.now();
 
+    await this.persist();
     await this.state.storage.setAlarm(Date.now() + 1000);
     return new Response(JSON.stringify({ ok: true, watchlistSize: this.watchlist.length }), { status: 200 });
   }
@@ -156,24 +270,60 @@ export class SnipeSession {
   // an underpriced hit) — this is what lets the frontend show "which item is
   // being checked, its live price vs. the poe.ninja reference price" instead
   // of only ever surfacing actual hits.
+  // Runs two trade queries per item, not one: the general pool (any
+  // identification state) plus a second, unidentified-only pass. An
+  // unidentified item hasn't had its random mod rolls revealed yet, so its
+  // price reflects the base item alone rather than whatever specific roll a
+  // seller happened to get — a much more stable/"solid" reference than the
+  // general pool, which mixes in every possible roll from far below to far
+  // above a typical listing. The general query's cheapest-5 cutoff can also
+  // bury a cheap unidentified listing behind pricier identified ones, so
+  // querying unidentified-only surfaces those directly. This doubles the
+  // request count per item (2 searches + 2 fetches instead of 1+1), so
+  // rotationIntervalMs's base was doubled (3s -> 6s, see the constructor)
+  // to keep the real per-second request rate roughly where it was.
   async checkOneItem(item) {
     const logEntry = {
       name: item.name, icon: item.icon || null,
-      referenceChaos: item.chaos, checkedAt: Date.now(),
-      listingsSeen: 0, cheapestAmount: null, cheapestCurrency: null, cheapestChaosEquiv: null,
+      referenceChaos: item.chaos, referenceWatchChaos: item.watchChaos, checkedAt: Date.now(),
+      listingsSeen: 0, cheapestAmount: null, cheapestCurrency: null, cheapestChaosEquiv: null, cheapestIdentified: null,
       underpriced: false, debug: null,
       variantCount: item.variants ? item.variants.length : null,
     };
     const tradeHeaders = { "User-Agent": TRADE_UA };
     if (this.poesessid) tradeHeaders["Cookie"] = `POESESSID=${this.poesessid}`;
+    const seenIds = new Set(); // dedupes hits the two passes both surface
+
+    const bannedOnGeneralPass = await this.runTradeQuery(item, tradeHeaders, logEntry, seenIds, false);
+    if (!bannedOnGeneralPass) {
+      await this.runTradeQuery(item, tradeHeaders, logEntry, seenIds, true);
+    }
+
+    if (this.buffer.length > 200) this.buffer = this.buffer.slice(-200);
+    if (!logEntry.debug && logEntry.listingsSeen === 0) {
+      logEntry.debug = "no usable listings found across either pass";
+    }
+    this.pushLog(logEntry);
+  }
+
+  // One search+fetch round trip for `item`. `unidentifiedOnly` picks which
+  // of the two passes described above this is; mutates `logEntry` in place
+  // and pushes any underpriced hit straight into `this.buffer` (skipping ids
+  // already in `seenIds`, since the general pass and the unidentified-only
+  // pass can both surface the same listing). Returns true if this call got
+  // 429'd, so checkOneItem can skip firing the second pass into the same ban.
+  async runTradeQuery(item, tradeHeaders, logEntry, seenIds, unidentifiedOnly) {
+    const query = { status: { option: "securable" }, name: item.name, stats: [{ type: "and", filters: [] }] };
+    if (unidentifiedOnly) query.filters = { misc_filters: { filters: { identified: { option: "false" } } } };
+
     let searchResp;
     try {
       searchResp = await fetch(`https://www.pathofexile.com/api/trade/search/${encodeURIComponent(this.league)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...tradeHeaders },
-        body: JSON.stringify({ query: { status: { option: "online" }, name: item.name }, sort: { price: "asc" } }),
+        body: JSON.stringify({ query, sort: { price: "asc" } }),
       });
-    } catch (e) { logEntry.debug = `search request threw: ${e}`; this.pushLog(logEntry); return; }
+    } catch (e) { logEntry.debug = logEntry.debug || `search request threw: ${e}`; return false; }
     if (!searchResp.ok) {
       let snippet = "";
       try { snippet = (await searchResp.text()).slice(0, 200); } catch (e) {}
@@ -181,17 +331,19 @@ export class SnipeSession {
         const waitSec = parseRetrySeconds(searchResp, snippet);
         const paddedWaitSec = this.applyRateLimit(waitSec);
         logEntry.debug = `rate limited by pathofexile.com/trade (ban #${this.consecutiveBans} in a row) — server said wait ${waitSec}s, pausing ${paddedWaitSec}s with a safety margin, rotation slowed to one check every ${Math.round(this.rotationIntervalMs / 1000)}s`;
-      } else {
-        logEntry.debug = `search HTTP ${searchResp.status} ${searchResp.statusText}: ${snippet}`;
+        return true;
       }
-      this.pushLog(logEntry); return;
+      logEntry.debug = logEntry.debug || `search HTTP ${searchResp.status} ${searchResp.statusText}: ${snippet}`;
+      return false;
     }
     const searchData = await searchResp.json();
     if (!searchData.id || !Array.isArray(searchData.result) || !searchData.result.length) {
-      logEntry.debug = searchData.error
-        ? `search error: ${JSON.stringify(searchData.error)}`
-        : "search OK, 0 listings currently online for this item";
-      this.pushLog(logEntry); return;
+      if (!logEntry.debug) {
+        logEntry.debug = searchData.error
+          ? `search error: ${JSON.stringify(searchData.error)}`
+          : `search OK, 0 ${unidentifiedOnly ? "unidentified " : ""}listings currently online for this item`;
+      }
+      return false;
     }
 
     const ids = searchData.result.slice(0, 5).join(",");
@@ -200,7 +352,7 @@ export class SnipeSession {
       fetchResp = await fetch(`https://www.pathofexile.com/api/trade/fetch/${ids}?query=${searchData.id}`, {
         headers: tradeHeaders,
       });
-    } catch (e) { logEntry.debug = `fetch request threw: ${e}`; this.pushLog(logEntry); return; }
+    } catch (e) { logEntry.debug = logEntry.debug || `fetch request threw: ${e}`; return false; }
     if (!fetchResp.ok) {
       let snippet = "";
       try { snippet = (await fetchResp.text()).slice(0, 200); } catch (e) {}
@@ -208,23 +360,24 @@ export class SnipeSession {
         const waitSec = parseRetrySeconds(fetchResp, snippet);
         const paddedWaitSec = this.applyRateLimit(waitSec);
         logEntry.debug = `rate limited by pathofexile.com/trade (ban #${this.consecutiveBans} in a row) — server said wait ${waitSec}s, pausing ${paddedWaitSec}s with a safety margin, rotation slowed to one check every ${Math.round(this.rotationIntervalMs / 1000)}s`;
-      } else {
-        logEntry.debug = `fetch HTTP ${fetchResp.status} ${fetchResp.statusText}: ${snippet}`;
+        return true;
       }
-      this.pushLog(logEntry); return;
+      logEntry.debug = logEntry.debug || `fetch HTTP ${fetchResp.status} ${fetchResp.statusText}: ${snippet}`;
+      return false;
     }
     // Both calls succeeded without a 429 — this streak of bans is over.
     this.consecutiveBans = 0;
     const fetchData = await fetchResp.json();
-    if (fetchData.error) logEntry.debug = `fetch error: ${JSON.stringify(fetchData.error)}`;
+    if (fetchData.error && !logEntry.debug) logEntry.debug = `fetch error: ${JSON.stringify(fetchData.error)}`;
 
-    // Same searchId reopens this exact name-filtered query on the real trade
-    // site — since the query only ever matches this one item name, the page
-    // it lands on shows just this item's listings, not a generic browse.
+    // Same searchId reopens this exact query on the real trade site — since
+    // the query only ever matches this one item name (plus the identified
+    // filter on the second pass), the page it lands on shows just those
+    // listings, not a generic browse.
     const tradeUrl = `https://www.pathofexile.com/trade/search/${encodeURIComponent(this.league)}/${searchData.id}`;
 
     for (const r of (fetchData.result || [])) {
-      if (!r || !r.listing || !r.listing.price) continue;
+      if (!r || !r.listing || !r.listing.price || seenIds.has(r.id)) continue;
       const { amount, currency } = r.listing.price;
       if (amount == null || !currency) continue;
       const chaosEquiv = currency === "chaos" ? amount
@@ -232,11 +385,13 @@ export class SnipeSession {
         : (currency === "exalted" && this.exaltedRate) ? amount * this.exaltedRate
         : null;
       if (chaosEquiv == null) continue; // unsupported currency for comparison, skip
+      seenIds.add(r.id);
       logEntry.listingsSeen++;
       if (logEntry.cheapestChaosEquiv == null || chaosEquiv < logEntry.cheapestChaosEquiv) {
         logEntry.cheapestChaosEquiv = Math.round(chaosEquiv * 100) / 100;
         logEntry.cheapestAmount = amount;
         logEntry.cheapestCurrency = currency;
+        logEntry.cheapestIdentified = (r.item && typeof r.item.identified === "boolean") ? r.item.identified : null;
       }
 
       // item.chaos is the FLOOR across every poe.ninja-priced variant of this
@@ -273,16 +428,13 @@ export class SnipeSession {
         referenceChaos,
         variantLabel,
         variantUncertain,
+        unidentified: (r.item && typeof r.item.identified === "boolean") ? !r.item.identified : !!unidentifiedOnly,
         account: (r.listing.account && r.listing.account.name) || "?",
         tradeUrl,
         seenAt: Date.now(),
       });
     }
-    if (this.buffer.length > 200) this.buffer = this.buffer.slice(-200);
-    if (!logEntry.debug && logEntry.listingsSeen === 0) {
-      logEntry.debug = `fetch returned ${(fetchData.result || []).length} result(s), none had a usable price/currency`;
-    }
-    this.pushLog(logEntry);
+    return false;
   }
 
   pushLog(entry) {
@@ -310,6 +462,7 @@ export class SnipeSession {
 
   async handlePoll() {
     this.lastPolledAt = Date.now();
+    await this.persist(); // lastPolledAt drives the 10-min idle-abandon check — must survive eviction
     const running = !!this.watchlist.length;
     const listings = this.buffer;
     this.buffer = [];
@@ -328,6 +481,7 @@ export class SnipeSession {
     this.currentItem = null;
     this.rateLimitedUntil = 0;
     this.poesessid = null;
+    await this.persist();
     await this.state.storage.deleteAlarm();
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   }
@@ -338,6 +492,7 @@ export class SnipeSession {
       this.watchlist = []; // no poll in 10+ min — stop rotating, matches handleStop's end state
       this.currentItem = null;
       this.poesessid = null;
+      await this.persist();
       return;
     }
     // While rate-limited, make ZERO trade-API calls until the cooldown clears
@@ -358,10 +513,12 @@ export class SnipeSession {
     if (Date.now() < this.rateLimitedUntil) {
       // just entered a rate-limit ban from the check above — don't advance
       // rotationIndex, so the same item gets re-checked first once cleared
+      await this.persist();
       await this.state.storage.setAlarm(Math.min(this.rateLimitedUntil + 500, Date.now() + 30000));
       return;
     }
     this.rotationIndex = (this.rotationIndex + 1) % this.watchlist.length;
+    await this.persist();
     await this.state.storage.setAlarm(Date.now() + this.rotationIntervalMs);
   }
 }
@@ -416,11 +573,14 @@ function findDiscriminator(row, allRows) {
 // live listing actually is and compare against ITS price instead.
 async function fetchTopUniqueWatchlist(league, priceFilter) {
   const categories = ["UniqueWeapon", "UniqueArmour", "UniqueAccessory", "UniqueJewel", "UniqueFlask"];
-  const results = await Promise.all(categories.map(async (cat) => {
-    const qs = new URLSearchParams({ league, type: cat });
-    const resp = await fetch(`${NINJA_BASE}/stash/current/item/overview?${qs}`, { headers: { "User-Agent": UA } });
-    return resp.json();
-  }));
+  const [results, watchUnided] = await Promise.all([
+    Promise.all(categories.map(async (cat) => {
+      const qs = new URLSearchParams({ league, type: cat });
+      const resp = await fetch(`${NINJA_BASE}/stash/current/item/overview?${qs}`, { headers: { "User-Agent": UA } });
+      return resp.json();
+    })),
+    fetchWatchUnidentifiedPrices(league),
+  ]);
 
   // Currency rates are needed up front now — a "divine" priceFilter has to
   // be converted to chaos before it can filter poe.ninja's chaos-valued rows.
@@ -464,7 +624,8 @@ async function fetchTopUniqueWatchlist(league, priceFilter) {
     const variants = rows.length > 1
       ? rows.map((row) => ({ label: row.variant || null, chaos: chaosOf(row), discriminator: findDiscriminator(row, rows) }))
       : null;
-    all.push({ name, chaos: floorChaos, listingCount, icon, variants });
+    const watchChaos = watchUnided.has(name) ? watchUnided.get(name) : null;
+    all.push({ name, chaos: floorChaos, listingCount, icon, variants, watchChaos });
   }
 
   if (minChaos != null) all = all.filter((it) => it.chaos >= minChaos);
@@ -475,12 +636,37 @@ async function fetchTopUniqueWatchlist(league, priceFilter) {
 
   const watchlistMap = new Map();
   for (const it of [...byMostSold, ...byMostExpensive]) {
-    watchlistMap.set(it.name, { chaos: it.chaos, icon: it.icon, variants: it.variants });
+    watchlistMap.set(it.name, { chaos: it.chaos, icon: it.icon, variants: it.variants, watchChaos: it.watchChaos });
   }
   const watchlist = Array.from(watchlistMap.entries())
-    .map(([name, v]) => ({ name, chaos: v.chaos, icon: v.icon, variants: v.variants }));
+    .map(([name, v]) => ({ name, chaos: v.chaos, icon: v.icon, variants: v.variants, watchChaos: v.watchChaos }));
 
   return { watchlist, divineRate, exaltedRate };
+}
+
+// base item name -> lowest poe.watch "Unidentified <name> [ilvl]" price — the
+// real floor value an as-dropped, unrolled item sells for, before anyone
+// rolls/identifies it (mirrors boss.py's _get_watch_unidentified(): same
+// source, same reasoning — an unidentified copy's price reflects the base
+// item alone, not whatever specific roll a seller happened to get). Purely
+// best-effort: poe.watch being slow/unreachable never blocks the watchlist,
+// it just means those items show no poe.watch reference price.
+async function fetchWatchUnidentifiedPrices(league) {
+  const result = new Map();
+  try {
+    const qs = new URLSearchParams({ league });
+    const resp = await fetch(`${WATCH_BASE}/compact?${qs}`, { headers: { "User-Agent": UA } });
+    const data = await resp.json();
+    for (const it of (data.items || [])) {
+      const nm = it.name || "";
+      if (!nm.startsWith("Unidentified ")) continue;
+      const base = nm.slice("Unidentified ".length).replace(/\s+\d+\+?$/, "");
+      const chaos = it.min ?? it.mean;
+      if (chaos == null) continue;
+      if (!result.has(base) || chaos < result.get(base)) result.set(base, chaos);
+    }
+  } catch (e) { /* best-effort — see comment above */ }
+  return result;
 }
 
 // SnipeSession is intentionally a SINGLETON: pathofexile.com/trade's rate
@@ -534,14 +720,25 @@ export default {
       return withCors(await doResp.text(), doResp.status, "application/json");
     }
 
-    if (!url.pathname.startsWith("/ninja/") && url.pathname !== "/watch/compact") {
+    if (!url.pathname.startsWith("/ninja/") && url.pathname !== "/watch/compact" && url.pathname !== "/forum/patch-notes") {
       // Not an API-proxy path, and no static asset matched (Cloudflare tries
-      // that first) — send the visitor to the dashboard's real URL.
-      return Response.redirect(url.origin + "/bosses", 302);
+      // that first) — send the visitor to the dashboard's real landing page.
+      return Response.redirect(url.origin + "/home", 302);
     }
 
     if (request.method === "OPTIONS") return withCors(null, 204);
     if (request.method !== "GET") return withCors("method not allowed", 405, "text/plain");
+
+    if (url.pathname === "/forum/patch-notes") {
+      const game = url.searchParams.get("game") || "poe1";
+      if (!PATCH_NOTES_URLS[game]) return withCors(JSON.stringify({ ok: false, error: "unknown game" }), 400);
+      try {
+        const items = await fetchPatchNotes(game);
+        return withCors(JSON.stringify({ ok: true, items }), 200);
+      } catch (e) {
+        return withCors(JSON.stringify({ ok: false, error: String(e) }), 502);
+      }
+    }
 
     const upstream = url.pathname.startsWith("/ninja/")
       ? NINJA_BASE + url.pathname.slice("/ninja".length) + url.search
