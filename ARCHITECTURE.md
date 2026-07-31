@@ -82,6 +82,7 @@ verified line-for-line identical to the pre-refactor output (see Verification ha
 | `/bosses`          | Boss Farm Estimator  | poe1  | No          | `render_bosses_page()`           |
 | `/snipe`           | Trade Sniper          | poe1  | Yes (`PAGE_REQUIRES_ADMIN = true`) — hidden from the public site menu (injected client-side when admin is detected), redirects non-admin visitors to `/home` | `render_snipe_page()` |
 | `/poe2-campaign`   | PoE2 Campaign (stub)  | poe2  | Yes (`PAGE_REQUIRES_ADMIN = true`) — same pattern as `/snipe`, placeholder body for now | `render_poe2_campaign_page()` |
+| `/flip-advisor`    | Flip Advisor          | poe1  | Yes (`PAGE_REQUIRES_ADMIN = true`) — same pattern as `/snipe` | `render_flip_advisor_page()` |
 
 `/home` is the site's real landing page. `/` (root) 302-redirects to `/home` in both
 deployment modes (see the "one normalized route" note further down). Any unmatched path,
@@ -365,6 +366,139 @@ between browser polls.
   server). This feature only fully works once deployed behind the Worker. Documented in-code as a
   comment above `render_snipe_page()`.
 
+### Flip Advisor page (`/flip-advisor`, PoE1 only, admin-only)
+
+Ranks Path of Exile 1 currency-exchange pairs by historical spread% over the last completed
+hour — a starting point from `tasks/todo.md`, whose original scoping note ("needs an OAuth
+client") turned out to be wrong once actually checked against the live API.
+
+- **Data source**: `https://web.poecdn.com/api/currency-exchange/<unix_hour_timestamp>` — the
+  same hourly-aggregated feed that powers pathofexile.com's Bulk Item Exchange. **Fully public,
+  no OAuth/API key** (confirmed live — the official docs page reads as if auth might be needed;
+  it isn't). `<unix_hour_timestamp>` is a **path** segment, not a query param despite how the
+  docs phrase it, and must be an already-completed hour — the current in-progress hour returns
+  `{"markets": []}` (confirmed live). `_get_flip_opportunities()`/`fetchFlipOpportunities()` try
+  1-4 completed hours back until one comes back non-empty. The response mixes every league
+  together (Standard, Hardcore, Ruthless, and dozens of private leagues) — filtered to
+  `market.league === <selected league>`.
+- **Currency ID -> display name**: the feed only gives internal metadata paths
+  (`Metadata/Items/Currency/CurrencyRerollRare`), not "Chaos Orb". Resolved via **RePoE**
+  (`raw.githubusercontent.com/brather1ng/RePoE/master/RePoE/data/base_items.min.json`, ~2MB,
+  live-fetched, community-maintained data-mining export) — confirmed live against several known
+  currencies (`CurrencyRerollRare` -> "Chaos Orb", `CurrencyModValues` -> "Divine Orb") before
+  trusting it. Cached far longer than the usual `CACHE_TTL` (`_REPOE_CACHE_TTL`/`REPOE_CACHE_TTL`,
+  6 hours) since this dataset only changes when GGG ships new item types, roughly per-league.
+  **A pair with either ID unmapped is skipped entirely, never guessed** — same "never guess a
+  name" policy as everywhere else in this repo (see the Lessons section's "Monochrome" divination
+  card precedent). Confirmed live that RePoE's snapshot can lag a brand-new league's items (one
+  real example found during development: `CurrencyDeepwater`, an Allflame-league currency, wasn't
+  in RePoE yet) — the skip-don't-guess policy is what keeps that safe.
+- **Ranking methodology, and why it's scoped honestly as a "signal" not a guarantee**: this is
+  *hourly aggregate, delayed* data, not a live orderbook — there's no way to retroactively act on
+  an intra-hour price swing. `spreadPct` (the % difference between a pair's `lowest_ratio` and
+  `highest_ratio` for the hour, normalized to a 1-unit rate on each side) is a **volatility/
+  inefficiency signal** — a wide spread means that pair's rate moved a lot within the hour, worth
+  checking live, never a number to trust as a precise/guaranteed profit. The page states this
+  plainly (`flip_disclaimer`) and every result links to the real Bulk Item Exchange
+  (`pathofexile.com/trade/exchange/<league>`) so the user verifies live pricing before acting,
+  rather than presenting computed numbers as authoritative.
+- **Liquidity is filtered in CHAOS-EQUIVALENT VALUE, not raw per-currency volume — a real bug
+  caught during development, twice.** First attempt summed `volume_traded` across both
+  currencies, which let a healthy, high-volume currency mask a nearly-dead partner (confirmed
+  live: a pair with volumes (99, 2109) summed to a value that ranked it #1 by spread%, and its
+  resolved name was almost certainly a stale/wrong RePoE mapping for a newer item — not a real
+  signal). Requiring the *lesser*-traded side alone was a partial fix, but raw unit counts still
+  aren't comparable across currencies of wildly different value (1000 Portal Scrolls vs. 1000
+  Divine Orbs). The real fix, per explicit user request: `_compute_chaos_values()`/
+  `computeChaosValues()` prices every reachable currency in Chaos-Orb terms via BFS over the
+  trade graph itself (no separate price source needed), and liquidity is
+  `min(volumeA × chaosValueA, volumeB × chaosValueB)`. The threshold is **user-adjustable**
+  (`?minLiquidity=`, chaos-equivalent — the page has a number input + chaos/divine unit toggle +
+  10/100/1000 presets), not a fixed constant — deliberately left as the user's own call rather
+  than this code silently picking a "right" number, since a stricter bar means fewer but more
+  confident results and a looser one means more results but more thin-liquidity noise, and
+  that's a real trade-off with no universally-correct answer.
+- **Pairs whose pool stock hit zero on either side are excluded entirely — `volume_traded` alone
+  can look healthy for a pair that was actually untradeable, a real gap caught by the user live.**
+  User report: a strategy included `Orb of Fusing -> Orb of Alteration` at 175c liquidity, but
+  "there is no market, no one trading this." Checked the raw feed for that exact pair/hour: real
+  `volume_traded` (414/593) but `lowest_stock` of **0** for Orb of Alteration — the pool was
+  drained dry for at least part of the hour, meaning that direction genuinely couldn't execute
+  then, even though past trade volume looked fine. Not an isolated case: 117 of 428 name-resolved
+  pairs in the same hour (27%) showed a zero on one side. Fix: both `_get_flip_opportunities()`
+  and `fetchFlipOpportunities()` now skip a pair outright (in Pass 1, before it can even feed
+  `_compute_chaos_values()`'s pricing BFS) if `lowest_stock` is 0 for either currency that hour.
+  The user's other two live-market discrepancies that same report (Metallic Fossil<->Divine Orb
+  showing 16-24:1 vs. their observed 40:1; Orb of Alteration->Chaos Orb showing a 300 guide vs.
+  their observed 278) were checked the same way and are **not** bugs — both computed averages sit
+  correctly inside that hour's actual `lowest_ratio`/`highest_ratio` range, the market had simply
+  moved past that hour's range by the time it was checked live. That's the inherent, already-
+  disclosed cost of hourly-delayed data (see `flip_disclaimer`) — the stock check above is a real
+  fix because it catches a market that was never really there, not because it can make delayed
+  data current.
+- **Multi-step "flip strategy" cycles** (`_find_flip_cycles()`/`findFlipCycles()`, shown above the
+  single-pair list on the page) — per explicit user request, not just single-pair spreads: finds
+  chains of 3-10 currency swaps that start and end at Chaos Orb and net a profit (e.g. Chaos ->
+  Divine -> Exalted -> Chaos), each step explicitly labeled SELL/BUY. Plain bounded DFS from
+  Chaos Orb (simple-cycle guard + a hard visit-count safety valve), not Bellman-Ford — the ask
+  was "many distinct strategies", not just the one best cycle, and this repo's post-liquidity-
+  filter currency graphs are small/sparse enough (tens of nodes) for that to stay fast (confirmed
+  live, well under a second). A 2-currency round trip is *always* exactly break-even by
+  construction (the B->A edge is the exact mathematical inverse of A->B, since this feed has no
+  separate buy/sell price) — real profit can only come from 3+ distinct currencies, so the search
+  only looks at cycle lengths 3-10.
+  - **A pair can be genuinely liquid AND still have an extreme intra-hour swing** — confirmed
+    live: `Chaos Orb <-> Orb of Fusing` moved from an 11:1 ratio to 1:1 within one hour (spread%
+    1000%) despite six-figure chaos-equivalent volume on both sides. Compounding several such
+    edges across a multi-hop cycle is what produced clearly-implausible 1000%+ "profit"
+    strategies even after the liquidity fix above — liquidity and price stability are different
+    things. `_FLIP_CYCLE_MAX_EDGE_SPREAD_PCT`/`FLIP_CYCLE_MAX_EDGE_SPREAD_PCT` (50%) keeps a
+    volatile pair out of the CYCLE graph specifically without hiding it from the plain single-pair
+    list, where its real spread% is still honestly shown.
+  - Each edge's rate is the **average** of the hour's low/high ratio, not the optimistic extreme
+    — using the optimistic edge would compound across a multi-hop cycle into an even more
+    overstated number than the single-pair spread% trap already avoids by showing the true range
+    instead of a cherry-picked one.
+  - Every step and every strategy carries its own `liquidityChaos`/`minStepLiquidityChaos` so the
+    user can judge a multi-hop chain's confidence hop-by-hop, not just trust an aggregate number.
+  - **Each step also shows a whole-unit "guide"** (`chainWholeAmounts()`, client-side JS only, no
+    backend involvement) — per explicit user request/validation ask: PoE currency isn't
+    divisible, so a raw rate like "1 Chaos -> 0.7 Exalted" isn't an executable trade. This is
+    computed for the WHOLE strategy at once, not per-step independently — an earlier version
+    (`rationalApprox()`, since replaced) rationalized each step's rate on its own and produced
+    **internally inconsistent amounts caught live by the user**: step 1 said "7 Chaos -> 1
+    Metallic Fossil" while step 2 separately said "33 Metallic Fossil -> 2 Divine Orb", even
+    though the chain only ever produced 1 Metallic Fossil from step 1, not 33. `chainWholeAmounts()`
+    instead walks the whole chain ONCE with a single shared starting quantity, rounding each
+    step's output to the nearest whole number and carrying that *exact* number into the next
+    step as its input — so a step's "buy" amount and the next step's "sell" amount are always the
+    literal same number, by construction. The starting amount isn't just "smallest that avoids a
+    step rounding to zero" either — a second bug caught in the same live check: that alone could
+    pick a starting amount so small that per-step rounding error compounded into a wildly wrong
+    overall ratio (a real case: 300/60 = 5x shown, vs. the strategy's actual computed profit of
+    ~2.6x). `CHAIN_ACCURACY_TOLERANCE` (2%, matching this data's own hourly-aggregate precision)
+    searches increasing starting amounts for the smallest one whose overall *rounded* ratio is
+    also within tolerance of the *true* (unrounded) cumulative rate product — accurate and
+    practically small at the same time — falling back to the best candidate found if none meets
+    the tolerance within the search cap (`CHAIN_MAX_START`).
+- **Frontend** (`FLIP_ADVISOR_BODY`/`FLIP_ADVISOR_JS`, `render_flip_advisor_page()`) follows the
+  same composition pattern as every other page. Strategies render as `.flip-strategy-card`s
+  (profit% header + a numbered SELL/BUY step list) above a `.flip-grid`/`.flip-card` grid for the
+  plain single-pair spreads below; reuses the shared header's League selector
+  (`populateLeagueOptions()`, same as every other page) and re-fetches on league or liquidity
+  change. No icons (a deliberate v1 simplification — would need a join against poe.ninja's
+  existing Currency feed by matching resolved names, deferred as a clean follow-up, not needed
+  for the core value).
+- **Same dual-implementation pattern as patch notes**: `boss.py`'s `_get_currency_names()`/
+  `_compute_chaos_values()`/`_find_flip_cycles()`/`_get_flip_opportunities()` and `worker.js`'s
+  JS ports of the same four are independent implementations — same "must be kept in sync" caveat
+  already documented for `FETCH_ENGINE`/`OLD_FETCH_DATA` and the patch-notes parser. The static
+  build's `FLIP_ADVISOR_BASE` constant gets swapped from the local `/api/flipadvisor` to the
+  Worker's `/currency-exchange` proxy the same way `PATCH_NOTES_BASE` is (`build_static.py`'s
+  `OLD_FLIP_ADVISOR_BASE` marker).
+- Not listed in `PAGES` (admin-only, same precedent as `/snipe`/`/poe2-campaign`) — injected into
+  the `poe1` site-menu group by `enableAdminUI()`. Excluded from `sitemap.xml` for the same reason.
+
 ### Admin detection (`admin-extension/`, `SHARED_JS_CHROME`)
 
 A personal "PoE Helper Admin" Chrome extension (unpublished, loaded unpacked — see
@@ -417,7 +551,7 @@ page marked `PAGE_REQUIRES_ADMIN` (currently `/snipe` and `/poe2-campaign`) back
 ### Security
 
 - **HTML-injection hardening (`escAttr()`)**: `it.icon` (poe.ninja's icon URL, including the Astrolabe-specific `image` field), `it.url` (built from poe.ninja's `detailsId` when a price is found), and `it.type` (via `nmeClass()`) are the only fields flowing into `innerHTML`-rendered HTML attributes (`src=`, `href=`, `class=`) that originate from poe.ninja's API rather than this file's own trusted `ENTITIES` data. All three are passed through `escAttr()` (escapes `&"<>`) before interpolation. This defends against a compromised/malformed upstream response breaking out of an attribute and injecting an event handler — HTTPS + the fixed real poe.ninja domain already make this low-likelihood, but it was free to close. **If you add another field sourced from poe.ninja/poe.watch/the forum into an HTML attribute, run it through `escAttr()` too** — boss/item *names* don't need this (they come from `ENTITIES`, which this repo's own maintainer controls). Patch note titles/dates scraped from the forum go through `escAttr()` for the same reason.
-- **`worker.js` reviewed and confirmed safe**: the `/ninja/<path>` and `/forum/patch-notes` proxies always concatenate onto a fixed base string (never a relative-URL resolution against attacker input), so the upstream host can never change regardless of what a client requests — no SSRF. The `/home` redirect (`Response.redirect(url.origin + "/home", 302)`) always targets the Worker's own origin, never an attacker-supplied URL — no open redirect. `withCors()` sends `X-Content-Type-Options: nosniff` as cheap defense-in-depth.
+- **`worker.js` reviewed and confirmed safe**: the `/ninja/<path>`, `/forum/patch-notes`, and `/currency-exchange` proxies always concatenate onto a fixed base string (never a relative-URL resolution against attacker input), so the upstream host can never change regardless of what a client requests — no SSRF. The `/home` redirect (`Response.redirect(url.origin + "/home", 302)`) always targets the Worker's own origin, never an attacker-supplied URL — no open redirect. `withCors()` sends `X-Content-Type-Options: nosniff` as cheap defense-in-depth.
 - **`?league=` query param (local server) is length-capped** (`[:64]` in `do_GET`) — added because `_cache`/`_index_cache` never evict entries, so an unbounded stream of distinct junk league strings would otherwise grow server memory forever. Low severity in practice (the server only binds `127.0.0.1`, never internet-reachable per its existing design), but cheap to close and matches this file's own "fail fast" standard.
 - **Nothing in this repo handles credentials, auth, or user-submitted write operations** — no login, no database, no state-changing endpoints besides the Trade Sniper's own start/poll/stop (which only ever start/stop a background price check, never write anything sensitive). The only external calls are read-only GETs to poe.ninja/poe.watch/the pathofexile.com forum (server-side from `boss.py`, or proxied read-only through `worker.js` for the static build). The Cloudflare Worker itself holds no secrets; Git-connected auto-deploy auth is handled entirely by Cloudflare's own OAuth integration, never a token stored in this repo.
 
@@ -425,13 +559,13 @@ page marked `PAGE_REQUIRES_ADMIN` (currently `/snipe` and `/poe2-campaign`) back
 
 `boss.py`'s `PAGE` is reused **unchanged** except for one swap: `fetchData()`. Everything else (CSS, HTML, `render()`, i18n, the theme/league controls above) is identical between the local server and the static build — there's no separate frontend codebase to keep in sync.
 
-- **Why it exists**: poe.ninja sends no `Access-Control-Allow-Origin` header (confirmed via `curl`), so a browser can't call it directly from a backend-less page. `worker/worker.js` reverse-proxies poe.ninja (`/ninja/<path>`), poe.watch (`/watch/compact`), and the pathofexile.com forum (`/forum/patch-notes`) with CORS added, edge-cached via `cf: {cacheTtl: 300}` (mirrors `boss.py`'s own `CACHE_TTL`, but shared across every visitor instead of per-browser).
+- **Why it exists**: poe.ninja sends no `Access-Control-Allow-Origin` header (confirmed via `curl`), so a browser can't call it directly from a backend-less page. `worker/worker.js` reverse-proxies poe.ninja (`/ninja/<path>`), poe.watch (`/watch/compact`), the pathofexile.com forum (`/forum/patch-notes`), and the currency-exchange feed + RePoE (`/currency-exchange`) with CORS added, edge-cached via `cf: {cacheTtl: 300}` (mirrors `boss.py`'s own `CACHE_TTL`, but shared across every visitor instead of per-browser — RePoE specifically uses a much longer edge-cache TTL, see the Flip Advisor section above).
 - **One Worker does double duty**: the same `boss-farm-calculator` Worker also serves the built dashboard as static assets (`[assets] directory = "../build"` in `wrangler.toml`) — Cloudflare tries a static-asset match *before* invoking `worker.js`'s own `fetch()` handler, so that handler only ever sees requests that are either a proxy route or a genuinely unmatched path, which it 302-redirects to `/home`.
   - **Real platform quirk, confirmed live**: the bare root `/` does NOT fall through to `worker.js` like every other unmatched path does — Cloudflare's static-asset layer does its own implicit "look for index.html" check there and returns its own bare 404 first. Fix was a real `build/index.html` file (a tiny client-side redirect stub to `/home`), not more Worker logic — don't try to "fix" this in `worker.js`, it can't intercept that case.
 - **`build_static.py`** imports `boss.py` directly (`ENTITIES`, `PAGE`, `OVERVIEW_SLUG`, `EXCHANGE_CATEGORIES`, etc. — all single-sourced, nothing duplicated) and does two textual substitutions on `PAGE`: `__POLL_MS__` (same as `boss.py`) and a full-text replace of the `fetchData()` function (`OLD_FETCH_DATA` constant — **must match `boss.py`'s `fetchData()` byte-for-byte** or the build raises `RuntimeError` by design; update both together whenever `fetchData()` changes) with `FETCH_ENGINE`, a client-side JS port of `build_index()`/`build_payload()` that calls the Worker instead of poe.ninja/poe.watch directly. Kept as a close line-by-line translation of the Python on purpose, including the same floor-price/`chaos_unided`-override/"no ceiling below the floor" logic — verified against `boss.py`'s actual behavior with a mocked-`fetch` Node test (not committed; rebuild one in the scratchpad if you touch the pricing logic again).
   - The index in `FETCH_ENGINE` is a `Map<name, Map<type, entry>>`, not a single string-keyed map — item names routinely contain spaces (`"The Rippling Thoughts"`), so a delimiter-joined string key isn't safely reversible (this was a real bug caught before it shipped).
 - **Two independent things read `currentLeague`**: `boss.py`'s own `fetchData()` (used locally, appends `?league=` to `/api/data` only if set — `do_GET` parses that query param and falls back to the server's `--league` default) and `FETCH_ENGINE`'s `fetchData()` (`currentLeague || LEAGUE`, the embedded build-time default). Both must be kept in sync with any future change to the league-selection UI.
-- **`build_static.py` builds all four pages**: `build/home/index.html`, `build/bosses/index.html` (via `render_page()`, the pricing-engine swap described above), `build/snipe/index.html`, and `build/poe2-campaign/index.html` (the latter three need no pricing-engine swap — only `__LEAGUE_JSON__` gets substituted, same as `boss.py`'s own `main()` does locally). `sitemap.xml` lists `/home` and `/bosses` (`/snipe`/`/poe2-campaign` deliberately left out while admin-only/unadvertised, same reasoning as before).
+- **`build_static.py` builds all five pages**: `build/home/index.html`, `build/bosses/index.html` (via `render_page()`, the pricing-engine swap described above), `build/snipe/index.html`, `build/poe2-campaign/index.html`, and `build/flip-advisor/index.html` (the latter four need no pricing-engine swap — only `__LEAGUE_JSON__` gets substituted, same as `boss.py`'s own `main()` does locally; `/home` and `/flip-advisor` additionally get their own small `PATCH_NOTES_BASE`/`FLIP_ADVISOR_BASE` URL swaps, see their own sections above). `sitemap.xml` lists `/home` and `/bosses` (`/snipe`/`/poe2-campaign`/`/flip-advisor` deliberately left out while admin-only/unadvertised, same reasoning as before).
 - **`wrangler.toml`'s Durable Object migrations are additive, never edited in place**: `SnipeSession` was introduced as `tag = "v2"` (`deleted_classes: ["SnipeTestDO"]` from the throwaway prototype used to validate the WebSocket approach, `new_sqlite_classes: ["SnipeSession"]`) layered after the original `tag = "v1"` migration — Cloudflare requires migration history to be append-only. If `SnipeSession`'s shape ever needs to change in a way that isn't backward-compatible with existing running instances, add a new `tag = "v3"` migration; don't rewrite `v1`/`v2`.
 - **Regenerate command**: `python build_static.py --worker-url https://poe-farm-helper.com --league Allflame --poll 120 --out build`, then `cd worker && wrangler deploy` (or push, if Git-connected Workers Builds auto-deploy is set up — see `wrangler.toml`'s `[build]` block, which runs `build_static.py` itself in Cloudflare's CI). **Confirmed live**: Cloudflare's Workers Builds environment does have `python` available — the `[custom build] Running: python ../build_static.py ...` step has succeeded on every deploy so far, both the Git-connected pipeline and a plain local `wrangler deploy` (which also runs the `[build]` command first).
 - **Custom domain (`poe-farm-helper.com`) bound via `routes` in `wrangler.toml`** (`{ pattern = "poe-farm-helper.com", custom_domain = true }` — note: Custom Domain routes take a **bare hostname only**, `poe-farm-helper.com/*` errors with "Wildcard operators (*) are not allowed in Custom Domains"). **`workers_dev = true` is set explicitly** alongside it — Wrangler disables `workers_dev` by default the moment any custom domain route exists, which silently broke the pre-existing `boss-farm-calculator.<account>.workers.dev` URL the first time this was deployed (a real outage, caught immediately by re-curling it). Anything that depends on the `.workers.dev` URL specifically (e.g. AdSense site verification, set up before the custom domain existed) needs that URL to keep working — don't remove `workers_dev = true` without checking what still points at it. After binding a brand-new custom domain, expect an SSL-provisioning delay (schannel/curl error `SEC_E_ILLEGAL_MESSAGE` while DNS already resolves correctly to Cloudflare's IPs) — this clears on its own, it isn't a config error to chase.

@@ -106,6 +106,210 @@ async function fetchPatchSnippet(threadUrl) {
   }
 }
 
+// --------------------------------------------------------------------------- //
+// Currency Exchange flip advisor (/flip-advisor, PoE1 only). Mirrors boss.py's
+// _get_currency_names()/_compute_chaos_values()/_find_flip_cycles()/
+// _get_flip_opportunities() — same "two independent implementations, must be
+// kept in sync" caveat already documented for FETCH_ENGINE/OLD_FETCH_DATA and
+// the patch-notes parser above. See boss.py for the full reasoning:
+// - liquidity is filtered in CHAOS-EQUIVALENT VALUE (volume * that
+//   currency's own Chaos price), not raw per-currency unit counts, and the
+//   threshold is user-adjustable (?minLiquidity=), not a fixed constant —
+//   raw volume isn't comparable across currencies of wildly different value.
+// - a pair can be genuinely liquid AND still have an extreme intra-hour
+//   swing (confirmed live: Chaos<->Orb of Fusing moved 11:1 -> 1:1 despite
+//   six-figure volume) — FLIP_CYCLE_MAX_EDGE_SPREAD_PCT keeps a volatile
+//   pair out of the CYCLE graph specifically (it's still shown in the plain
+//   pair list) so it can't compound into an implausible multi-hop number.
+// - never guess an unmapped currency name; a 2-currency round trip is always
+//   exactly break-even by construction (B->A is the exact inverse of A->B),
+//   so only 3+ hop cycles can ever be profitable.
+const CURRENCY_EXCHANGE_URL = "https://web.poecdn.com/api/currency-exchange";
+const REPOE_BASE_ITEMS_URL = "https://raw.githubusercontent.com/brather1ng/RePoE/master/RePoE/data/base_items.min.json";
+const REPOE_CACHE_TTL = 6 * 3600;
+const FLIP_DEFAULT_MIN_LIQUIDITY_CHAOS = 100;
+const FLIP_MAX_RESULTS = 30;
+const FLIP_CYCLE_START = "Chaos Orb";
+const FLIP_CYCLE_MIN_STEPS = 3;
+const FLIP_CYCLE_MAX_STEPS = 10;
+const FLIP_CYCLE_MAX_RESULTS = 20;
+const FLIP_CYCLE_MAX_VISITS = 300000;
+const FLIP_CYCLE_MAX_EDGE_SPREAD_PCT = 50;
+
+async function fetchCurrencyNames() {
+  const resp = await fetch(REPOE_BASE_ITEMS_URL, {
+    headers: { "User-Agent": UA },
+    cf: { cacheTtl: REPOE_CACHE_TTL, cacheEverything: true },
+  });
+  const data = await resp.json();
+  const names = {};
+  for (const [k, v] of Object.entries(data)) {
+    if (k.startsWith("Metadata/Items/Currency/") && v && v.name) names[k] = v.name;
+  }
+  return names;
+}
+
+async function fetchCurrencyExchangeHour(hourTs) {
+  const resp = await fetch(`${CURRENCY_EXCHANGE_URL}/${hourTs}`, {
+    headers: { "User-Agent": UA },
+    cf: { cacheTtl: CACHE_TTL, cacheEverything: true },
+  });
+  return resp.json();
+}
+
+// currency name -> how many Chaos Orbs 1 unit is worth, via BFS from `base`
+// over the FULL (unfiltered) rate graph. See boss.py's _compute_chaos_values
+// docstring for why BFS naturally prefers a currency's direct Chaos pair
+// when one exists.
+function computeChaosValues(fullGraph, base) {
+  if (!fullGraph[base]) return {};
+  const values = { [base]: 1.0 };
+  let queue = [base];
+  while (queue.length) {
+    const nextQueue = [];
+    for (const node of queue) {
+      for (const [neighbor, rate] of Object.entries(fullGraph[node] || {})) {
+        if (neighbor in values || rate <= 0) continue;
+        values[neighbor] = values[node] / rate;
+        nextQueue.push(neighbor);
+      }
+    }
+    queue = nextQueue;
+  }
+  return values;
+}
+
+// Simple-cycle DFS from `start` back to `start`, 3-10 hops — see boss.py's
+// _find_flip_cycles docstring for the full reasoning (exhaustive-but-bounded
+// rather than shortest-path, since the ask is many distinct strategies, not
+// just the single best one).
+function findFlipCycles(graph, start) {
+  if (!graph[start]) return [];
+  const results = [];
+  let visits = 0;
+  const path = [start];
+  const pathSet = new Set([start]);
+
+  function dfs(current, rateSoFar, depth) {
+    visits++;
+    if (visits > FLIP_CYCLE_MAX_VISITS) return;
+    if (depth >= FLIP_CYCLE_MIN_STEPS && graph[current] && graph[current][start]) {
+      const finalRate = rateSoFar * graph[current][start];
+      if (finalRate > 1.0) results.push({ path: [...path, start], rate: finalRate });
+    }
+    if (depth >= FLIP_CYCLE_MAX_STEPS) return;
+    for (const [nxt, rate] of Object.entries(graph[current] || {})) {
+      if (nxt === start || pathSet.has(nxt)) continue;
+      path.push(nxt); pathSet.add(nxt);
+      dfs(nxt, rateSoFar * rate, depth + 1);
+      path.pop(); pathSet.delete(nxt);
+    }
+  }
+
+  dfs(start, 1.0, 0);
+  results.sort((x, y) => y.rate - x.rate);
+  return results.slice(0, FLIP_CYCLE_MAX_RESULTS);
+}
+
+async function fetchFlipOpportunities(league, minLiquidityChaosRaw) {
+  const minLiquidityChaos = Number.isFinite(minLiquidityChaosRaw) && minLiquidityChaosRaw >= 0
+    ? minLiquidityChaosRaw : FLIP_DEFAULT_MIN_LIQUIDITY_CHAOS;
+  const names = await fetchCurrencyNames();
+  const nowSec = Math.floor(Date.now() / 1000);
+  const currentHour = nowSec - (nowSec % 3600);
+  let data = null, hourTs = null;
+  for (const hoursBack of [1, 2, 3, 4]) {
+    const candidateTs = currentHour - hoursBack * 3600;
+    const candidate = await fetchCurrencyExchangeHour(candidateTs);
+    if (candidate.markets && candidate.markets.length) { data = candidate; hourTs = candidateTs; break; }
+  }
+  const result = { items: [], strategies: [], hourTimestamp: hourTs, minLiquidityChaos, divineRateChaos: null };
+  if (!data) return result;
+
+  // Pass 1: full rate graph (every name-resolved pair, unfiltered) -> price
+  // every reachable currency in Chaos terms.
+  const leagueMarkets = data.markets.filter((m) => m.league === league);
+  const fullGraph = {};
+  const pairCache = [];
+  for (const m of leagueMarkets) {
+    const pair = m.market_pair || [];
+    if (pair.length !== 2) continue;
+    const [a, b] = pair;
+    const nameA = names[a], nameB = names[b];
+    if (!nameA || !nameB) continue; // never guess a name
+    const lo = m.lowest_ratio || {}, hi = m.highest_ratio || {};
+    if (!(lo[a] && lo[b] && hi[a] && hi[b])) continue;
+    // Skip pairs whose pool stock hit zero on either side during the hour —
+    // volume_traded (past activity only) misses this; see boss.py's mirror
+    // of this check for the confirmed live example (Orb of Fusing<->Orb of
+    // Alteration) that prompted it.
+    const stockLo = m.lowest_stock || {};
+    if (!(stockLo[a] > 0) || !(stockLo[b] > 0)) continue;
+    const rateLow = lo[b] / lo[a], rateHigh = hi[b] / hi[a];
+    if (rateLow <= 0) continue;
+    const loRate = Math.min(rateLow, rateHigh), hiRate = Math.max(rateLow, rateHigh);
+    const avgRate = (loRate + hiRate) / 2;
+    if (avgRate <= 0) continue;
+    fullGraph[nameA] = fullGraph[nameA] || {}; fullGraph[nameA][nameB] = avgRate;
+    fullGraph[nameB] = fullGraph[nameB] || {}; fullGraph[nameB][nameA] = 1 / avgRate;
+    const vol = m.volume_traded || {};
+    pairCache.push([nameA, nameB, loRate, hiRate, vol[a] || 0, vol[b] || 0]);
+  }
+
+  const chaosValues = computeChaosValues(fullGraph, FLIP_CYCLE_START);
+  result.divineRateChaos = chaosValues["Divine Orb"] != null ? chaosValues["Divine Orb"] : null;
+
+  // Pass 2: filter by chaos-equivalent liquidity, using the prices just derived.
+  const items = [];
+  const graph = {};
+  const edgeLiquidity = {};
+  for (const [nameA, nameB, loRate, hiRate, volA, volB] of pairCache) {
+    const cvA = chaosValues[nameA], cvB = chaosValues[nameB];
+    if (cvA == null || cvB == null) continue; // unreachable from Chaos Orb this hour
+    const liquidityChaos = Math.min(volA * cvA, volB * cvB);
+    if (liquidityChaos < minLiquidityChaos) continue;
+    const spreadPct = (hiRate - loRate) / loRate * 100;
+    items.push({
+      nameA, nameB,
+      rateLow: Math.round(loRate * 10000) / 10000, rateHigh: Math.round(hiRate * 10000) / 10000,
+      spreadPct: Math.round(spreadPct * 10) / 10,
+      liquidityChaos: Math.round(liquidityChaos * 10) / 10,
+    });
+    if (spreadPct <= FLIP_CYCLE_MAX_EDGE_SPREAD_PCT) {
+      const avgRate = (loRate + hiRate) / 2;
+      graph[nameA] = graph[nameA] || {}; graph[nameA][nameB] = avgRate;
+      graph[nameB] = graph[nameB] || {}; graph[nameB][nameA] = 1 / avgRate;
+      const roundedLiq = Math.round(liquidityChaos * 10) / 10;
+      edgeLiquidity[`${nameA}→${nameB}`] = roundedLiq;
+      edgeLiquidity[`${nameB}→${nameA}`] = roundedLiq;
+    }
+  }
+  items.sort((x, y) => y.spreadPct - x.spreadPct);
+
+  const strategies = [];
+  for (const cyc of findFlipCycles(graph, FLIP_CYCLE_START)) {
+    const path = cyc.path;
+    const steps = [];
+    for (let i = 0; i < path.length - 1; i++) {
+      const frm = path[i], to = path[i + 1];
+      steps.push({
+        sell: frm, buy: to, rate: Math.round(graph[frm][to] * 10000) / 10000,
+        liquidityChaos: edgeLiquidity[`${frm}→${to}`],
+      });
+    }
+    strategies.push({
+      steps,
+      profitPct: Math.round((cyc.rate - 1) * 10000) / 100,
+      endAmount: Math.round(cyc.rate * 10000) / 10000,
+      minStepLiquidityChaos: Math.min(...steps.map((s) => s.liquidityChaos)),
+    });
+  }
+
+  result.items = items.slice(0, FLIP_MAX_RESULTS);
+  result.strategies = strategies;
+  return result;
+}
+
 function withCors(body, status, contentType) {
   return new Response(body, {
     status,
@@ -729,7 +933,7 @@ export default {
       return withCors(await doResp.text(), doResp.status, "application/json");
     }
 
-    if (!url.pathname.startsWith("/ninja/") && url.pathname !== "/watch/compact" && url.pathname !== "/forum/patch-notes") {
+    if (!url.pathname.startsWith("/ninja/") && url.pathname !== "/watch/compact" && url.pathname !== "/forum/patch-notes" && url.pathname !== "/currency-exchange") {
       // Not an API-proxy path, and no static asset matched (Cloudflare tries
       // that first) — send the visitor to the dashboard's real landing page.
       return Response.redirect(url.origin + "/home", 302);
@@ -744,6 +948,17 @@ export default {
       try {
         const items = await fetchPatchNotes(game);
         return withCors(JSON.stringify({ ok: true, items }), 200);
+      } catch (e) {
+        return withCors(JSON.stringify({ ok: false, error: String(e) }), 502);
+      }
+    }
+
+    if (url.pathname === "/currency-exchange") {
+      const league = url.searchParams.get("league") || "Standard";
+      const minLiquidityRaw = parseFloat(url.searchParams.get("minLiquidity"));
+      try {
+        const data = await fetchFlipOpportunities(league, minLiquidityRaw);
+        return withCors(JSON.stringify({ ok: true, ...data }), 200);
       } catch (e) {
         return withCors(JSON.stringify({ ok: false, error: String(e) }), 502);
       }

@@ -425,6 +425,25 @@ def render_poe2_campaign_page(league, worker_url, poll_ms):
                     .replace("__CANONICAL_URL__", canonical_url))
 
 
+# Same reasoning/pattern as OLD_PATCH_NOTES_BASE above: boss.py's FLIP_ADVISOR_JS
+# hits the local dev server's own /api/flipadvisor relatively; the static build
+# needs the Worker's /currency-exchange proxy instead (absolute URL).
+OLD_FLIP_ADVISOR_BASE = "const FLIP_ADVISOR_BASE = '/api/flipadvisor';"
+
+
+def render_flip_advisor_page(league, worker_url, poll_ms):
+    canonical_url = worker_url.rstrip("/") + "/flip-advisor"
+    html = (boss.render_flip_advisor_page().replace("__POLL_MS__", str(poll_ms))
+                    .replace("__LEAGUE_JSON__", json.dumps(league))
+                    .replace("__CANONICAL_URL__", canonical_url))
+    if OLD_FLIP_ADVISOR_BASE not in html:
+        raise RuntimeError("FLIP_ADVISOR_BASE line not found in boss.render_flip_advisor_page() — "
+                            "boss.py's FLIP_ADVISOR_JS changed shape; update OLD_FLIP_ADVISOR_BASE in build_static.py to match.")
+    new_base = "const FLIP_ADVISOR_BASE = " + json.dumps(worker_url.rstrip("/") + "/currency-exchange") + ";"
+    html = html.replace(OLD_FLIP_ADVISOR_BASE, new_base, 1)
+    return html
+
+
 # Cloudflare's static-asset layer does an implicit "look for index.html" check
 # at the bare root that returns its own 404 without ever invoking worker.js's
 # fetch() handler (confirmed live — every other unmatched path correctly
@@ -461,32 +480,36 @@ def main():
     bosses_dir = out_dir / "bosses"
     snipe_dir = out_dir / "snipe"
     poe2_dir = out_dir / "poe2-campaign"
-    for d in (home_dir, bosses_dir, snipe_dir, poe2_dir):
+    flip_dir = out_dir / "flip-advisor"
+    for d in (home_dir, bosses_dir, snipe_dir, poe2_dir, flip_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     home_html = render_home_page(args.league, args.worker_url, args.poll * 1000)
     html = render_page(args.league, args.worker_url, args.poll * 1000)
     snipe_html = render_snipe_page(args.league, args.worker_url, args.poll * 1000)
     poe2_html = render_poe2_campaign_page(args.league, args.worker_url, args.poll * 1000)
+    flip_html = render_flip_advisor_page(args.league, args.worker_url, args.poll * 1000)
     if not args.no_minify:
         home_html = boss.minify_page(home_html)
         html = boss.minify_page(html)
         snipe_html = boss.minify_page(snipe_html)
         poe2_html = boss.minify_page(poe2_html)
+        flip_html = boss.minify_page(flip_html)
     (home_dir / "index.html").write_text(home_html, encoding="utf-8")
     (bosses_dir / "index.html").write_text(html, encoding="utf-8")
     (snipe_dir / "index.html").write_text(snipe_html, encoding="utf-8")
     (poe2_dir / "index.html").write_text(poe2_html, encoding="utf-8")
+    (flip_dir / "index.html").write_text(flip_html, encoding="utf-8")
     (out_dir / "index.html").write_text(ROOT_REDIRECT, encoding="utf-8")
 
     base = args.worker_url.rstrip("/")
     (out_dir / "robots.txt").write_text(
         f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n", encoding="utf-8")
     (out_dir / "sitemap.xml").write_text(
-        # /snipe and /poe2-campaign deliberately left out of the sitemap while they're
-        # admin-only/hidden from the site menu (see PAGES in boss.py) — both pages still
-        # build and work at their URLs for direct/manual access, just aren't advertised
-        # for search engines to crawl yet.
+        # /snipe, /poe2-campaign, and /flip-advisor deliberately left out of the sitemap
+        # while they're admin-only/hidden from the site menu (see PAGES in boss.py) — all
+        # three still build and work at their URLs for direct/manual access, just aren't
+        # advertised for search engines to crawl yet.
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
         f"  <url><loc>{base}/home</loc></url>\n"
@@ -497,6 +520,7 @@ def main():
     print(f"Wrote {bosses_dir / 'index.html'} ({len(html):,} bytes)")
     print(f"Wrote {snipe_dir / 'index.html'} ({len(snipe_html):,} bytes)")
     print(f"Wrote {poe2_dir / 'index.html'} ({len(poe2_html):,} bytes)")
+    print(f"Wrote {flip_dir / 'index.html'} ({len(flip_html):,} bytes)")
     print(f"Wrote {out_dir / 'index.html'} (redirect -> /home)")
     print(f"Wrote {out_dir / 'robots.txt'} and {out_dir / 'sitemap.xml'}")
     print(f"  league={args.league}  worker={args.worker_url}  poll={args.poll}s")

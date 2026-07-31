@@ -1,13 +1,16 @@
 # Task Backlog
 
-## Pending
+## Done
 
-- [ ] **Currency Exchange flip advisor (PoE 1 only)** — new page/feature that uses the
-      official Currency Exchange API (https://www.pathofexile.com/developer/docs/reference#currencyexchange)
-      to surface profitable currency-flipping opportunities. Needs an OAuth client
-      (currency-exchange endpoints require authentication, unlike the plain trade
-      search/fetch endpoints this repo already uses) — scope out the auth flow before
-      implementation. PoE 1 only, not PoE 2.
+- [x] **Currency Exchange flip advisor (PoE 1 only)** — shipped as `/flip-advisor`
+      (admin-only). Turned out the original scoping note was wrong: `web.poecdn.com/api/
+      currency-exchange/<hour>` is fully public, no OAuth needed (confirmed live). Ranks
+      currency pairs by historical hourly spread% (a volatility signal, not a live-orderbook
+      guarantee — the page says so explicitly). Currency ID -> display name resolved via
+      RePoE's `base_items.min.json` (live-fetched, long-TTL cached); pairs with an unmapped
+      ID are skipped rather than guessed. See `ARCHITECTURE.md` for the full writeup.
+
+## Pending
 
 - [ ] **Atlas Tree / Scarab popularity page (PoE 1 only)** — new page showing the most-used
       atlas trees and scarabs, sourced from poe.ninja

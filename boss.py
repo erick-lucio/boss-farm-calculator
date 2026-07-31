@@ -599,6 +599,330 @@ def _get_patch_notes(game):
     return result
 
 
+# --------------------------------------------------------------------------- #
+# Currency Exchange flip advisor (/flip-advisor, PoE1 only)
+# --------------------------------------------------------------------------- #
+# https://web.poecdn.com/api/currency-exchange/<hour> is the automated
+# bulk-currency-exchange market's hourly aggregate feed — fully public, no
+# OAuth (confirmed live; the official docs page implies auth might be needed,
+# it isn't). `id` is a PATH segment, not a query param despite how the docs
+# phrase it, and must be an already-completed hour — the current in-progress
+# hour returns an empty markets list (confirmed live).
+CURRENCY_EXCHANGE_URL = "https://web.poecdn.com/api/currency-exchange"
+REPOE_BASE_ITEMS_URL = "https://raw.githubusercontent.com/brather1ng/RePoE/master/RePoE/data/base_items.min.json"
+# RePoE only updates when GGG ships new item types (roughly per-league) —
+# nowhere near CACHE_TTL's 5-minute freshness need, and it's a ~2MB fetch, so
+# it gets its own much longer cache lifetime.
+_REPOE_CACHE_TTL = 6 * 3600
+# Liquidity is filtered in CHAOS-EQUIVALENT VALUE, not raw per-currency unit
+# counts — a real bug found during development: raw volume isn't comparable
+# across currencies (1000 Portal Scrolls and 1000 Divine Orbs are wildly
+# different amounts of real economic value), which is exactly how a
+# near-worthless, barely-traded pair could look "liquid" by raw count alone.
+# `_compute_chaos_values()` prices every reachable currency in Chaos-Orb
+# terms via the trade graph itself; each pair's liquidity is then
+# min(volume_A * chaosValue_A, volume_B * chaosValue_B) — the LESSER side,
+# not summed (a cheap, high-volume currency can otherwise mask a nearly-dead
+# partner). The threshold is user-adjustable (`min_liquidity` query param,
+# chaos-equivalent) rather than a fixed constant — confirmed live that a
+# strict bar (few results, all plausible: Chaos<->Divine, Chaos<->Exalted
+# etc.) and a loose one (many results, but reintroducing thin-liquidity/
+# bad-mapping noise like the "Clear Oil" case below) are both legitimate
+# depending on how much the user wants to trade off count vs. confidence —
+# not this code's call to make silently.
+_FLIP_DEFAULT_MIN_LIQUIDITY_CHAOS = 100
+_FLIP_MAX_RESULTS = 30
+
+
+def _get_currency_names():
+    """internal item id ("Metadata/Items/Currency/CurrencyRerollRare") ->
+    display name ("Chaos Orb"), sourced from RePoE (a community-maintained,
+    unauthenticated data-mining export — confirmed live and accurate against
+    several known currencies before relying on it). Best-effort: on failure,
+    returns whatever's cached (even if stale) rather than nothing, since
+    losing this mapping shouldn't take down a working flip-advisor result
+    just because RePoE happened to be unreachable this cycle.
+    """
+    now = time.time()
+    key = ("currencynames",)
+    with _lock:
+        c = _cache.get(key)
+        if c and now - c[0] < _REPOE_CACHE_TTL:
+            return c[1]
+    try:
+        req = urllib.request.Request(REPOE_BASE_ITEMS_URL, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=40) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        names = {k: v["name"] for k, v in data.items()
+                 if k.startswith("Metadata/Items/Currency/") and v.get("name")}
+        with _lock:
+            _cache[key] = (now, names)
+        return names
+    except Exception as e:
+        print(f"  [warning] RePoE currency names: {e}")
+        with _lock:
+            c = _cache.get(key)
+        return c[1] if c else {}
+
+
+def _fetch_currency_exchange_hour(hour_ts):
+    req = urllib.request.Request(f"{CURRENCY_EXCHANGE_URL}/{hour_ts}", headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _compute_chaos_values(full_graph, base="Chaos Orb"):
+    """currency name -> how many Chaos Orbs 1 unit of it is worth, derived
+    from the trade graph itself via BFS from `base` (rather than needing a
+    separate price source). BFS visits `base`'s DIRECT neighbors first, so a
+    currency that trades directly against Chaos always gets that direct rate
+    rather than a noisier multi-hop derived one; only currencies with no
+    direct Chaos pair fall back to a value derived through whatever
+    intermediate currency connects them. `full_graph` must be built from
+    EVERY resolved pair regardless of liquidity — a currency's own trading
+    volume being too thin to trust as a *result* doesn't mean its rate can't
+    still usefully help price a DIFFERENT currency it connects to.
+    """
+    if base not in full_graph:
+        return {}
+    values = {base: 1.0}
+    queue = [base]
+    while queue:
+        nxt_queue = []
+        for node in queue:
+            for neighbor, rate in full_graph.get(node, {}).items():
+                if neighbor in values or rate <= 0:
+                    continue
+                values[neighbor] = values[node] / rate
+                nxt_queue.append(neighbor)
+        queue = nxt_queue
+    return values
+
+
+# Multi-hop cycle search — see _find_flip_cycles()'s own docstring for the
+# full reasoning. Every currency-exchange pair yields TWO graph edges (A->B
+# and B->A); B->A is approximated as the exact mathematical inverse of A->B
+# (this feed has no separate buy/sell price, only one pool ratio per pair —
+# see the rate-averaging note in the main loop below), which means a
+# 2-currency round trip (A->B->A) is *always* exactly break-even by
+# construction and can never appear as "profitable" — genuine profit can
+# only come from a cycle through 3+ distinct currencies (real triangular+
+# arbitrage), so the search only looks at cycle lengths 3-10.
+_FLIP_CYCLE_START = "Chaos Orb"  # the de facto base/reference currency for trading
+_FLIP_CYCLE_MIN_STEPS = 3
+_FLIP_CYCLE_MAX_STEPS = 10
+_FLIP_CYCLE_MAX_RESULTS = 20
+_FLIP_CYCLE_MAX_VISITS = 300000  # safety valve against pathological graph blowup
+# A pair can be genuinely liquid (high chaos-equivalent volume on both sides)
+# and STILL have an extreme intra-hour price swing — confirmed live: Chaos<->
+# Orb of Fusing moved from an 11:1 ratio to 1:1 within one hour (spread_pct
+# 1000%) despite six-figure volume on both sides. Liquidity and price
+# stability are different things; compounding several such edges across a
+# multi-hop cycle is what produced clearly-implausible 1000%+ "profit"
+# strategies even after the liquidity fix above. Capping which pairs are
+# trusted as CYCLE-GRAPH edges (independent of the liquidity filter) is what
+# actually fixes it — the single-pair spread list below still shows a
+# high-spread pair's real number regardless, since that's honestly
+# informative there; it just isn't trusted to compound through a cycle.
+_FLIP_CYCLE_MAX_EDGE_SPREAD_PCT = 50
+
+
+def _find_flip_cycles(graph, start):
+    """Simple-cycle DFS from `start` back to `start`, 3-10 hops, keeping
+    every cycle whose compounded rate product is profitable (> 1.0) —
+    "compounded" meaning literally: start with 1 unit of `start`, multiply by
+    each hop's rate in sequence, see if you end up with more than 1.
+
+    Deliberately exhaustive-but-bounded rather than a shortest-path/Bellman-
+    Ford style algorithm: the ask here is "show me the top 20 distinct
+    strategies", not just the single best cycle, and this repo's currency
+    graphs are small/sparse enough (tens of nodes, a few hundred edges at
+    most, after the min-volume filter) for plain DFS with a node-revisit
+    guard (simple cycles only) and a hard visit-count safety valve to stay
+    fast — confirmed live at well under a second for a real league's graph.
+    """
+    if start not in graph:
+        return []
+    results = []
+    visits = [0]
+    path = [start]
+    path_set = {start}
+
+    def dfs(current, rate_so_far, depth):
+        visits[0] += 1
+        if visits[0] > _FLIP_CYCLE_MAX_VISITS:
+            return
+        if depth >= _FLIP_CYCLE_MIN_STEPS and start in graph.get(current, {}):
+            final_rate = rate_so_far * graph[current][start]
+            if final_rate > 1.0:
+                results.append({"path": list(path) + [start], "rate": final_rate})
+        if depth >= _FLIP_CYCLE_MAX_STEPS:
+            return
+        for nxt, rate in graph.get(current, {}).items():
+            if nxt == start or nxt in path_set:
+                continue
+            path.append(nxt)
+            path_set.add(nxt)
+            dfs(nxt, rate_so_far * rate, depth + 1)
+            path.pop()
+            path_set.discard(nxt)
+
+    dfs(start, 1.0, 0)
+    results.sort(key=lambda r: -r["rate"])
+    return results[:_FLIP_CYCLE_MAX_RESULTS]
+
+
+def _get_flip_opportunities(league, min_liquidity_chaos=None):
+    """Top currency-exchange pairs for `league` (ranked by historical spread%
+    over the last completed hour) plus multi-hop "flip strategy" cycles
+    (see _find_flip_cycles()), both filtered by a user-adjustable
+    chaos-equivalent liquidity floor (see the constant's own comment for why
+    that's the right unit — raw per-currency volume isn't comparable).
+
+    This is HOURLY AGGREGATE, DELAYED data, not a live orderbook — there is
+    no way to retroactively act on an intra-hour price swing. Both
+    `spread_pct` and a strategy's profit% are volatility/inefficiency
+    SIGNALS from the last completed hour, never a guaranteed live profit —
+    each edge's rate is the AVERAGE of that hour's lowest_ratio/
+    highest_ratio-derived rate (not the optimistic extreme — using the
+    optimistic edge would compound across a multi-hop cycle into wildly
+    overstated "profit", the same trap the single-pair spread% metric
+    itself avoids by showing the true range instead of one cherry-picked
+    number). Pairs whose pool stock hit zero on either side during the hour
+    are excluded entirely (see the lowest_stock check below) — volume_traded
+    alone can look healthy for a pair that was actually untradeable for
+    part of the hour. The frontend must present both as signals to verify
+    live, not precise numbers to trust.
+    """
+    min_liquidity_chaos = (
+        _FLIP_DEFAULT_MIN_LIQUIDITY_CHAOS if min_liquidity_chaos is None
+        else max(0.0, min_liquidity_chaos)
+    )
+    now = time.time()
+    key = ("flipadvisor", league, min_liquidity_chaos)
+    with _lock:
+        c = _cache.get(key)
+        if c and now - c[0] < CACHE_TTL:
+            return c[1]
+    result = {"items": [], "strategies": [], "hourTimestamp": None,
+              "minLiquidityChaos": min_liquidity_chaos, "divineRateChaos": None}
+    try:
+        names = _get_currency_names()
+        current_hour = int(now) - (int(now) % 3600)
+        data = None
+        hour_ts = None
+        # The in-progress hour is always empty; older ones can occasionally
+        # be too (e.g. right after a server restart with no traffic logged
+        # yet) — try a few completed hours back before giving up.
+        for hours_back in (1, 2, 3, 4):
+            candidate_ts = current_hour - hours_back * 3600
+            candidate = _fetch_currency_exchange_hour(candidate_ts)
+            if candidate.get("markets"):
+                data, hour_ts = candidate, candidate_ts
+                break
+        if data:
+            # Pass 1: build the FULL rate graph (every name-resolved pair,
+            # no liquidity filtering yet) and price every reachable currency
+            # in Chaos terms from it — see _compute_chaos_values()'s
+            # docstring for why this needs the unfiltered graph.
+            league_markets = [m for m in data["markets"] if m.get("league") == league]
+            full_graph = {}
+            pair_cache = []
+            for m in league_markets:
+                pair = m.get("market_pair") or []
+                if len(pair) != 2:
+                    continue
+                a, b = pair
+                name_a, name_b = names.get(a), names.get(b)
+                if not name_a or not name_b:
+                    continue  # never guess a name — see _get_currency_names()
+                lo, hi = m.get("lowest_ratio", {}), m.get("highest_ratio", {})
+                if not (lo.get(a) and lo.get(b) and hi.get(a) and hi.get(b)):
+                    continue
+                # Skip pairs whose pool stock hit zero on either side during
+                # the hour — a hard "this trade could not actually execute"
+                # signal that volume_traded (past activity only) misses.
+                # Confirmed live: Orb of Fusing<->Orb of Alteration had real
+                # volume_traded but lowest_stock of 0 for Alteration, i.e.
+                # the pool was drained dry for part of the hour — 27% of
+                # this hour's pairs showed this, so it's common, not an edge
+                # case worth ignoring.
+                stock_lo = m.get("lowest_stock", {})
+                if stock_lo.get(a, 0) <= 0 or stock_lo.get(b, 0) <= 0:
+                    continue
+                rate_low = lo[b] / lo[a]
+                rate_high = hi[b] / hi[a]
+                if rate_low <= 0:
+                    continue
+                lo_rate, hi_rate = min(rate_low, rate_high), max(rate_low, rate_high)
+                avg_rate = (lo_rate + hi_rate) / 2  # see docstring: avoid the optimistic-extreme trap
+                if avg_rate <= 0:
+                    continue
+                full_graph.setdefault(name_a, {})[name_b] = avg_rate
+                full_graph.setdefault(name_b, {})[name_a] = 1 / avg_rate
+                vol = m.get("volume_traded", {})
+                pair_cache.append((name_a, name_b, lo_rate, hi_rate, vol.get(a) or 0, vol.get(b) or 0))
+
+            chaos_values = _compute_chaos_values(full_graph)
+            result["divineRateChaos"] = chaos_values.get("Divine Orb")
+
+            # Pass 2: now filter by chaos-equivalent liquidity, using the
+            # prices just derived.
+            items = []
+            graph = {}
+            edge_liquidity = {}  # (from, to) -> chaos-equivalent liquidity, for strategy steps below
+            for name_a, name_b, lo_rate, hi_rate, vol_a, vol_b in pair_cache:
+                cv_a, cv_b = chaos_values.get(name_a), chaos_values.get(name_b)
+                if cv_a is None or cv_b is None:
+                    continue  # unreachable from Chaos Orb in this hour's graph
+                liquidity_chaos = min(vol_a * cv_a, vol_b * cv_b)
+                if liquidity_chaos < min_liquidity_chaos:
+                    continue
+                spread_pct = (hi_rate - lo_rate) / lo_rate * 100
+                items.append({
+                    "nameA": name_a, "nameB": name_b,
+                    "rateLow": round(lo_rate, 4), "rateHigh": round(hi_rate, 4),
+                    "spreadPct": round(spread_pct, 1),
+                    "liquidityChaos": round(liquidity_chaos, 1),
+                })
+                # Liquid but volatile pairs are shown above regardless — just
+                # not trusted as a cycle-graph edge (see
+                # _FLIP_CYCLE_MAX_EDGE_SPREAD_PCT's comment on why).
+                if spread_pct <= _FLIP_CYCLE_MAX_EDGE_SPREAD_PCT:
+                    avg_rate = (lo_rate + hi_rate) / 2
+                    graph.setdefault(name_a, {})[name_b] = avg_rate
+                    graph.setdefault(name_b, {})[name_a] = 1 / avg_rate
+                    rounded_liq = round(liquidity_chaos, 1)
+                    edge_liquidity[(name_a, name_b)] = rounded_liq
+                    edge_liquidity[(name_b, name_a)] = rounded_liq
+            items.sort(key=lambda it: -it["spreadPct"])
+
+            strategies = []
+            for cyc in _find_flip_cycles(graph, _FLIP_CYCLE_START):
+                path = cyc["path"]
+                steps = []
+                for i in range(len(path) - 1):
+                    frm, to = path[i], path[i + 1]
+                    steps.append({
+                        "sell": frm, "buy": to, "rate": round(graph[frm][to], 4),
+                        "liquidityChaos": edge_liquidity.get((frm, to)),
+                    })
+                strategies.append({
+                    "steps": steps,
+                    "profitPct": round((cyc["rate"] - 1) * 100, 2),
+                    "endAmount": round(cyc["rate"], 4),
+                    "minStepLiquidityChaos": min(s["liquidityChaos"] for s in steps),
+                })
+            result["items"] = items[:_FLIP_MAX_RESULTS]
+            result["strategies"] = strategies
+            result["hourTimestamp"] = hour_ts
+    except Exception as e:
+        print(f"  [warning] flip advisor ({league}): {e}")
+    with _lock:
+        _cache[key] = (now, result)
+    return result
+
+
 def build_index(league):
     """(name, type) -> {chaos, chaos_max, chaos_n, chaos_alt, divine, icon,
     detailsId, type, chaos_unided}.
@@ -1364,6 +1688,36 @@ button.sync:disabled, button.stop:disabled{opacity:.4; cursor:default}
   color:var(--ink-dim); white-space:nowrap}
 .patch-item a{color:var(--ink); text-decoration:none; flex:1; min-width:0}
 .patch-item a:hover{color:var(--gold-bright); text-decoration:underline}
+
+.flip-grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:10px;
+  margin-top:14px}
+.flip-card{display:flex; flex-direction:column; gap:6px; background:var(--panel);
+  border:1px solid var(--line); border-radius:4px; padding:12px 14px}
+.flip-card .flip-pair{font-family:"Spectral",Georgia,serif; font-size:13px; color:var(--ink)}
+.flip-card .flip-rate{font-family:ui-monospace,monospace; font-size:11px; color:var(--ink-dim)}
+.flip-card .flip-spread{font-family:ui-monospace,monospace; font-size:18px; font-weight:700;
+  color:var(--gold-bright)}
+.flip-card .flip-volume{font-family:ui-monospace,monospace; font-size:10.5px; color:var(--ink-dim)}
+
+.flip-strategies{display:flex; flex-direction:column; gap:10px; margin-top:14px}
+.flip-strategy-card{background:linear-gradient(180deg,var(--panel),var(--panel2));
+  border:1px solid var(--ok); border-radius:4px; padding:12px 14px}
+.flip-strategy-head{display:flex; align-items:center; justify-content:space-between;
+  flex-wrap:wrap; gap:8px; margin-bottom:8px}
+.flip-strategy-profit{font-family:ui-monospace,monospace; font-size:16px; font-weight:700; color:var(--ok)}
+.flip-strategy-meta{font-family:ui-monospace,monospace; font-size:10.5px; color:var(--ink-dim)}
+.flip-steps{display:flex; flex-direction:column; gap:4px}
+.flip-step{display:flex; align-items:center; gap:8px; font-size:12px; flex-wrap:wrap}
+.flip-step .step-num{font-family:ui-monospace,monospace; font-size:10px; color:var(--ink-dim);
+  width:16px; flex:0 0 auto}
+.flip-step .step-op{font-family:ui-monospace,monospace; font-size:9.5px; text-transform:uppercase;
+  letter-spacing:.05em; padding:2px 6px; border-radius:2px; flex:0 0 auto}
+.flip-step .step-op.sell{color:var(--neg); border:1px solid var(--neg)}
+.flip-step .step-op.buy{color:var(--ok); border:1px solid var(--ok)}
+.flip-step .step-desc{font-family:"Spectral",Georgia,serif; flex:1; min-width:0}
+.flip-step .step-liq{font-family:ui-monospace,monospace; font-size:9.5px; color:var(--ink-dim); white-space:nowrap}
+.flip-step .step-guide{font-family:ui-monospace,monospace; font-size:11px; color:var(--gold-bright);
+  background:var(--overlay-soft); border-radius:2px; padding:2px 6px; white-space:nowrap}
 </style>"""
 
 SHARED_HEADER_HTML = r"""<header>
@@ -1548,6 +1902,15 @@ function enableAdminUI(){
     a.innerHTML = '&#127919; <span>' + t('menu_snipe') + '</span>';
     poe1Group.appendChild(a);
   }
+  if(poe1Group && !poe1Group.querySelector('a[href="/flip-advisor"]')){
+    const isCurrent = location.pathname.startsWith('/flip-advisor');
+    const a = document.createElement('a');
+    a.className = 'sitemenu-link' + (isCurrent ? ' active' : '');
+    a.href = '/flip-advisor';
+    if(isCurrent) a.setAttribute('aria-current', 'page');
+    a.innerHTML = '&#128177; <span>' + t('menu_flip_advisor') + '</span>';
+    poe1Group.appendChild(a);
+  }
   if(poe2Group && !poe2Group.querySelector('a[href="/poe2-campaign"]')){
     const isCurrent = location.pathname.startsWith('/poe2-campaign');
     const a = document.createElement('a');
@@ -1709,7 +2072,7 @@ function populateLeagueOptions(data){
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE · BOSS ECONOMY',
-  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   btn_refresh: 'Refresh', btn_syncing: 'Syncing…',
   legend_currency: 'currency / fragment', legend_unique: 'unique',
@@ -1807,7 +2170,7 @@ en: {
 },
 pt: {
   tagline: 'PATH OF EXILE · ECONOMIA DE BOSS',
-  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Bosses', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Bosses', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   btn_refresh: 'Atualizar', btn_syncing: 'Sincronizando…',
   legend_currency: 'moeda / fragmento', legend_unique: 'único',
@@ -2457,7 +2820,7 @@ document.getElementById('leaguesel').addEventListener('change', e => {
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE · TRADE SNIPER',
-  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Uses Path of Exile’s official, unauthenticated trade API to check a curated list of items on a rotation — nothing is stored server-side beyond an active session.',
   footer_made_by: 'Built by Erick Lúcio',
@@ -2503,7 +2866,7 @@ en: {
 },
 pt: {
   tagline: 'PATH OF EXILE · CAÇADOR DE OFERTAS',
-  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games. Usa a API oficial e não-autenticada de troca do Path of Exile para checar uma lista selecionada de itens em rodízio — nada é guardado no servidor além de uma sessão ativa.',
   footer_made_by: 'Feito por Erick Lúcio',
@@ -2921,6 +3284,15 @@ HOME_BODY = r"""
           </div>
           <span class="page-card-badge" data-i18n="home_card_admin_badge">Admin only</span>
         </a>
+        <a class="page-card" href="/flip-advisor" hidden data-admin-only>
+          <div class="page-card-head"><span class="pc-icon">&#128177;</span> <span data-i18n="home_card_flipadvisor_title">Flip Advisor</span></div>
+          <div class="page-card-desc" data-i18n="home_card_flipadvisor_desc">
+            Ranks Currency Exchange pairs by historical hourly spread%, plus multi-step buy/sell
+            strategies with a whole-unit trade guide — a volatility signal to check live, not a
+            guaranteed profit.
+          </div>
+          <span class="page-card-badge" data-i18n="home_card_admin_badge">Admin only</span>
+        </a>
       </div>
       <div class="patchnotes" id="patchNotesPoe1">
         <div class="slabel" data-i18n="home_patchnotes_label">Recent patch notes</div>
@@ -2979,7 +3351,7 @@ document.getElementById('leaguesel').addEventListener('change', e => {
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE · HUB',
-  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   btn_refresh: 'Refresh', btn_syncing: 'syncing…',
   footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games.',
@@ -2999,6 +3371,8 @@ en: {
   home_card_snipe_desc: 'Watches a curated list of top Unique items for trade-site listings priced below the current market floor, checked live against the official trade API.',
   home_card_poe2campaign_title: 'PoE2 Campaign',
   home_card_poe2campaign_desc: 'Placeholder page for future Path of Exile 2 campaign notes — not built yet.',
+  home_card_flipadvisor_title: 'Flip Advisor',
+  home_card_flipadvisor_desc: 'Ranks Currency Exchange pairs by historical hourly spread%, plus multi-step buy/sell strategies with a whole-unit trade guide — a volatility signal to check live, not a guaranteed profit.',
   home_card_admin_badge: 'Admin only',
   home_patchnotes_label: 'Recent patch notes',
   home_patchnotes_loading: 'Loading…',
@@ -3007,7 +3381,7 @@ en: {
 },
 pt: {
   tagline: 'PATH OF EXILE · CENTRAL',
-  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   btn_refresh: 'Atualizar', btn_syncing: 'sincronizando…',
   footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games.',
@@ -3027,6 +3401,8 @@ pt: {
   home_card_snipe_desc: 'Monitora uma lista selecionada dos principais itens Únicos em busca de anúncios com preço abaixo do valor de mercado atual, checados ao vivo na API oficial de troca.',
   home_card_poe2campaign_title: 'Campanha PoE2',
   home_card_poe2campaign_desc: 'Página placeholder para futuras notas de campanha do Path of Exile 2 — ainda não construída.',
+  home_card_flipadvisor_title: 'Conselheiro de Flip',
+  home_card_flipadvisor_desc: 'Classifica pares da Currency Exchange pelo spread% histórico por hora, além de estratégias de compra/venda em múltiplas etapas com um guia de troca em unidades inteiras — um sinal de volatilidade para checar ao vivo, não um lucro garantido.',
   home_card_admin_badge: 'Somente admin',
   home_patchnotes_label: 'Notas de atualização recentes',
   home_patchnotes_loading: 'Carregando…',
@@ -3169,7 +3545,7 @@ POE2_CAMPAIGN_JS = r"""const LEAGUE = __LEAGUE_JSON__;
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE 2 · CAMPAIGN',
-  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   btn_refresh: 'Refresh', btn_syncing: 'syncing…',
   footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games.',
@@ -3179,7 +3555,7 @@ en: {
 },
 pt: {
   tagline: 'PATH OF EXILE 2 · CAMPANHA',
-  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   btn_refresh: 'Atualizar', btn_syncing: 'sincronizando…',
   footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games.',
@@ -3222,6 +3598,352 @@ def render_poe2_campaign_page():
             + render_sitemenu("poe2-campaign") + header + POE2_CAMPAIGN_BODY + SHARED_FOOTER_HTML
             + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n'
             + "<script>\nconst PAGE_REQUIRES_ADMIN = true;\n" + SHARED_JS_CHROME + POE2_CAMPAIGN_JS
+            + '\n</script>\n</body>\n</html>')
+
+
+# --------------------------------------------------------------------------- #
+# Flip Advisor page (/flip-advisor) — admin-only, PoE1 only
+# --------------------------------------------------------------------------- #
+# Surfaces currency-exchange pairs ranked by historical spread% over the last
+# completed hour (see _get_flip_opportunities() for the full methodology and
+# why this is a volatility SIGNAL, not a live-orderbook guarantee). Not
+# listed in PAGES — admin-only, injected client-side, same precedent as
+# /snipe and /poe2-campaign.
+FLIP_ADVISOR_EXTRA_CONTROLS = ""
+
+FLIP_ADVISOR_BODY = r"""
+
+<div class="wrap">
+  <div class="note" data-i18n="flip_disclaimer">
+    This uses the official currency-exchange market's hourly aggregate data — delayed and
+    historical, not a live orderbook. A high spread% means that pair's rate moved a lot within
+    the last completed hour (a volatility signal worth checking), not a guaranteed profit.
+    Always verify the live price on the Bulk Item Exchange before trading.
+  </div>
+  <div class="note" data-i18n="flip_liquidity_note">
+    Liquidity is shown in chaos-equivalent value (volume × that currency's own chaos price), not
+    raw unit counts — a lower number means fewer results but higher confidence; a higher number
+    shows more results, some from thinner/more volatile markets.
+  </div>
+  <div class="snipe-row">
+    <label><span data-i18n="flip_liquidity_label">Min. liquidity</span>
+      <input type="number" id="flipMinLiquidity" min="0" step="1" value="100" style="width:100px">
+    </label>
+    <select id="flipLiquidityUnit" style="width:90px">
+      <option value="chaos" data-i18n="snipe_unit_chaos">Chaos</option>
+      <option value="divine" data-i18n="snipe_unit_divine">Divine</option>
+    </select>
+    <div class="runs" id="flipLiquidityPresets" role="group" aria-label="liquidity presets">
+      <button data-liq="10">10</button>
+      <button data-liq="100" class="active">100</button>
+      <button data-liq="1000">1000</button>
+    </div>
+    <button class="sync" id="flipApply" data-i18n="flip_apply">Apply</button>
+  </div>
+  <div class="snipe-row">
+    <span class="snipe-status" id="flipStatus" data-i18n="flip_status_loading">Loading…</span>
+    <a class="sync" id="flipTradeLink" href="https://www.pathofexile.com/trade/exchange/Standard" target="_blank" rel="noopener noreferrer" data-i18n="flip_open_exchange">Open Bulk Item Exchange &rarr;</a>
+  </div>
+
+  <div class="snipe-results">
+    <div class="slabel" data-i18n="flip_strategies_label">Multi-step flip strategies (start &amp; end with Chaos Orb)</div>
+    <div class="flip-strategies" id="flipStrategies"></div>
+    <div class="empty" id="flipStrategiesEmpty" data-i18n="flip_strategies_empty">No profitable multi-step cycle found at this liquidity level right now — try lowering the minimum liquidity, or check back next hour.</div>
+  </div>
+
+  <div class="snipe-results">
+    <div class="slabel" data-i18n="flip_pairs_label">Single-pair spreads</div>
+    <div class="flip-grid" id="flipList"></div>
+    <div class="empty" id="flipEmpty" data-i18n="flip_empty">No opportunities found for this league right now.</div>
+  </div>
+</div>
+"""
+
+FLIP_ADVISOR_JS = r"""const LEAGUE = __LEAGUE_JSON__;
+const FLIP_ADVISOR_BASE = '/api/flipadvisor';
+
+function populateLeagueOptions(){
+  const sel = document.getElementById('leaguesel');
+  if(sel.options.length) return;
+  let currentLeague;
+  try { currentLeague = localStorage.getItem('bossFarmLeague'); } catch(e) { currentLeague = null; }
+  const cur = currentLeague || LEAGUE;
+  const opts = [LEAGUE, 'Standard', 'Hardcore', 'Hardcore ' + LEAGUE];
+  const seen = new Set();
+  sel.innerHTML = opts.filter(o => o && !seen.has(o) && seen.add(o))
+    .map(o => `<option value="${o}" ${o===cur?'selected':''}>${o}</option>`).join('');
+  document.getElementById('league').textContent = cur;
+}
+populateLeagueOptions();
+
+const I18N = {
+en: {
+  tagline: 'PATH OF EXILE · FLIP ADVISOR',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor',
+  chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
+  btn_refresh: 'Refresh', btn_syncing: 'syncing…',
+  footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games.',
+  footer_made_by: 'Built by Erick Lúcio',
+  footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
+  flip_disclaimer: 'This uses the official currency-exchange market\'s hourly aggregate data — delayed and historical, not a live orderbook. A high spread% means that pair\'s rate moved a lot within the last completed hour (a volatility signal worth checking), not a guaranteed profit. Always verify the live price on the Bulk Item Exchange before trading.',
+  flip_status_loading: 'Loading…',
+  flip_status_ready: 'Showing top {n} pairs for {league} — hour data as of {time}',
+  flip_status_error: 'Could not load flip data right now.',
+  flip_open_exchange: 'Open Bulk Item Exchange →',
+  flip_empty: 'No opportunities found for this league right now.',
+  flip_spread: 'spread',
+  flip_volume: 'liquidity',
+  flip_liquidity_note: 'Liquidity is shown in chaos-equivalent value (volume × that currency\'s own chaos price), not raw unit counts — a lower number means fewer results but higher confidence; a higher number shows more results, some from thinner/more volatile markets.',
+  flip_liquidity_label: 'Min. liquidity',
+  flip_apply: 'Apply',
+  snipe_unit_chaos: 'Chaos',
+  snipe_unit_divine: 'Divine',
+  flip_strategies_label: 'Multi-step flip strategies (start & end with Chaos Orb)',
+  flip_strategies_empty: 'No profitable multi-step cycle found at this liquidity level right now — try lowering the minimum liquidity, or check back next hour.',
+  flip_pairs_label: 'Single-pair spreads',
+  flip_sell: 'Sell',
+  flip_buy: 'Buy',
+  flip_steps: 'steps',
+  flip_min_step_liq: 'min. step liquidity',
+  flip_guide_change: 'Change {den} {sell} to {num} {buy}',
+},
+pt: {
+  tagline: 'PATH OF EXILE · CONSELHEIRO DE FLIP',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip',
+  chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
+  btn_refresh: 'Atualizar', btn_syncing: 'sincronizando…',
+  footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games.',
+  footer_made_by: 'Feito por Erick Lúcio',
+  footer_dm: 'Sugestão ou opinião? Manda um DM no LinkedIn',
+  flip_disclaimer: 'Isso usa os dados agregados por hora do mercado oficial de troca de moedas — atrasados e históricos, não uma carteira de ordens ao vivo. Um spread% alto significa que a taxa daquele par variou bastante na última hora completa (um sinal de volatilidade que vale a pena checar), não um lucro garantido. Sempre confira o preço ao vivo no Bulk Item Exchange antes de negociar.',
+  flip_status_loading: 'Carregando…',
+  flip_status_ready: 'Mostrando os {n} melhores pares para {league} — dados da hora {time}',
+  flip_status_error: 'Não foi possível carregar os dados de flip agora.',
+  flip_open_exchange: 'Abrir Bulk Item Exchange →',
+  flip_empty: 'Nenhuma oportunidade encontrada para esta liga agora.',
+  flip_spread: 'spread',
+  flip_volume: 'liquidez',
+  flip_liquidity_note: 'A liquidez é mostrada em valor equivalente em chaos (volume × o preço em chaos daquela moeda), não em contagem bruta de unidades — um número menor significa menos resultados, mas mais confiança; um número maior mostra mais resultados, alguns de mercados mais finos/voláteis.',
+  flip_liquidity_label: 'Liquidez mín.',
+  flip_apply: 'Aplicar',
+  snipe_unit_chaos: 'Caos',
+  snipe_unit_divine: 'Divino',
+  flip_strategies_label: 'Estratégias de flip em múltiplas etapas (começa e termina com Chaos Orb)',
+  flip_strategies_empty: 'Nenhum ciclo de múltiplas etapas lucrativo encontrado com este nível de liquidez agora — tente diminuir a liquidez mínima, ou volte na próxima hora.',
+  flip_pairs_label: 'Spreads de par único',
+  flip_sell: 'Vender',
+  flip_buy: 'Comprar',
+  flip_steps: 'etapas',
+  flip_min_step_liq: 'liquidez mín. da etapa',
+  flip_guide_change: 'Troque {den} {sell} por {num} {buy}',
+},
+};
+
+function renderFlipList(items){
+  const list = document.getElementById('flipList');
+  const empty = document.getElementById('flipEmpty');
+  if(!items || !items.length){
+    empty.hidden = false;
+    list.innerHTML = '';
+    return;
+  }
+  empty.hidden = true;
+  list.innerHTML = items.map(it => `<div class="flip-card">
+    <div class="flip-pair">${escAttr(it.nameA)} &harr; ${escAttr(it.nameB)}</div>
+    <div class="flip-rate">${it.rateLow} – ${it.rateHigh}</div>
+    <div class="flip-spread">${it.spreadPct}% <span style="font-size:10px;color:var(--ink-dim);font-weight:400">${t('flip_spread')}</span></div>
+    <div class="flip-volume">${t('flip_volume')}: ${Math.round(it.liquidityChaos).toLocaleString()}c</div>
+  </div>`).join('');
+}
+
+// PoE currency isn't divisible — a rate like "1 Chaos -> 0.7 Exalted" isn't
+// an executable trade (can't sell 0.7 of an Exalted Orb). This finds a
+// single WHOLE-NUMBER starting quantity of the chain's first currency such
+// that every step along the whole chain lands on a whole number too — not
+// just each step rationalized independently. Rationalizing each step's rate
+// on its own (an earlier, real bug caught live) produces internally
+// inconsistent amounts: step 1 says "7 Chaos -> 1 Metallic Fossil" while
+// step 2 separately says "33 Metallic Fossil -> 2 Divine Orb" — but the
+// chain only ever produced 1 Metallic Fossil from step 1, not 33. This
+// instead walks the chain ONCE with a shared starting amount, rounding each
+// step's output to the nearest whole number and carrying that EXACT number
+// into the next step as its input — so step i's "buy" amount and step i+1's
+// "sell" amount are always the literal same number, by construction.
+//
+// The starting amount isn't just "smallest that avoids any step rounding to
+// zero" — a second real bug caught live: that alone found a starting amount
+// so small that per-step rounding error compounded into a chain whose
+// overall ratio (300/60 = 5x) was wildly off from the strategy's actual
+// computed profit (~2.6x). Instead this searches increasing starting
+// amounts for the smallest one whose overall rounded ratio is within
+// CHAIN_ACCURACY_TOLERANCE of the TRUE (unrounded) cumulative rate product
+// — accurate AND practically small — falling back to whichever candidate
+// found during the search had the lowest error if none met the tolerance
+// within the search cap.
+const CHAIN_ACCURACY_TOLERANCE = 0.02; // 2% — matches this data's own hourly-aggregate precision
+const CHAIN_MAX_START = 200000;
+
+function chainWholeAmounts(rates){
+  const trueRatio = rates.reduce((a, r) => a * r, 1);
+  let best = null, bestErr = Infinity;
+  for(let start = 1; start <= CHAIN_MAX_START; start++){
+    const amounts = [start];
+    let amt = start, ok = true;
+    for(const r of rates){
+      amt = Math.round(amt * r);
+      if(amt < 1){ ok = false; break; }
+      amounts.push(amt);
+    }
+    if(!ok) continue;
+    const err = Math.abs((amt / start) - trueRatio) / trueRatio;
+    if(err < bestErr){ best = amounts; bestErr = err; }
+    if(err <= CHAIN_ACCURACY_TOLERANCE) return amounts;
+  }
+  return best || [1, ...rates.map(() => 1)]; // pathological fallback, should never hit in practice
+}
+
+// Every step is one atomic exchange: SELL the "from" currency, BUY the "to"
+// currency, at `rate` units of "to" per 1 unit of "from" — labeled
+// explicitly per step (not just an arrow) since which side is being bought
+// vs sold was the whole point of asking for this over the single-pair list.
+// The "guide" column is the same trade expressed in whole, actually-
+// tradeable, CHAIN-CONSISTENT units (see chainWholeAmounts() above).
+function renderStrategies(strategies){
+  const list = document.getElementById('flipStrategies');
+  const empty = document.getElementById('flipStrategiesEmpty');
+  if(!strategies || !strategies.length){
+    empty.hidden = false;
+    list.innerHTML = '';
+    return;
+  }
+  empty.hidden = true;
+  list.innerHTML = strategies.map(s => {
+    const chainAmounts = chainWholeAmounts(s.steps.map(st => st.rate));
+    const steps = s.steps.map((st, i) => {
+      const guide = t('flip_guide_change')
+        .replace('{den}', chainAmounts[i]).replace('{sell}', escAttr(st.sell))
+        .replace('{num}', chainAmounts[i + 1]).replace('{buy}', escAttr(st.buy));
+      return `<div class="flip-step">
+      <span class="step-num">${i + 1}.</span>
+      <span class="step-op sell">${t('flip_sell')}</span>
+      <span class="step-desc">1 ${escAttr(st.sell)}</span>
+      <span class="step-op buy">${t('flip_buy')}</span>
+      <span class="step-desc">${st.rate} ${escAttr(st.buy)}</span>
+      <span class="step-guide">${guide}</span>
+      <span class="step-liq">${t('flip_volume')}: ${Math.round(st.liquidityChaos).toLocaleString()}c</span>
+    </div>`;
+    }).join('');
+    return `<div class="flip-strategy-card">
+      <div class="flip-strategy-head">
+        <span class="flip-strategy-profit">+${s.profitPct}%</span>
+        <span class="flip-strategy-meta">${s.steps.length} ${t('flip_steps')} · 1 &rarr; ${s.endAmount} Chaos Orb · ${t('flip_min_step_liq')}: ${Math.round(s.minStepLiquidityChaos).toLocaleString()}c</span>
+      </div>
+      <div class="flip-steps">${steps}</div>
+    </div>`;
+  }).join('');
+}
+
+let lastFlipData = null;
+
+function currentMinLiquidityChaos(){
+  const raw = Number(document.getElementById('flipMinLiquidity').value) || 0;
+  const unit = document.getElementById('flipLiquidityUnit').value;
+  if(unit === 'divine'){
+    const divineRate = (lastFlipData && lastFlipData.divineRateChaos) || 180;
+    return raw * divineRate;
+  }
+  return raw;
+}
+
+async function loadFlipAdvisor(){
+  const league = document.getElementById('leaguesel').value || LEAGUE;
+  document.getElementById('flipTradeLink').href = 'https://www.pathofexile.com/trade/exchange/' + encodeURIComponent(league);
+  const minLiquidity = currentMinLiquidityChaos();
+  setStatus('flip_status_loading');
+  try{
+    const url = FLIP_ADVISOR_BASE + '?league=' + encodeURIComponent(league) + '&minLiquidity=' + encodeURIComponent(minLiquidity);
+    const r = await fetch(url, {signal: AbortSignal.timeout(30000)});
+    const data = await r.json();
+    if(!data.ok) throw new Error(data.error || 'failed');
+    lastFlipData = data;
+    renderFlipList(data.items);
+    renderStrategies(data.strategies);
+    const time = data.hourTimestamp ? new Date(data.hourTimestamp * 1000).toLocaleString() : '?';
+    setStatus('flip_status_ready', {n: data.items.length, league, time});
+  }catch(e){
+    console.error('[Flip Advisor] /api/flipadvisor request failed.', e);
+    lastFlipData = null;
+    setStatus('flip_status_error');
+    renderFlipList([]);
+    renderStrategies([]);
+  }
+}
+
+function setStatus(key, vars){
+  const el = document.getElementById('flipStatus');
+  let text = t(key);
+  if(vars) for(const k of Object.keys(vars)) text = text.replace('{' + k + '}', vars[k]);
+  el.textContent = text;
+}
+
+function refreshDynamicI18n(){
+  if(lastFlipData){
+    renderFlipList(lastFlipData.items);
+    renderStrategies(lastFlipData.strategies);
+    const time = lastFlipData.hourTimestamp ? new Date(lastFlipData.hourTimestamp * 1000).toLocaleString() : '?';
+    setStatus('flip_status_ready', {n: lastFlipData.items.length, league: document.getElementById('leaguesel').value || LEAGUE, time});
+  }
+}
+
+const langSel = document.getElementById('langsel');
+langSel.value = lang;
+langSel.addEventListener('change', () => {
+  lang = langSel.value;
+  try { localStorage.setItem('bossFarmLang', lang); } catch(e) {}
+  applyStaticI18n();
+  refreshDynamicI18n();
+});
+
+document.getElementById('leaguesel').addEventListener('change', e => {
+  try { localStorage.setItem('bossFarmLeague', e.target.value); } catch(err) {}
+  document.getElementById('league').textContent = e.target.value;
+  loadFlipAdvisor();
+});
+
+document.getElementById('flipApply').addEventListener('click', loadFlipAdvisor);
+document.getElementById('flipMinLiquidity').addEventListener('keydown', e => {
+  if(e.key === 'Enter') loadFlipAdvisor();
+});
+document.getElementById('flipLiquidityPresets').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-liq]');
+  if(!btn) return;
+  document.getElementById('flipMinLiquidity').value = btn.dataset.liq;
+  document.getElementById('flipLiquidityUnit').value = 'chaos';
+  document.querySelectorAll('#flipLiquidityPresets button').forEach(b => b.classList.toggle('active', b === btn));
+  loadFlipAdvisor();
+});
+
+applyStaticI18n();
+loadFlipAdvisor();
+"""
+
+
+def render_flip_advisor_page():
+    head = (SHARED_HEAD_TEMPLATE
+            .replace("__PAGE_TITLE__", 'Flip Advisor — Path of Exile Currency Exchange Spread Watcher')
+            .replace("__PAGE_DESCRIPTION__", 'Ranks Path of Exile currency-exchange pairs by historical hourly spread — a volatility signal for potential flips, sourced from the official currency-exchange market data.')
+            .replace("__PAGE_SOCIAL_TITLE__", 'Flip Advisor — PoE Currency Exchange Spread Watcher')
+            .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Ranks Path of Exile currency-exchange pairs by historical hourly spread, sourced from the official currency-exchange market data.')
+            .replace("__PAGE_APP_NAME__", 'Flip Advisor')
+            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Ranks Path of Exile currency-exchange pairs by historical hourly spread.')
+            .replace("__FAVICON_URL__", _favicon_data_uri("\U0001F4B1")))
+    header = (SHARED_HEADER_HTML.replace("__EXTRA_CONTROLS__", FLIP_ADVISOR_EXTRA_CONTROLS)
+              .replace("__BRAND_ICON__", "&#128177;").replace("__BRAND_TITLE__", "Flip Advisor")
+              .replace("__PRICECHIPS_ATTR__", "hidden").replace("__DIVINE_CHIP_ATTR__", "hidden"))
+    return (head + "\n" + SHARED_CSS + '\n</head>\n<body>' + "\n"
+            + render_sitemenu("flip-advisor") + header + FLIP_ADVISOR_BODY + SHARED_FOOTER_HTML
+            + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n'
+            + "<script>\nconst PAGE_REQUIRES_ADMIN = true;\n" + SHARED_JS_CHROME + FLIP_ADVISOR_JS
             + '\n</script>\n</body>\n</html>')
 
 
@@ -3324,6 +4046,20 @@ def make_handler(league, poll_ms, pages_html):
                         self._send(200, body, "application/json")
                     except Exception as e:
                         self._send(500, json.dumps({"ok": False, "error": str(e)}).encode(), "application/json")
+            elif path == "/api/flipadvisor":
+                qs = urllib.parse.parse_qs(parsed.query)
+                req_league = (qs.get("league") or [league])[0].strip()[:64] or league
+                min_liq_raw = (qs.get("minLiquidity") or [None])[0]
+                try:
+                    min_liq = float(min_liq_raw) if min_liq_raw not in (None, "") else None
+                except ValueError:
+                    min_liq = None
+                try:
+                    data = _get_flip_opportunities(req_league, min_liq)
+                    body = json.dumps({"ok": True, **data}).encode("utf-8")
+                    self._send(200, body, "application/json")
+                except Exception as e:
+                    self._send(500, json.dumps({"ok": False, "error": str(e)}).encode(), "application/json")
             else:
                 self._send(404, b"not found", "text/plain")
     return H
@@ -3354,6 +4090,9 @@ def main():
         "poe2-campaign": (render_poe2_campaign_page().replace("__POLL_MS__", str(args.poll * 1000))
                           .replace("__LEAGUE_JSON__", json.dumps(args.league))
                           .replace("__CANONICAL_URL__", f"http://localhost:{args.port}/poe2-campaign")),
+        "flip-advisor": (render_flip_advisor_page().replace("__POLL_MS__", str(args.poll * 1000))
+                         .replace("__LEAGUE_JSON__", json.dumps(args.league))
+                         .replace("__CANONICAL_URL__", f"http://localhost:{args.port}/flip-advisor")),
     }
     if args.minify:
         pages_html = {slug: minify_page(html) for slug, html in pages_html.items()}
@@ -3365,7 +4104,8 @@ def main():
           f"\nBoss Farm dashboard at http://localhost:{args.port}/bosses"
           f"\nTrade Sniper (needs the deployed Worker to actually work) at "
           f"http://localhost:{args.port}/snipe"
-          f"\nPoE2 Campaign (admin-only stub) at http://localhost:{args.port}/poe2-campaign")
+          f"\nPoE2 Campaign (admin-only stub) at http://localhost:{args.port}/poe2-campaign"
+          f"\nFlip Advisor (admin-only, PoE1) at http://localhost:{args.port}/flip-advisor")
     try:
         webbrowser.open(url)
     except Exception:
