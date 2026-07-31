@@ -69,6 +69,11 @@ function withCors(body, status, contentType) {
 // 429 seen in testing), and supplying your own account's session cookie may
 // use a separate, more generous bucket — never required, never persisted to
 // storage, only held in this instance's memory for the life of the watch.
+// `rotationIntervalMs` starts at 3s but grows (capped, see applyRateLimit())
+// every time a 429 happens — GGG's own bans escalate on repeat violations
+// shortly after a previous one clears, so resuming at the original fast pace
+// right when a ban expires reliably re-triggers a longer one; this session's
+// pace permanently backs off instead of oscillating back into that loop.
 export class SnipeSession {
   constructor(state, env) {
     this.state = state;
@@ -85,6 +90,8 @@ export class SnipeSession {
     this.lastPolledAt = 0;
     this.rateLimitedUntil = 0;  // ms epoch; while in the future, alarm() makes zero trade-API calls
     this.poesessid = null;      // optional; never written to storage, never echoed in any response
+    this.consecutiveBans = 0;   // resets to 0 on any check that doesn't itself get 429'd
+    this.rotationIntervalMs = 3000; // grows (capped) after each ban — see checkOneItem's 429 handling
   }
 
   async fetch(request) {
@@ -136,6 +143,8 @@ export class SnipeSession {
     this.checkLog = [];
     this.currentItem = null;
     this.rateLimitedUntil = 0;
+    this.consecutiveBans = 0;
+    this.rotationIntervalMs = 3000;
     this.lastPolledAt = Date.now();
 
     await this.state.storage.setAlarm(Date.now() + 1000);
@@ -170,8 +179,8 @@ export class SnipeSession {
       try { snippet = (await searchResp.text()).slice(0, 200); } catch (e) {}
       if (searchResp.status === 429) {
         const waitSec = parseRetrySeconds(searchResp, snippet);
-        this.rateLimitedUntil = Date.now() + waitSec * 1000;
-        logEntry.debug = `rate limited by pathofexile.com/trade — pausing the whole rotation for ${waitSec}s (no more requests until then)`;
+        const paddedWaitSec = this.applyRateLimit(waitSec);
+        logEntry.debug = `rate limited by pathofexile.com/trade (ban #${this.consecutiveBans} in a row) — server said wait ${waitSec}s, pausing ${paddedWaitSec}s with a safety margin, rotation slowed to one check every ${Math.round(this.rotationIntervalMs / 1000)}s`;
       } else {
         logEntry.debug = `search HTTP ${searchResp.status} ${searchResp.statusText}: ${snippet}`;
       }
@@ -197,13 +206,15 @@ export class SnipeSession {
       try { snippet = (await fetchResp.text()).slice(0, 200); } catch (e) {}
       if (fetchResp.status === 429) {
         const waitSec = parseRetrySeconds(fetchResp, snippet);
-        this.rateLimitedUntil = Date.now() + waitSec * 1000;
-        logEntry.debug = `rate limited by pathofexile.com/trade — pausing the whole rotation for ${waitSec}s (no more requests until then)`;
+        const paddedWaitSec = this.applyRateLimit(waitSec);
+        logEntry.debug = `rate limited by pathofexile.com/trade (ban #${this.consecutiveBans} in a row) — server said wait ${waitSec}s, pausing ${paddedWaitSec}s with a safety margin, rotation slowed to one check every ${Math.round(this.rotationIntervalMs / 1000)}s`;
       } else {
         logEntry.debug = `fetch HTTP ${fetchResp.status} ${fetchResp.statusText}: ${snippet}`;
       }
       this.pushLog(logEntry); return;
     }
+    // Both calls succeeded without a 429 — this streak of bans is over.
+    this.consecutiveBans = 0;
     const fetchData = await fetchResp.json();
     if (fetchData.error) logEntry.debug = `fetch error: ${JSON.stringify(fetchData.error)}`;
 
@@ -279,6 +290,24 @@ export class SnipeSession {
     if (this.checkLog.length > 50) this.checkLog = this.checkLog.slice(-50);
   }
 
+  // PoE's trade API escalates ban length on repeat violations shortly after
+  // a previous ban clears (confirmed in testing: resuming right at the old
+  // ban's expiry and retrying at the normal pace re-triggered a fresh ban
+  // immediately). So a 429 here does three things instead of just trusting
+  // the server's stated wait verbatim: pads it with a growing safety margin
+  // that scales with how many bans have happened back-to-back, slows the
+  // whole rotation's normal per-item pace (permanently for this session —
+  // reverting it after one clean check risks oscillating straight back into
+  // the same escalation), and tracks the streak so `debug` can show the user
+  // it's actually adapting rather than looping silently.
+  applyRateLimit(waitSec) {
+    this.consecutiveBans++;
+    const paddedWaitSec = Math.round(waitSec * (1 + 0.5 * Math.min(this.consecutiveBans - 1, 6)) + 10);
+    this.rateLimitedUntil = Date.now() + paddedWaitSec * 1000;
+    this.rotationIntervalMs = Math.min(this.rotationIntervalMs * 1.5, 20000);
+    return paddedWaitSec;
+  }
+
   async handlePoll() {
     this.lastPolledAt = Date.now();
     const running = !!this.watchlist.length;
@@ -333,7 +362,7 @@ export class SnipeSession {
       return;
     }
     this.rotationIndex = (this.rotationIndex + 1) % this.watchlist.length;
-    await this.state.storage.setAlarm(Date.now() + 3000);
+    await this.state.storage.setAlarm(Date.now() + this.rotationIntervalMs);
   }
 }
 
