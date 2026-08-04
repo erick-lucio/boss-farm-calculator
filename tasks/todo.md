@@ -34,6 +34,11 @@
       present (Acts 4/5 have none) — sourced from the same exile-leveling dataset's `Complete
       {trial}` markers rather than poewiki (`Trial_of_Ascendancy`, Anubis-blocked again this
       session), with a `campaign_trial_note` explaining the Labyrinth/Ascendancy-points mechanic.
+      **Update:** `/poe2-campaign` was deactivated back to admin-only per explicit request after
+      being public for a while — `PAGE_REQUIRES_ADMIN = true` again, removed from `PAGES`, home
+      card re-hidden with the "Admin only" badge, excluded from `sitemap.xml`, site-menu link
+      back to client-side injection via `enableAdminUI()`'s `poe2Group` block. Its content/route
+      data is unchanged, only the gating. `/campaign` (PoE1) is unaffected, still fully public.
 - [x] **Swapped LinkedIn for email in the site footer** — `footer_made_by`/`footer_dm` +
       `SHARED_FOOTER_HTML` now show a byline (no link) and a `mailto:ericklucio.suv@gmail.com`
       contact link instead of the LinkedIn profile link, across every page.

@@ -1232,8 +1232,7 @@ PAGES = [
     {"slug": "bosses", "icon": "&#128128;", "menu_key": "menu_bosses", "label_en": "Boss Farm", "game": "poe1"},
     {"slug": "flip-advisor", "icon": "&#128177;", "menu_key": "menu_flip_advisor", "label_en": "Flip Advisor", "game": "poe1"},
     {"slug": "campaign", "icon": "&#128506;", "menu_key": "menu_campaign", "label_en": "Campaign Guide", "game": "poe1"},
-    {"slug": "poe2-campaign", "icon": "&#9876;&#65039;", "menu_key": "menu_poe2_campaign", "label_en": "PoE2 Campaign", "game": "poe2"},
-    # Admin-only pages (Trade Sniper) intentionally not listed here —
+    # Admin-only pages (Trade Sniper, PoE2 Campaign) intentionally not listed here —
     # hidden from the site menu for everyone else, injected client-side (into the
     # matching game's <div class="sitemenu-group">) by enableAdminUI() only once the
     # admin handshake confirms. Their /slug routes still render and work for anyone
@@ -2115,6 +2114,7 @@ function enableAdminUI(){
   }
   const menu = document.getElementById('sitemenu');
   const poe1Group = menu && menu.querySelector('.sitemenu-group[data-game="poe1"]');
+  const poe2Group = menu && menu.querySelector('.sitemenu-group[data-game="poe2"]');
   if(poe1Group && !poe1Group.querySelector('a[href="/snipe"]')){
     const isCurrent = location.pathname.startsWith('/snipe');
     const a = document.createElement('a');
@@ -2124,10 +2124,19 @@ function enableAdminUI(){
     a.innerHTML = '&#127919; <span>' + t('menu_snipe') + '</span>';
     poe1Group.appendChild(a);
   }
-  // Generic marker for any admin-gated content beyond the sitemenu link
-  // above (e.g. the /home page's Trade Sniper page-card) — just add hidden
-  // data-admin-only to an element and it reveals itself here once admin
-  // status is confirmed, no per-page wiring needed.
+  if(poe2Group && !poe2Group.querySelector('a[href="/poe2-campaign"]')){
+    const isCurrent = location.pathname.startsWith('/poe2-campaign');
+    const a = document.createElement('a');
+    a.className = 'sitemenu-link' + (isCurrent ? ' active' : '');
+    a.href = '/poe2-campaign';
+    if(isCurrent) a.setAttribute('aria-current', 'page');
+    a.innerHTML = '&#9876;&#65039; <span>' + t('menu_poe2_campaign') + '</span>';
+    poe2Group.appendChild(a);
+  }
+  // Generic marker for any admin-gated content beyond the sitemenu links
+  // above (e.g. the /home page's Trade Sniper / PoE2 Campaign page-cards) —
+  // just add hidden data-admin-only to an element and it reveals itself here
+  // once admin status is confirmed, no per-page wiring needed.
   document.querySelectorAll('[data-admin-only]').forEach(el => { el.hidden = false; });
   reorderSiteMenuByGame();
 }
@@ -3519,12 +3528,13 @@ HOME_BODY = r"""
         below to stay current in the meantime.
       </div>
       <div class="page-cards">
-        <a class="page-card" href="/poe2-campaign">
+        <a class="page-card" href="/poe2-campaign" hidden data-admin-only>
           <div class="page-card-head"><span class="pc-icon">&#9876;&#65039;</span> <span data-i18n="home_card_poe2campaign_title">PoE2 Campaign</span></div>
           <div class="page-card-desc" data-i18n="home_card_poe2campaign_desc">
             Fastest campaign route act by act, league-start and second-character item lists, and
             every permanent bonus available in Early Access so far.
           </div>
+          <span class="page-card-badge" data-i18n="home_card_admin_badge">Admin only</span>
         </a>
       </div>
       <div class="patchnotes" id="patchNotesPoe2">
@@ -4365,7 +4375,7 @@ def render_poe2_campaign_page():
     return (head + "\n" + SHARED_CSS + '\n</head>\n<body>' + "\n"
             + render_sitemenu("poe2-campaign") + header + POE2_CAMPAIGN_BODY + SHARED_FOOTER_HTML
             + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n'
-            + "<script>\nconst PAGE_REQUIRES_ADMIN = false;\n" + SHARED_JS_CHROME + POE2_CAMPAIGN_JS
+            + "<script>\nconst PAGE_REQUIRES_ADMIN = true;\n" + SHARED_JS_CHROME + POE2_CAMPAIGN_JS
             + '\n</script>\n</body>\n</html>')
 
 

@@ -531,18 +531,17 @@ def main():
     (out_dir / "robots.txt").write_text(
         f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n", encoding="utf-8")
     (out_dir / "sitemap.xml").write_text(
-        # /snipe deliberately left out of the sitemap while it's admin-only/hidden from
-        # the site menu (see PAGES in boss.py) — still builds and works at its URL for
-        # direct/manual access, just isn't advertised for search engines to crawl yet.
-        # /flip-advisor, /campaign, and /poe2-campaign are all listed in PAGES (public)
-        # so they're included here.
+        # /snipe and /poe2-campaign deliberately left out of the sitemap while they're
+        # admin-only/hidden from the site menu (see PAGES in boss.py) — both still build
+        # and work at their URLs for direct/manual access, just aren't advertised for
+        # search engines to crawl yet. /flip-advisor and /campaign are listed in PAGES
+        # (public) so they're included here.
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
         f"  <url><loc>{base}/home</loc></url>\n"
         f"  <url><loc>{base}/bosses</loc></url>\n"
         f"  <url><loc>{base}/flip-advisor</loc></url>\n"
         f"  <url><loc>{base}/campaign</loc></url>\n"
-        f"  <url><loc>{base}/poe2-campaign</loc></url>\n"
         "</urlset>\n", encoding="utf-8")
 
     print(f"Wrote {home_dir / 'index.html'} ({len(home_html):,} bytes)")

@@ -82,7 +82,7 @@ verified line-for-line identical to the pre-refactor output (see Verification ha
 | `/home`            | Home                 | —     | No          | `render_home_page()`             |
 | `/bosses`          | Boss Farm Estimator  | poe1  | No          | `render_bosses_page()`           |
 | `/snipe`           | Trade Sniper          | poe1  | Yes (`PAGE_REQUIRES_ADMIN = true`) — hidden from the public site menu (injected client-side when admin is detected), redirects non-admin visitors to `/home` | `render_snipe_page()` |
-| `/poe2-campaign`   | PoE2 Campaign Guide   | poe2  | No — listed in `PAGES`, visible to every visitor | `render_poe2_campaign_page()` |
+| `/poe2-campaign`   | PoE2 Campaign Guide   | poe2  | Yes (`PAGE_REQUIRES_ADMIN = true`) — same pattern as `/snipe`, deactivated per explicit request after being public briefly | `render_poe2_campaign_page()` |
 | `/flip-advisor`    | Flip Advisor          | poe1  | No — listed in `PAGES`, visible to every visitor | `render_flip_advisor_page()` |
 | `/campaign`        | Campaign Guide (PoE1) | poe1  | No — listed in `PAGES`, visible to every visitor | `render_campaign_page()` |
 
@@ -503,13 +503,17 @@ client") turned out to be wrong once actually checked against the live API.
   `sitemap.xml`. `PAGE_REQUIRES_ADMIN = false`, same as `/bosses`/`/home` — unlike `/snipe`,
   there's no client-side redirect-to-`/home` gate.
 
-### Campaign Guide pages (`/campaign` PoE1, `/poe2-campaign` PoE2) — public
+### Campaign Guide pages (`/campaign` PoE1 public, `/poe2-campaign` PoE2 admin-only)
 
 Act-by-act rush guides: fastest route, league-start and second-character item lists, and every
 quest/encounter that grants a permanent character bonus (passive skill points for PoE1; a wider
-mix of passive points/resistances/Spirit/max life for PoE2). Both public, listed in `PAGES`, no
-admin gate, no live per-page data fetch (fully static content, same "no polling" character as the
-old `/poe2-campaign` stub it replaced).
+mix of passive points/resistances/Spirit/max life for PoE2). No live per-page data fetch (fully
+static content, same "no polling" character as the old `/poe2-campaign` stub it replaced).
+`/campaign` is public, listed in `PAGES`, no admin gate. `/poe2-campaign` briefly went public the
+same way, then was deactivated back to admin-only per explicit request — same pattern as `/snipe`
+now, not listed in `PAGES`, injected client-side into the site menu by `enableAdminUI()`, hidden
+`/home` card with the "Admin only" badge again. Its content/rendering logic is unchanged; only the
+gating flipped back.
 
 - **Shared generator helpers, not hand-duplicated HTML** (`boss.py`, right after
   `_favicon_data_uri()`): `_campaign_act_svg(n_steps, quest_pins)` builds one inline schematic
@@ -595,12 +599,36 @@ old `/poe2-campaign` stub it replaced).
   shared) reading/writing a **separate** `bossFarmLeaguePoe2` localStorage key so picking a league
   on `/poe2-campaign` never leaks into PoE1 pages' saved preference or vice versa. `/campaign`
   (PoE1) just reuses the standard `bossFarmLeague` key like every other PoE1 page.
-- Both listed in `PAGES` (`/campaign` → `game: "poe1"`, `/poe2-campaign` → `game: "poe2"`),
-  `PAGE_REQUIRES_ADMIN = false`, included in `sitemap.xml`, home-page cards with no
-  `hidden data-admin-only`. `/poe2-campaign` replacing its old admin-only stub also removed the
-  now-redundant `poe2Group` link-injection block from `enableAdminUI()` (`SHARED_JS_CHROME`) — it
-  no longer needs client-side injection since `render_sitemenu()` puts it in the static HTML
-  directly, same as every other public page.
+- `/campaign` is listed in `PAGES` (`game: "poe1"`), `PAGE_REQUIRES_ADMIN = false`, included in
+  `sitemap.xml`, home-page card with no `hidden data-admin-only`. `/poe2-campaign` is deliberately
+  **not** listed in `PAGES` (same precedent as `/snipe`), `PAGE_REQUIRES_ADMIN = true`, excluded
+  from `sitemap.xml`, home-page card back to `hidden data-admin-only` + the "Admin only" badge —
+  its site-menu link is injected client-side by the `poe2Group` block in `enableAdminUI()`
+  (`SHARED_JS_CHROME`), same mechanism as `/snipe`'s `poe1Group` block right above it.
+- **External sources used while building this content** (kept here so a future session can go
+  back to them instead of re-researching from scratch):
+  - `https://github.com/HeartofPhos/exile-leveling` / `https://heartofphos.github.io/exile-leveling/`
+    — MIT-licensed, actively maintained PoE1 leveling-route tool; primary source for
+    `POE1_CAMPAIGN_ACTS`'s route/quest/trial data, fetched directly from
+    `https://raw.githubusercontent.com/HeartofPhos/exile-leveling/main/common/data/routes/act-<N>.txt`
+    (acts 1-10).
+  - `https://www.poewiki.net/wiki/Act_1`, `https://www.poewiki.net/wiki/Trial_of_Ascendancy`,
+    `https://www.poewiki.net/wiki/Guide:Campaign_landmarks` — the "official" PoE1 wiki pages for
+    this content; user-supplied links, but automated fetch hit the Anubis anti-bot block both
+    times it was tried this session (see the Lessons section) — not actually used as a data
+    source, exile-leveling was used instead. Worth retrying directly if poewiki becomes fetchable
+    again (it's intermittent, not permanently blocked).
+  - `https://maxroll.gg/poe/getting-started/campaign-guide` — has its own per-act annotated route
+    map images; considered and rejected as an image source since they're Maxroll's own copyrighted
+    graphics, not something this site can legally hotlink or copy (see the map-images bullet
+    above).
+  - `https://maxroll.gg/poe2/getting-started/comprehensive-league-start-leveling-guide` — primary
+    source for `POE2_CAMPAIGN_ACTS`'s act/interlude permanent-bonus list (Beira, Crowbell, Kabala,
+    Silverfist, Orbala's Pillars, etc.).
+  - `https://www.gamer.org/path-of-exile-all-campaign-skill-point-quests/` and
+    `https://www.pathofexile.com/forum/view-thread/2150196` — early research pass for the PoE1
+    24-bonus-passive-point quest list (name/act/reward), cross-checked against and then superseded
+    in detail by the exile-leveling data above once that source was found.
 
 ### Admin detection (`admin-extension/`, `SHARED_JS_CHROME`)
 
@@ -608,9 +636,9 @@ A personal "PoE Helper Admin" Chrome extension (unpublished, loaded unpacked —
 `admin-extension/manifest.json`) flags the site's owner as admin in their own browser. **This is
 not real authentication** — it's a client-side convenience flag with nothing sensitive behind it
 (this repo has no login/database/write endpoints, see Security below). Currently gates: showing
-the hidden Trade Sniper link in the site menu (see the "not listed in `PAGES`" note above), a
-small `ADMIN` chip in the header, and redirecting non-admin visitors away from any page marked
-`PAGE_REQUIRES_ADMIN` (currently just `/snipe`) back to `/home`.
+the hidden Trade Sniper and PoE2 Campaign links in the site menu (see the "not listed in `PAGES`"
+note above), a small `ADMIN` chip in the header, and redirecting non-admin visitors away from any
+page marked `PAGE_REQUIRES_ADMIN` (currently `/snipe` and `/poe2-campaign`) back to `/home`.
 
 - **Handshake, not a plain flag**: the extension's content script runs in an isolated JS world and
   can't set a property directly on the page's own `window` — a `CustomEvent` dispatched on
@@ -641,7 +669,7 @@ small `ADMIN` chip in the header, and redirecting non-admin visitors away from a
   handshake hasn't confirmed them by then; it does **not** protect anything (there's nothing
   sensitive server-side to protect — see Security below), it just keeps a stray/unlisted-page
   visitor from landing on unfinished UI. `PAGE_REQUIRES_ADMIN` is a plain `const` prepended before
-  `SHARED_JS_CHROME` in each `render_<page>_page()` (`true` for `/snipe` only,
+  `SHARED_JS_CHROME` in each `render_<page>_page()` (`true` for `/snipe` and `/poe2-campaign`,
   `false` elsewhere) — add the same line (with the right value) to any future page's own
   `render_*` function; there's no automatic per-page default. Since `PAGE_REQUIRES_ADMIN` must
   exist before `SHARED_JS_CHROME`'s own top-level code reads it, and everything here is one
@@ -668,7 +696,7 @@ small `ADMIN` chip in the header, and redirecting non-admin visitors away from a
 - **`build_static.py`** imports `boss.py` directly (`ENTITIES`, `PAGE`, `OVERVIEW_SLUG`, `EXCHANGE_CATEGORIES`, etc. — all single-sourced, nothing duplicated) and does two textual substitutions on `PAGE`: `__POLL_MS__` (same as `boss.py`) and a full-text replace of the `fetchData()` function (`OLD_FETCH_DATA` constant — **must match `boss.py`'s `fetchData()` byte-for-byte** or the build raises `RuntimeError` by design; update both together whenever `fetchData()` changes) with `FETCH_ENGINE`, a client-side JS port of `build_index()`/`build_payload()` that calls the Worker instead of poe.ninja/poe.watch directly. Kept as a close line-by-line translation of the Python on purpose, including the same floor-price/`chaos_unided`-override/"no ceiling below the floor" logic — verified against `boss.py`'s actual behavior with a mocked-`fetch` Node test (not committed; rebuild one in the scratchpad if you touch the pricing logic again).
   - The index in `FETCH_ENGINE` is a `Map<name, Map<type, entry>>`, not a single string-keyed map — item names routinely contain spaces (`"The Rippling Thoughts"`), so a delimiter-joined string key isn't safely reversible (this was a real bug caught before it shipped).
 - **Two independent things read `currentLeague`**: `boss.py`'s own `fetchData()` (used locally, appends `?league=` to `/api/data` only if set — `do_GET` parses that query param and falls back to the server's `--league` default) and `FETCH_ENGINE`'s `fetchData()` (`currentLeague || LEAGUE`, the embedded build-time default). Both must be kept in sync with any future change to the league-selection UI.
-- **`build_static.py` builds all six pages**: `build/home/index.html`, `build/bosses/index.html` (via `render_page()`, the pricing-engine swap described above), `build/snipe/index.html`, `build/poe2-campaign/index.html`, `build/flip-advisor/index.html`, and `build/campaign/index.html` (the latter five need no pricing-engine swap — only `__LEAGUE_JSON__` gets substituted, same as `boss.py`'s own `main()` does locally; `/home` and `/flip-advisor` additionally get their own small `PATCH_NOTES_BASE`/`FLIP_ADVISOR_BASE` URL swaps, see their own sections above; `/poe2-campaign` gets the separate `--league-poe2` value instead of `--league`, see the Campaign Guide section above). `sitemap.xml` lists `/home`, `/bosses`, `/flip-advisor`, `/campaign`, and `/poe2-campaign` (`/snipe` deliberately left out while admin-only/unadvertised, same reasoning as before).
+- **`build_static.py` builds all six pages**: `build/home/index.html`, `build/bosses/index.html` (via `render_page()`, the pricing-engine swap described above), `build/snipe/index.html`, `build/poe2-campaign/index.html`, `build/flip-advisor/index.html`, and `build/campaign/index.html` (the latter five need no pricing-engine swap — only `__LEAGUE_JSON__` gets substituted, same as `boss.py`'s own `main()` does locally; `/home` and `/flip-advisor` additionally get their own small `PATCH_NOTES_BASE`/`FLIP_ADVISOR_BASE` URL swaps, see their own sections above; `/poe2-campaign` gets the separate `--league-poe2` value instead of `--league`, see the Campaign Guide section above). `sitemap.xml` lists `/home`, `/bosses`, `/flip-advisor`, and `/campaign` (`/snipe` and `/poe2-campaign` deliberately left out while admin-only/unadvertised, same reasoning as before) — all six pages still build and work at their URLs regardless.
 - **`wrangler.toml`'s Durable Object migrations are additive, never edited in place**: `SnipeSession` was introduced as `tag = "v2"` (`deleted_classes: ["SnipeTestDO"]` from the throwaway prototype used to validate the WebSocket approach, `new_sqlite_classes: ["SnipeSession"]`) layered after the original `tag = "v1"` migration — Cloudflare requires migration history to be append-only. If `SnipeSession`'s shape ever needs to change in a way that isn't backward-compatible with existing running instances, add a new `tag = "v3"` migration; don't rewrite `v1`/`v2`.
 - **Regenerate command**: `python build_static.py --worker-url https://poe-farm-helper.com --league Allflame --poll 120 --out build`, then `cd worker && wrangler deploy` (or push, if Git-connected Workers Builds auto-deploy is set up — see `wrangler.toml`'s `[build]` block, which runs `build_static.py` itself in Cloudflare's CI). **Confirmed live**: Cloudflare's Workers Builds environment does have `python` available — the `[custom build] Running: python ../build_static.py ...` step has succeeded on every deploy so far, both the Git-connected pipeline and a plain local `wrangler deploy` (which also runs the `[build]` command first).
 - **Custom domain (`poe-farm-helper.com`) bound via `routes` in `wrangler.toml`** (`{ pattern = "poe-farm-helper.com", custom_domain = true }` — note: Custom Domain routes take a **bare hostname only**, `poe-farm-helper.com/*` errors with "Wildcard operators (*) are not allowed in Custom Domains"). **`workers_dev = true` is set explicitly** alongside it — Wrangler disables `workers_dev` by default the moment any custom domain route exists, which silently broke the pre-existing `boss-farm-calculator.<account>.workers.dev` URL the first time this was deployed (a real outage, caught immediately by re-curling it). Anything that depends on the `.workers.dev` URL specifically (e.g. AdSense site verification, set up before the custom domain existed) needs that URL to keep working — don't remove `workers_dev = true` without checking what still points at it. After binding a brand-new custom domain, expect an SSL-provisioning delay (schannel/curl error `SEC_E_ILLEGAL_MESSAGE` while DNS already resolves correctly to Cloudflare's IPs) — this clears on its own, it isn't a config error to chase.
