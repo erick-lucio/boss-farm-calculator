@@ -28,6 +28,7 @@ import argparse
 import concurrent.futures
 import html as html_module  # aliased — this file uses `html` as a local var name everywhere
 import json
+import mimetypes
 import os
 import re
 import subprocess
@@ -1229,7 +1230,10 @@ PAGES = [
     # anything into it) hides itself entirely via CSS (:has() — see SHARED_CSS).
     {"slug": "home", "icon": "&#129517;", "menu_key": "menu_home", "label_en": "Home", "game": None},
     {"slug": "bosses", "icon": "&#128128;", "menu_key": "menu_bosses", "label_en": "Boss Farm", "game": "poe1"},
-    # Admin-only pages (Trade Sniper, PoE2 Campaign) intentionally not listed here —
+    {"slug": "flip-advisor", "icon": "&#128177;", "menu_key": "menu_flip_advisor", "label_en": "Flip Advisor", "game": "poe1"},
+    {"slug": "campaign", "icon": "&#128506;", "menu_key": "menu_campaign", "label_en": "Campaign Guide", "game": "poe1"},
+    {"slug": "poe2-campaign", "icon": "&#9876;&#65039;", "menu_key": "menu_poe2_campaign", "label_en": "PoE2 Campaign", "game": "poe2"},
+    # Admin-only pages (Trade Sniper) intentionally not listed here —
     # hidden from the site menu for everyone else, injected client-side (into the
     # matching game's <div class="sitemenu-group">) by enableAdminUI() only once the
     # admin handshake confirms. Their /slug routes still render and work for anyone
@@ -1276,6 +1280,180 @@ def _favicon_data_uri(emoji):
     return "data:image/svg+xml," + urllib.parse.quote(svg)
 
 
+# --------------------------------------------------------------------------- #
+# Campaign Guide pages (/campaign PoE1, /poe2-campaign PoE2) — shared helpers
+# --------------------------------------------------------------------------- #
+# Both games' campaign act data (POE1_CAMPAIGN_ACTS / POE2_CAMPAIGN_ACTS,
+# defined further down near their respective pages) feeds these two
+# generators. This is the one place in the file where a page's body/I18N is
+# built by looping over Python data instead of hand-written per-section HTML
+# (unlike BOSSES_BODY, which is empty chrome hydrated by a live JSON payload
+# client-side) — justified because this content is fully static/known at
+# build time, and hand-duplicating ~10 (PoE1) / ~7 (PoE2) nearly-identical
+# act sections twice each (EN+PT) would be pure repetition. Each act still
+# ultimately renders through the same data-i18n + applyStaticI18n() mechanism
+# every other page uses (same precedent as I18N.note's large prose block) —
+# only the per-act SVG stays outside that, since it's language-neutral
+# (numbers/letters only, no embedded prose, so it never needs re-rendering
+# on a language switch).
+#
+# Route "waypoints" and pin positions are deliberately schematic, not
+# to-scale real map coordinates or a literal turn-by-turn speedrun path —
+# zone sub-connections can shift slightly between patches even when the
+# major zone names don't, so this shows visit ORDER of the major named
+# zones/quest objectives, not exact geometry. Quest-giver NPC names are
+# intentionally omitted (several community sources disagree with each other
+# on exactly who hands out which of these quests) in favor of the objective
+# zone, which every source agrees on — same "don't state what isn't
+# confidently known" policy as the RePoE/divination-card precedent elsewhere
+# in this file.
+def _campaign_act_svg(n_steps, quest_pins):
+    """n_steps: number of route waypoints. quest_pins: list of
+    (waypoint_index, letter) for each must-do quest, letter matches the
+    lettered quest list rendered beside it. Inline SVG (no separate asset
+    file, same precedent as _favicon_data_uri), using var(--...) CSS custom
+    properties for fill/stroke so it re-themes with the rest of the page.
+
+    Route arrows point at the actual next waypoint (computed from the real
+    vector between the two node centers via an auto-oriented SVG marker),
+    not a fixed direction — a zigzag route has diagonal segments, so a
+    hardcoded up/down arrow would point at nothing. Quest pins are plain
+    (non-directional) dots on a leader line, precisely because they are NOT
+    route-direction indicators — only the route line itself carries an
+    arrowhead, so there's no longer any arrow that could point the wrong way."""
+    step_w = 90
+    pad_x = 30
+    row_y = (46, 108)
+    height = 150
+    pts = [(pad_x + i * step_w, row_y[i % 2]) for i in range(max(n_steps, 1))]
+    width = pad_x * 2 + max(n_steps - 1, 0) * step_w
+    parts = [f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+             f'role="img" aria-label="route map">']
+    parts.append('<defs><marker id="campaign-arrow" viewBox="0 0 10 10" refX="8" refY="5" '
+                 'markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
+                 '<path d="M0,0 L10,5 L0,10 z" fill="var(--gold-bright)"/></marker></defs>')
+    for i in range(len(pts) - 1):
+        x1, y1 = pts[i]
+        x2, y2 = pts[i + 1]
+        dx, dy = x2 - x1, y2 - y1
+        dist = (dx * dx + dy * dy) ** 0.5 or 1
+        ux, uy = dx / dist, dy / dist
+        # stop short of the destination circle (r=12) so the arrowhead sits
+        # right at its edge instead of hiding underneath it
+        ex, ey = x2 - ux * 14, y2 - uy * 14
+        sx, sy = x1 + ux * 13, y1 + uy * 13
+        parts.append(f'<line x1="{sx:.1f}" y1="{sy:.1f}" x2="{ex:.1f}" y2="{ey:.1f}" '
+                     f'stroke="var(--line)" stroke-width="2" marker-end="url(#campaign-arrow)"/>')
+    for i, (x, y) in enumerate(pts):
+        parts.append(f'<circle cx="{x}" cy="{y}" r="12" fill="var(--panel2)" '
+                     f'stroke="var(--gold-bright)" stroke-width="2"/>')
+        parts.append(f'<text x="{x}" y="{y+4}" text-anchor="middle" font-size="11" '
+                     f'font-weight="700" fill="var(--gold-bright)">{i+1}</text>')
+    for wp_idx, letter in quest_pins:
+        x, y = pts[wp_idx]
+        up = y < height / 2
+        py = y - 28 if up else y + 28
+        parts.append(f'<line x1="{x}" y1="{y}" x2="{x}" y2="{py}" stroke="var(--ok)" '
+                     f'stroke-width="1.5" stroke-dasharray="2,2"/>')
+        parts.append(f'<circle cx="{x}" cy="{py}" r="8" fill="var(--ok)"/>')
+        parts.append(f'<text x="{x}" y="{py+3.5}" text-anchor="middle" font-size="9" '
+                     f'font-weight="700" fill="var(--panel)">{letter}</text>')
+    parts.append('</svg>')
+    return "".join(parts)
+
+
+def _campaign_act_content_html(act, lang):
+    """Builds one act's full inner HTML for one language — becomes an
+    I18N[lang]['campaign_<id>'] value, swapped in via data-i18n like every
+    other large-prose block in this file (see I18N.note)."""
+    def pick(en, pt):
+        return en if lang == "en" else pt
+
+    title = pick(act["title_en"], act["title_pt"])
+    route = act["route_en"] if lang == "en" else act["route_pt"]
+    parts = [f'<h3 class="campaign-act-title">{title}</h3>']
+    parts.append('<div class="campaign-section-label">' + pick("Route", "Rota") + '</div>')
+    parts.append('<div class="campaign-route-list">')
+    for i, wp in enumerate(route):
+        parts.append(f'<div class="rstep"><span class="rnum">{i+1}</span><span>{wp}</span></div>')
+    parts.append('</div>')
+    if act["quests"]:
+        parts.append('<div class="campaign-section-label">'
+                      + pick("Do these — passive skill points", "Faça estas — pontos de passiva") + '</div>')
+        for i, q in enumerate(act["quests"]):
+            letter = chr(65 + i)
+            name = pick(q["name_en"], q["name_pt"])
+            zone = pick(q["zone_en"], q["zone_pt"])
+            note = pick(q["note_en"], q["note_pt"])
+            parts.append(
+                f'<div class="campaign-quest"><div class="cq-head">'
+                f'<span class="cq-pin">{letter}</span> {name} '
+                f'<span class="cq-reward">{q["reward"]}</span></div>'
+                f'<div class="cq-zone">{zone}</div><div>{note}</div></div>')
+    if act.get("boss_en"):
+        boss = pick(act["boss_en"], act["boss_pt"])
+        parts.append('<div class="campaign-section-label">' + pick("Act boss", "Chefe do ato") + '</div>'
+                      + f'<div>{boss}</div>')
+    return "".join(parts)
+
+
+def _render_campaign_acts(acts, img_dir=None):
+    """Returns (body_html, en_i18n_js_entries, pt_i18n_js_entries) for a full
+    campaign page's act-by-act section. The two *_i18n_js_entries strings are
+    raw JS object-literal source (one `key: "...",` line per act) meant to be
+    embedded directly inside that page's I18N.en/I18N.pt blocks — each value
+    is produced via json.dumps() rather than a hand-escaped template
+    literal, since JSON string syntax is valid JS string syntax and safely
+    handles any apostrophes/quotes in the generated HTML (e.g. quest names
+    like "Dweller's Deep") without manual escaping.
+
+    img_dir: if given (e.g. "/imgs/poe1"), each act shows the real supplied
+    map screenshot ("<img_dir>/act<N>.png", N from the act's "a<N>" id) as
+    its route visual instead of the generated schematic SVG — these images
+    already show the actual route nodes, branches, and quest markers (from a
+    real leveling-route tool), which is strictly more accurate than our own
+    simplified schematic, so when a real image exists it takes over
+    entirely rather than sitting as a background behind our SVG. None (the
+    default) falls back to `_campaign_act_svg()` — used for games/acts with
+    no map image yet."""
+    body_chunks = []
+    en_entries = []
+    pt_entries = []
+    for act in acts:
+        key = "campaign_" + act["id"]
+        if img_dir:
+            act_num = act["id"][1:]
+            img_url = f"{img_dir}/act{act_num}.png"
+            visual = (f'<div class="campaign-map-wrap"><img class="campaign-map-img" '
+                      f'src="{img_url}" alt="Act {act_num} route map" loading="lazy"></div>')
+        else:
+            quest_pins = [(q["attach"], chr(65 + i)) for i, q in enumerate(act["quests"])]
+            svg = _campaign_act_svg(len(act["route_en"]), quest_pins)
+            visual = f'<div class="campaign-svg-wrap">{svg}</div>'
+        body_chunks.append(
+            f'<div class="campaign-act">\n{visual}\n'
+            f'<div data-i18n="{key}"></div>\n</div>')
+        en_entries.append(f'  {key}: {json.dumps(_campaign_act_content_html(act, "en"))},')
+        pt_entries.append(f'  {key}: {json.dumps(_campaign_act_content_html(act, "pt"))},')
+    body_html = '<div class="campaign-guide">\n' + "\n".join(body_chunks) + '\n</div>'
+    return body_html, "\n".join(en_entries), "\n".join(pt_entries)
+
+
+def _render_campaign_items(items):
+    """Builds one language-neutral-container .campaign-items grid (item name
+    + why, both en/pt versions rendered as sibling data-lang blocks toggled
+    by the same I18N mechanism)... """
+    # Items render through the same per-act I18N key mechanism — see
+    # _render_campaign_page_body() below, which calls this once per language.
+    parts = ['<div class="campaign-items">']
+    for it in items:
+        parts.append(
+            '<div class="campaign-item"><b>{item}</b><div class="ci-why">{why}</div></div>'
+            .format(item=it["item"], why=it["why"]))
+    parts.append('</div>')
+    return "".join(parts)
+
+
 SHARED_HEAD_TEMPLATE = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -1296,6 +1474,15 @@ SHARED_HEAD_TEMPLATE = r"""<!doctype html>
 <link rel="icon" href="__FAVICON_URL__">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Spectral:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-VNJJSYPYEQ"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-VNJJSYPYEQ');
+</script>
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7517572231491496"
      crossorigin="anonymous"></script>
 <script type="application/ld+json">
@@ -1545,10 +1732,9 @@ footer{border-top:1px solid var(--line); margin-top:auto; padding-top:24px;
   justify-content:space-between; align-items:center; gap:20px; flex-wrap:wrap;
   color:var(--ink-dim); font-size:11.5px; line-height:1.5}
 .foot-credits{display:flex; flex-direction:column; align-items:flex-end; gap:4px; flex:0 0 auto}
-.foot-linkedin{color:var(--gold); white-space:nowrap; font-weight:600}
-.foot-linkedin:hover{color:var(--gold-bright)}
-.foot-dm{color:var(--ink-dim); font-size:11px; white-space:nowrap}
-.foot-dm:hover{color:var(--ink)}
+.foot-byline{color:var(--gold); white-space:nowrap; font-weight:600}
+.foot-contact{color:var(--ink-dim); font-size:11px; white-space:nowrap}
+.foot-contact:hover{color:var(--ink)}
 
 .menutoggle{font-family:ui-monospace,monospace; font-size:16px; line-height:1; color:var(--ink-dim);
   background:var(--panel); border:1px solid var(--line); border-radius:2px;
@@ -1718,6 +1904,37 @@ button.sync:disabled, button.stop:disabled{opacity:.4; cursor:default}
 .flip-step .step-liq{font-family:ui-monospace,monospace; font-size:9.5px; color:var(--ink-dim); white-space:nowrap}
 .flip-step .step-guide{font-family:ui-monospace,monospace; font-size:11px; color:var(--gold-bright);
   background:var(--overlay-soft); border-radius:2px; padding:2px 6px; white-space:nowrap}
+
+.campaign-guide{display:flex; flex-direction:column; gap:20px; margin-top:14px}
+.campaign-act{background:linear-gradient(180deg,var(--panel),var(--panel2));
+  border:1px solid var(--line); border-radius:4px; padding:16px 18px}
+.campaign-act-title{margin:0 0 10px; font-family:"Cinzel",serif; font-weight:700; font-size:15px;
+  letter-spacing:.03em; color:var(--ink)}
+.campaign-svg-wrap{background:var(--overlay-soft); border-radius:4px; padding:10px 10px 4px;
+  margin-bottom:12px; overflow-x:auto}
+.campaign-svg-wrap svg{display:block; width:100%; height:auto; min-width:420px}
+.campaign-map-wrap{border-radius:4px; overflow:hidden; margin-bottom:12px; border:1px solid var(--line);
+  background:var(--overlay-soft)}
+.campaign-map-img{display:block; width:100%; height:auto}
+.campaign-section-label{font-family:"Cinzel",serif; font-weight:700; font-size:11px; letter-spacing:.08em;
+  text-transform:uppercase; color:var(--ink-dim); margin:14px 0 6px}
+.campaign-route-list{display:flex; flex-direction:column; gap:4px; font-size:12.5px}
+.campaign-route-list .rstep{display:flex; gap:8px; align-items:baseline}
+.campaign-route-list .rnum{font-family:ui-monospace,monospace; font-size:10px; color:var(--gold-bright);
+  flex:0 0 auto; width:16px}
+.campaign-quest{border-left:2px solid var(--ok); padding:6px 10px; margin-bottom:6px; font-size:12.5px}
+.campaign-quest .cq-head{font-weight:700; color:var(--ink); display:flex; gap:8px; align-items:baseline;
+  flex-wrap:wrap}
+.campaign-quest .cq-pin{font-family:ui-monospace,monospace; font-size:10px; color:var(--ok);
+  border:1px solid var(--ok); border-radius:2px; padding:0 4px}
+.campaign-quest .cq-reward{font-family:ui-monospace,monospace; font-size:10.5px; color:var(--gold-bright)}
+.campaign-quest .cq-zone{font-size:11px; color:var(--ink-dim)}
+.campaign-items{display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:8px;
+  margin-top:8px; margin-bottom:20px}
+.campaign-item{background:var(--panel); border:1px solid var(--line); border-radius:3px;
+  padding:8px 10px; font-size:12px}
+.campaign-item b{color:var(--ink)}
+.campaign-item .ci-why{color:var(--ink-dim); font-size:11px; margin-top:3px}
 </style>"""
 
 SHARED_HEADER_HTML = r"""<header>
@@ -1748,11 +1965,9 @@ SHARED_FOOTER_HTML = r"""<footer>
   <div class="foot">
     <span data-i18n="footer_disclaimer">Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Prices from poe.ninja/poe.watch, drop data from poewiki/community guides — see the note above for sourcing and caveats.</span>
     <div class="foot-credits">
-      <a class="foot-linkedin" href="https://www.linkedin.com/in/erick-lucioo/" target="_blank" rel="noopener">
-        <span data-i18n="footer_made_by">Built by Erick Lúcio</span> — LinkedIn &#8599;
-      </a>
-      <a class="foot-dm" href="https://www.linkedin.com/in/erick-lucioo/" target="_blank" rel="noopener">
-        <span data-i18n="footer_dm">Suggestion or opinion? Send me a DM on LinkedIn</span> &#8599;
+      <span class="foot-byline" data-i18n="footer_made_by">Built by Erick Lúcio</span>
+      <a class="foot-contact" href="mailto:ericklucio.suv@gmail.com">
+        ericklucio.suv@gmail.com — <span data-i18n="footer_dm">send me an email there for comment or feedback</span>
       </a>
     </div>
   </div>
@@ -1892,7 +2107,6 @@ function enableAdminUI(){
   }
   const menu = document.getElementById('sitemenu');
   const poe1Group = menu && menu.querySelector('.sitemenu-group[data-game="poe1"]');
-  const poe2Group = menu && menu.querySelector('.sitemenu-group[data-game="poe2"]');
   if(poe1Group && !poe1Group.querySelector('a[href="/snipe"]')){
     const isCurrent = location.pathname.startsWith('/snipe');
     const a = document.createElement('a');
@@ -1902,28 +2116,10 @@ function enableAdminUI(){
     a.innerHTML = '&#127919; <span>' + t('menu_snipe') + '</span>';
     poe1Group.appendChild(a);
   }
-  if(poe1Group && !poe1Group.querySelector('a[href="/flip-advisor"]')){
-    const isCurrent = location.pathname.startsWith('/flip-advisor');
-    const a = document.createElement('a');
-    a.className = 'sitemenu-link' + (isCurrent ? ' active' : '');
-    a.href = '/flip-advisor';
-    if(isCurrent) a.setAttribute('aria-current', 'page');
-    a.innerHTML = '&#128177; <span>' + t('menu_flip_advisor') + '</span>';
-    poe1Group.appendChild(a);
-  }
-  if(poe2Group && !poe2Group.querySelector('a[href="/poe2-campaign"]')){
-    const isCurrent = location.pathname.startsWith('/poe2-campaign');
-    const a = document.createElement('a');
-    a.className = 'sitemenu-link' + (isCurrent ? ' active' : '');
-    a.href = '/poe2-campaign';
-    if(isCurrent) a.setAttribute('aria-current', 'page');
-    a.innerHTML = '&#9876;&#65039; <span>' + t('menu_poe2_campaign') + '</span>';
-    poe2Group.appendChild(a);
-  }
-  // Generic marker for any admin-gated content beyond the sitemenu links
-  // above (e.g. the /home page's Trade Sniper / PoE2 Campaign page-cards) —
-  // just add hidden data-admin-only to an element and it reveals itself here
-  // once admin status is confirmed, no per-page wiring needed.
+  // Generic marker for any admin-gated content beyond the sitemenu link
+  // above (e.g. the /home page's Trade Sniper page-card) — just add hidden
+  // data-admin-only to an element and it reveals itself here once admin
+  // status is confirmed, no per-page wiring needed.
   document.querySelectorAll('[data-admin-only]').forEach(el => { el.hidden = false; });
   reorderSiteMenuByGame();
 }
@@ -2072,7 +2268,7 @@ function populateLeagueOptions(data){
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE · BOSS ECONOMY',
-  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor', menu_campaign: 'Campaign Guide',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   btn_refresh: 'Refresh', btn_syncing: 'Syncing…',
   legend_currency: 'currency / fragment', legend_unique: 'unique',
@@ -2106,7 +2302,7 @@ en: {
   warn_retry_title: 'last good data shown above; will retry in {s}s',
   footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Prices from poe.ninja/poe.watch, drop data from poewiki/community guides — see the note above for sourcing and caveats.',
   footer_made_by: 'Built by Erick Lúcio',
-  footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
+  footer_dm: 'Send me an email there for comment or feedback',
   worst: 'Nothing from the loot pool drops this run — every independent chance roll misses, so you just lose the entry cost. Not a hypothetical: most bosses have no guaranteed drop, so this happens often.',
   avg: '<b>Expected value across many runs</b>, not what any single run looks like: EV = Σ(chance × price × qty) summed over every item in the loot pool, minus entry cost. Over enough repeats your real results converge to this number — over a handful of runs they usually don’t.',
   best: 'The single most valuable item in the loot pool drops — not the whole pool at once. Some pools can only ever yield one of several items per kill (e.g. Eater of Worlds’ guaranteed one-of-three pick), so summing every item would overstate the real ceiling.',
@@ -2170,7 +2366,7 @@ en: {
 },
 pt: {
   tagline: 'PATH OF EXILE · ECONOMIA DE BOSS',
-  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Bosses', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Bosses', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip', menu_campaign: 'Guia de Campanha',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   btn_refresh: 'Atualizar', btn_syncing: 'Sincronizando…',
   legend_currency: 'moeda / fragmento', legend_unique: 'único',
@@ -2204,7 +2400,7 @@ pt: {
   warn_retry_title: 'últimos dados bons mostrados acima; tentará de novo em {s}s',
   footer_disclaimer: 'Ferramenta de fã não-oficial — sem afiliação ou endosso da Grinding Gear Games. Preços do poe.ninja/poe.watch, dados de drop do poewiki/guias da comunidade — veja a nota acima pras fontes e ressalvas.',
   footer_made_by: 'Feito por Erick Lúcio',
-  footer_dm: 'Sugestão ou opinião? Me manda uma DM no LinkedIn',
+  footer_dm: 'Manda um e-mail lá para comentário ou feedback',
   worst: 'Nada do loot pool dropa nesse run — todas as chances independentes falham, então você só perde o custo de entrada. Não é hipotético: a maioria dos bosses não tem drop garantido, então isso acontece com frequência.',
   avg: '<b>Valor esperado ao longo de muitos runs</b>, não o que um único run parece: EV = Σ(chance × preço × qtd) somado por todo item do loot pool, menos o custo de entrada. Com repetições suficientes seus resultados reais convergem pra esse número — em poucos runs, geralmente não.',
   best: 'O item mais valioso do loot pool dropa sozinho — não o pool inteiro de uma vez. Alguns pools só permitem um entre vários itens por kill (ex: a escolha garantida de um-entre-três do Eater of Worlds), então somar todos os itens superestimaria o teto real.',
@@ -2820,11 +3016,11 @@ document.getElementById('leaguesel').addEventListener('change', e => {
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE · TRADE SNIPER',
-  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor', menu_campaign: 'Campaign Guide',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games. Uses Path of Exile’s official, unauthenticated trade API to check a curated list of items on a rotation — nothing is stored server-side beyond an active session.',
   footer_made_by: 'Built by Erick Lúcio',
-  footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
+  footer_dm: 'Send me an email there for comment or feedback',
   snipe_intro: 'Watches a curated list of Path of Exile Unique items — the top 50 by poe.ninja listing count ("most sold" proxy) plus the top 50 by poe.ninja price ("most expensive"), deduped — for trade-site listings priced below the current market floor. Checks both the general market and unidentified-only listings (a more solid price reference, since their random rolls aren\'t revealed yet). Rotates through the whole list roughly once every 10 minutes, one item at a time, to stay well within Path of Exile’s trade API rate limits. POESESSID is optional — see below.',
   snipe_scope_note: 'Uniques only — Currency, Fragments, Scarabs, and other stackable currency-type goods are intentionally left out (buy those from Faustus in-game instead, at a fixed Artifacts price). Also: every listing found here requires whispering the seller in-game to complete the trade — Path of Exile’s Instant Buyout / Asynchronous Trade system has no public API, so this can’t show or filter to instant-buyout-only listings.',
   snipe_threshold_label: 'Underpriced by at least',
@@ -2866,11 +3062,11 @@ en: {
 },
 pt: {
   tagline: 'PATH OF EXILE · CAÇADOR DE OFERTAS',
-  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip', menu_campaign: 'Guia de Campanha',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games. Usa a API oficial e não-autenticada de troca do Path of Exile para checar uma lista selecionada de itens em rodízio — nada é guardado no servidor além de uma sessão ativa.',
   footer_made_by: 'Feito por Erick Lúcio',
-  footer_dm: 'Sugestão ou opinião? Manda um DM no LinkedIn',
+  footer_dm: 'Manda um e-mail lá para comentário ou feedback',
   snipe_intro: 'Monitora uma lista selecionada de itens Únicos do Path of Exile — os 50 mais listados no poe.ninja (indicador de "mais vendidos") mais os 50 de maior preço no poe.ninja ("mais caros"), sem repetição — em busca de anúncios com preço abaixo do valor de mercado atual. Verifica tanto o mercado geral quanto anúncios não identificados (uma referência de preço mais sólida, já que as propriedades aleatórias ainda não foram reveladas). Passa pela lista inteira a cada ~10 minutos, um item de cada vez, para ficar bem dentro dos limites de requisição da API de troca do Path of Exile. POESESSID é opcional — veja abaixo.',
   snipe_scope_note: 'Apenas itens Únicos — Moedas, Fragmentos, Scarabs e outros itens empilháveis do tipo moeda ficam de fora de propósito (compre esses do Faustus dentro do jogo, por um preço fixo em Artefatos). Além disso: todo anúncio encontrado aqui exige sussurrar para o vendedor dentro do jogo para completar a troca — o sistema de Compra Instantânea / Troca Assíncrona do Path of Exile não tem API pública, então isso não consegue mostrar ou filtrar só os anúncios de compra instantânea.',
   snipe_threshold_label: 'Abaixo do preço em pelo menos',
@@ -3284,14 +3480,20 @@ HOME_BODY = r"""
           </div>
           <span class="page-card-badge" data-i18n="home_card_admin_badge">Admin only</span>
         </a>
-        <a class="page-card" href="/flip-advisor" hidden data-admin-only>
+        <a class="page-card" href="/flip-advisor">
           <div class="page-card-head"><span class="pc-icon">&#128177;</span> <span data-i18n="home_card_flipadvisor_title">Flip Advisor</span></div>
           <div class="page-card-desc" data-i18n="home_card_flipadvisor_desc">
             Ranks Currency Exchange pairs by historical hourly spread%, plus multi-step buy/sell
             strategies with a whole-unit trade guide — a volatility signal to check live, not a
             guaranteed profit.
           </div>
-          <span class="page-card-badge" data-i18n="home_card_admin_badge">Admin only</span>
+        </a>
+        <a class="page-card" href="/campaign">
+          <div class="page-card-head"><span class="pc-icon">&#128506;</span> <span data-i18n="home_card_campaign_title">Campaign Guide</span></div>
+          <div class="page-card-desc" data-i18n="home_card_campaign_desc">
+            Fastest campaign route act by act, league-start and second-character item lists, and
+            every quest that grants a bonus passive skill point — with a route map per act.
+          </div>
         </a>
       </div>
       <div class="patchnotes" id="patchNotesPoe1">
@@ -3309,12 +3511,12 @@ HOME_BODY = r"""
         below to stay current in the meantime.
       </div>
       <div class="page-cards">
-        <a class="page-card" href="/poe2-campaign" hidden data-admin-only>
+        <a class="page-card" href="/poe2-campaign">
           <div class="page-card-head"><span class="pc-icon">&#9876;&#65039;</span> <span data-i18n="home_card_poe2campaign_title">PoE2 Campaign</span></div>
           <div class="page-card-desc" data-i18n="home_card_poe2campaign_desc">
-            Placeholder page for future Path of Exile 2 campaign notes — not built yet.
+            Fastest campaign route act by act, league-start and second-character item lists, and
+            every permanent bonus available in Early Access so far.
           </div>
-          <span class="page-card-badge" data-i18n="home_card_admin_badge">Admin only</span>
         </a>
       </div>
       <div class="patchnotes" id="patchNotesPoe2">
@@ -3351,12 +3553,12 @@ document.getElementById('leaguesel').addEventListener('change', e => {
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE · HUB',
-  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor', menu_campaign: 'Campaign Guide',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   btn_refresh: 'Refresh', btn_syncing: 'syncing…',
   footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games.',
   footer_made_by: 'Built by Erick Lúcio',
-  footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
+  footer_dm: 'Send me an email there for comment or feedback',
   home_toggle_poe1: 'Path of Exile 1',
   home_toggle_poe2: 'Path of Exile 2',
   home_toggle_note: 'Pick your game — this only reorders the menu on the left. Both games\' info stays visible below either way.',
@@ -3370,9 +3572,11 @@ en: {
   home_card_snipe_title: 'Trade Sniper',
   home_card_snipe_desc: 'Watches a curated list of top Unique items for trade-site listings priced below the current market floor, checked live against the official trade API.',
   home_card_poe2campaign_title: 'PoE2 Campaign',
-  home_card_poe2campaign_desc: 'Placeholder page for future Path of Exile 2 campaign notes — not built yet.',
+  home_card_poe2campaign_desc: 'Fastest campaign route act by act, league-start and second-character item lists, and every permanent bonus available in Early Access so far.',
   home_card_flipadvisor_title: 'Flip Advisor',
   home_card_flipadvisor_desc: 'Ranks Currency Exchange pairs by historical hourly spread%, plus multi-step buy/sell strategies with a whole-unit trade guide — a volatility signal to check live, not a guaranteed profit.',
+  home_card_campaign_title: 'Campaign Guide',
+  home_card_campaign_desc: 'Fastest campaign route act by act, league-start and second-character item lists, and every quest that grants a bonus passive skill point — with a route map per act.',
   home_card_admin_badge: 'Admin only',
   home_patchnotes_label: 'Recent patch notes',
   home_patchnotes_loading: 'Loading…',
@@ -3381,12 +3585,12 @@ en: {
 },
 pt: {
   tagline: 'PATH OF EXILE · CENTRAL',
-  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip', menu_campaign: 'Guia de Campanha',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   btn_refresh: 'Atualizar', btn_syncing: 'sincronizando…',
   footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games.',
   footer_made_by: 'Feito por Erick Lúcio',
-  footer_dm: 'Sugestão ou opinião? Manda um DM no LinkedIn',
+  footer_dm: 'Manda um e-mail lá para comentário ou feedback',
   home_toggle_poe1: 'Path of Exile 1',
   home_toggle_poe2: 'Path of Exile 2',
   home_toggle_note: 'Escolha seu jogo — isso só reordena o menu à esquerda. As informações dos dois jogos continuam visíveis abaixo de qualquer forma.',
@@ -3400,9 +3604,11 @@ pt: {
   home_card_snipe_title: 'Caçador de Ofertas',
   home_card_snipe_desc: 'Monitora uma lista selecionada dos principais itens Únicos em busca de anúncios com preço abaixo do valor de mercado atual, checados ao vivo na API oficial de troca.',
   home_card_poe2campaign_title: 'Campanha PoE2',
-  home_card_poe2campaign_desc: 'Página placeholder para futuras notas de campanha do Path of Exile 2 — ainda não construída.',
+  home_card_poe2campaign_desc: 'Rota mais rápida da campanha ato a ato, listas de itens de início de liga e de segundo personagem, e todo bônus permanente disponível no Early Access até agora.',
   home_card_flipadvisor_title: 'Conselheiro de Flip',
   home_card_flipadvisor_desc: 'Classifica pares da Currency Exchange pelo spread% histórico por hora, além de estratégias de compra/venda em múltiplas etapas com um guia de troca em unidades inteiras — um sinal de volatilidade para checar ao vivo, não um lucro garantido.',
+  home_card_campaign_title: 'Guia de Campanha',
+  home_card_campaign_desc: 'Rota mais rápida da campanha ato a ato, listas de itens de início de liga e de segundo personagem, e toda quest que dá um ponto de passiva bônus — com mapa de rota por ato.',
   home_card_admin_badge: 'Somente admin',
   home_patchnotes_label: 'Notas de atualização recentes',
   home_patchnotes_loading: 'Carregando…',
@@ -3522,54 +3728,355 @@ def render_home_page():
 
 
 # --------------------------------------------------------------------------- #
-# PoE2 Campaign page (/poe2-campaign) — admin-only placeholder
+# Campaign Guide page (/campaign) — PoE1, public
 # --------------------------------------------------------------------------- #
-# Not listed in PAGES (same precedent as /snipe) — injected into the site menu
-# client-side by enableAdminUI() only once the admin handshake confirms.
-# Deliberately just a "coming soon" stub for now: this repo has no PoE2
-# support beyond the home page's patch-notes panel yet. Real content later.
-POE2_CAMPAIGN_EXTRA_CONTROLS = ""
+# Rush route, act-by-act tips, league-start/second-character item lists, and
+# every quest that grants a bonus passive skill point (24 total across the
+# 10-act campaign) — see _render_campaign_acts()'s docstring above for the
+# sourcing/accuracy policy (objective zone, not NPC name; schematic route,
+# not literal turn-by-turn geometry).
+POE1_LEAGUE_START_ITEMS = [
+    {"item_en": "Wanderlust (unique boots)", "item_pt": "Wanderlust (botas única)",
+     "why_en": "Movement speed with no snare/chill/temporal-chains penalty — cheap, huge early QoL.",
+     "why_pt": "Velocidade de movimento sem penalidade de lentidão/gelo/correntes temporais — barata, ótima qualidade de vida cedo."},
+    {"item_en": "Goldrim (unique helmet)", "item_pt": "Goldrim (elmo único)",
+     "why_en": "All resistances plus increased rarity for a few chaos — the single best early defensive upgrade.",
+     "why_pt": "Todas as resistências mais raridade aumentada por poucos chaos — a melhor melhoria defensiva do início de liga."},
+    {"item_en": "Tabula Rasa (unique body armour)", "item_pt": "Tabula Rasa (peitoral único)",
+     "why_en": "A fully-linked 6-socket white chest — 6-links your leveling skill from level 1 instead of grinding currency for one.",
+     "why_pt": "Peitoral branco com 6 conexões já prontas — dá 6-link na sua skill de leveling desde o nível 1, sem precisar farmar currency."},
+    {"item_en": "Lifesprig (unique wand, for casters)", "item_pt": "Lifesprig (varinha única, para conjuradores)",
+     "why_en": "Cast speed plus a free level-1 spell socketed in — a strong free starting weapon for spellcasters.",
+     "why_pt": "Velocidade de conjuração e um feitiço nível 1 grátis já encaixado — ótima arma inicial de graça para conjuradores."},
+    {"item_en": "Full rare-set vendor recipe", "item_pt": "Receita de vendedor com set raro completo",
+     "why_en": "Selling a matching rare helmet + gloves + boots + chest (normal rarity, no quality/links) to any town vendor returns a random unique of that slot — a free shot at exactly the items above.",
+     "why_pt": "Vender um set raro combinando (elmo + luvas + botas + peitoral, sem qualidade/conexões) para qualquer vendedor da cidade devolve um único aleatório daquele slot — uma chance grátis de conseguir os itens acima."},
+]
 
-POE2_CAMPAIGN_BODY = r"""
+POE1_SECOND_CHAR_ITEMS = [
+    {"item_en": "Buy Wanderlust / Goldrim / Tabula Rasa outright", "item_pt": "Compre Wanderlust / Goldrim / Tabula Rasa direto",
+     "why_en": "With currency already banked from your first character, just buy these instead of relying on the vendor recipe — a few chaos each right at league start.",
+     "why_pt": "Com currency já guardada do seu primeiro personagem, compre esses itens direto em vez de depender da receita — poucos chaos cada logo no início da liga."},
+    {"item_en": "20% quality gems", "item_pt": "Gemas com 20% de qualidade",
+     "why_en": "Buy (or apply Gemcutter's Prisms to) your leveling skill and support gems immediately — noticeably smoother than leveling with 0%-quality gems.",
+     "why_pt": "Compre (ou aplique Prismas de Cortador de Gemas em) sua skill de leveling e suportes desde já — bem mais suave que nivelar com gemas de 0% de qualidade."},
+    {"item_en": "A build-appropriate leveling unique weapon", "item_pt": "Uma arma única de leveling adequada à build",
+     "why_en": "Second characters can afford a real leveling weapon (a cheap low-level unique matching the new build's damage type) immediately instead of grinding to it.",
+     "why_pt": "Personagens secundários já podem comprar uma arma de leveling de verdade (uma única barata e de nível baixo, compatível com o tipo de dano da build) em vez de precisar farmar até conseguir uma."},
+    {"item_en": "Chaos and Alchemy orbs on hand", "item_pt": "Chaos e Orbes de Alquimia em mãos",
+     "why_en": "Upgrade good rare drops into full rares as you go, instead of relying only on the unique-item vendor recipes above for gear.",
+     "why_pt": "Melhore drops raros bons conforme joga, em vez de depender só das receitas de vendedor por itens únicos para equipamento."},
+]
 
+# Route/quest/boss data cross-checked against the exile-leveling project
+# (github.com/HeartofPhos/exile-leveling, MIT licensed) — an actively
+# maintained, open-source route dataset used by a real community leveling
+# tool, not this file's own guesswork. "attach" is the 0-based index into
+# route_en/route_pt the quest's pin renders next to (only used by the
+# _campaign_act_svg() fallback — see img_dir in the _render_campaign_acts()
+# call below; PoE1 currently always has a real map image, so this only
+# matters if that image is ever removed for an act). Bandit choice assumed
+# is "kill all three" (the standard leveling recommendation, +2 passive).
+POE1_CAMPAIGN_ACTS = [
+    {"id": "a1", "title_en": "Act 1 — The Twilight Strand", "title_pt": "Ato 1 — A Faixa do Crepúsculo",
+     "route_en": ["Lioneye's Watch (town)", "The Coast", "The Mud Flats", "The Submerged Passage",
+                  "The Tidal Island (side)", "The Flooded Depths", "The Ledge", "The Climb",
+                  "The Lower Prison", "The Upper Prison", "Prisoner's Gate", "The Ship Graveyard",
+                  "The Cavern of Wrath", "The Cavern of Anger", "Merveil's Lair"],
+     "route_pt": ["Vigia de Lioneye (cidade)", "A Costa", "Os Pântanos Lodosos", "A Passagem Submersa",
+                  "A Ilha das Marés (opcional)", "As Profundezas Alagadas", "A Saliência", "A Subida",
+                  "A Prisão Inferior", "A Prisão Superior", "O Portão do Prisioneiro", "Cemitério de Navios",
+                  "A Caverna da Ira", "A Caverna da Fúria", "Covil de Merveil"],
+     "quests": [
+        {"attach": 5, "name_en": "The Dweller of the Deep", "name_pt": "O Habitante das Profundezas",
+         "zone_en": "The Flooded Depths", "zone_pt": "As Profundezas Alagadas", "reward": "+1 passive",
+         "note_en": "Kill the unique Dweller of the Deep — reached from The Submerged Passage.",
+         "note_pt": "Mate o único Habitante das Profundezas — acessado a partir da Passagem Submersa."},
+        {"attach": 11, "name_en": "The Marooned Mariner", "name_pt": "O Marinheiro Encalhado",
+         "zone_en": "The Ship Graveyard", "zone_pt": "Cemitério de Navios", "reward": "+1 passive",
+         "note_en": "Kill Captain Fairgraves in the Ship Graveyard on the way to the Cavern of Wrath.",
+         "note_pt": "Mate o Capitão Fairgraves no Cemitério de Navios, a caminho da Caverna da Ira."},
+     ],
+     "boss_en": "Merveil, the Siren", "boss_pt": "Merveil, a Sereia"},
+
+    {"id": "a2", "title_en": "Act 2 — The Forest Encampment", "title_pt": "Ato 2 — Acampamento da Floresta",
+     "route_en": ["The Forest Encampment (town)", "The Old Fields", "The Crossroads", "The Den (side)",
+                  "The Chamber of Sins (1-2)", "The Fellshrine Ruins", "The Crypt (1-2)", "The Riverways",
+                  "The Western Forest", "The Weaver's Chambers", "The Broken Bridge", "The Wetlands",
+                  "The Vaal Ruins", "The Northern Forest", "The Caverns", "The Ancient Pyramid"],
+     "route_pt": ["Acampamento da Floresta (cidade)", "Os Campos Antigos", "A Encruzilhada", "A Toca (opcional)",
+                  "Câmara dos Pecados (1-2)", "Ruínas de Fellshrine", "A Cripta (1-2)", "As Vias Fluviais",
+                  "Floresta Oeste", "Câmaras da Tecelã", "A Ponte Quebrada", "Os Pântanos",
+                  "Ruínas Vaal", "Floresta Norte", "As Cavernas", "A Pirâmide Antiga"],
+     "quests": [
+        {"attach": 6, "name_en": "Through Sacred Ground", "name_pt": "Através do Solo Sagrado",
+         "zone_en": "The Crypt, Level 2", "zone_pt": "A Cripta, Nível 2", "reward": "+1 passive",
+         "note_en": "Find the Altar and take the Golden Hand on Crypt Level 2.",
+         "note_pt": "Encontre o Altar e pegue a Mão Dourada no Nível 2 da Cripta."},
+        {"attach": 11, "name_en": "The Way Forward", "name_pt": "O Caminho à Frente",
+         "zone_en": "hands in at Lioneye's Watch, after the bandit fight", "zone_pt": "entregue em Vigia de Lioneye, depois da luta com os bandidos", "reward": "+1 passive",
+         "note_en": "Unlocked by killing all three bandits — hand in back at Lioneye's Watch (Act 1's town), not in Act 2 itself.",
+         "note_pt": "Desbloqueada ao matar os três bandidos — entregue de volta em Vigia de Lioneye (cidade do Ato 1), não no Ato 2."},
+        {"attach": 11, "name_en": "Deal with the Bandits", "name_pt": "Lide com os Bandidos",
+         "zone_en": "Broken Bridge / Wetlands / Western Forest", "zone_pt": "Ponte Quebrada / Pântanos / Floresta Oeste", "reward": "+2 passive",
+         "note_en": "Killing all three bandits (Kraityn, Oak, Alira) and reporting back is the standard leveling choice — the extra passive point outweighs any single bandit's unique reward long-term.",
+         "note_pt": "Matar os três bandidos (Kraityn, Oak, Alira) e reportar é a escolha padrão de leveling — o ponto de passiva extra compensa mais a longo prazo do que a recompensa única de poupar um bandido."},
+     ],
+     "boss_en": "The Vaal Oversoul", "boss_pt": "A Alma Suprema Vaal"},
+
+    {"id": "a3", "title_en": "Act 3 — The City of Sarn", "title_pt": "Ato 3 — A Cidade de Sarn",
+     "route_en": ["The City of Sarn", "The Sarn Encampment (town)", "The Slums", "The Crematorium",
+                  "The Sewers", "The Marketplace", "The Battlefront", "The Solaris Temple (1-2)",
+                  "The Docks", "The Ebony Barracks", "The Lunaris Temple (1-2)", "The Imperial Gardens",
+                  "The Sceptre of God"],
+     "route_pt": ["A Cidade de Sarn", "Acampamento de Sarn (cidade)", "Os Cortiços", "O Crematório",
+                  "Os Esgotos", "O Mercado", "Linha de Frente", "Templo de Solaris (1-2)",
+                  "As Docas", "Os Quartéis de Ébano", "Templo de Lunaris (1-2)", "Os Jardins Imperiais",
+                  "O Cetro de Deus"],
+     "quests": [
+        {"attach": 4, "name_en": "Victario's Secrets", "name_pt": "Segredos de Victario",
+         "zone_en": "The Sewers", "zone_pt": "Os Esgotos", "reward": "+1 passive",
+         "note_en": "Find the hidden Platinum Busts inside the Sewers.",
+         "note_pt": "Encontre os Bustos de Platina escondidos dentro dos Esgotos."},
+        {"attach": 10, "name_en": "Piety's Pets", "name_pt": "Os Bichos de Piety",
+         "zone_en": "The Lunaris Temple, Level 2", "zone_pt": "Templo de Lunaris, Nível 2", "reward": "+1 passive",
+         "note_en": "Kill Piety and take the Tower Key on Lunaris Temple Level 2.",
+         "note_pt": "Mate Piety e pegue a Chave da Torre no Nível 2 do Templo de Lunaris."},
+     ],
+     "boss_en": "Dominus, High Templar (Piety is also fought earlier, at The Crematorium)",
+     "boss_pt": "Dominus, Alto Templário (Piety também é enfrentada antes, no Crematório)"},
+
+    {"id": "a4", "title_en": "Act 4 — Highgate", "title_pt": "Ato 4 — Highgate",
+     "route_en": ["The Aqueduct", "Highgate (town)", "The Dried Lake", "The Mines (1-2)",
+                  "The Crystal Veins", "Daresso's Dream", "The Grand Arena", "Kaom's Dream",
+                  "Kaom's Stronghold", "The Belly of the Beast (1-2)", "The Harvest", "The Ascent"],
+     "route_pt": ["O Aqueduto", "Highgate (cidade)", "O Lago Seco", "As Minas (1-2)",
+                  "As Veias de Cristal", "O Sonho de Daresso", "A Grande Arena", "O Sonho de Kaom",
+                  "A Fortaleza de Kaom", "A Barriga da Fera (1-2)", "A Colheita", "A Ascensão"],
+     "quests": [
+        {"attach": 3, "name_en": "An Indomitable Spirit", "name_pt": "Um Espírito Indomável",
+         "zone_en": "The Mines", "zone_pt": "As Minas", "reward": "+1 passive",
+         "note_en": "Free Deshret in the Mines — the only bonus-point quest this act, quick to grab.",
+         "note_pt": "Liberte Deshret nas Minas — a única quest de ponto bônus deste ato, rápida de pegar."},
+     ],
+     "boss_en": "Malachai, the Nightmare", "boss_pt": "Malachai, o Pesadelo"},
+
+    {"id": "a5", "title_en": "Act 5 — The Slave Pens", "title_pt": "Ato 5 — Os Currais de Escravos",
+     "route_en": ["The Slave Pens", "Overseer's Tower (town)", "The Control Blocks", "Oriath Square",
+                  "The Templar Courts", "The Chamber of Innocence", "The Torched Courts", "The Ruined Square",
+                  "The Ossuary", "The Reliquary", "The Cathedral Rooftop"],
+     "route_pt": ["Os Currais de Escravos", "A Torre do Supervisor (cidade)", "Os Blocos de Controle", "Praça de Oriath",
+                  "Os Tribunais Templários", "A Câmara da Inocência", "Os Tribunais Queimados", "A Praça em Ruínas",
+                  "O Ossário", "O Relicário", "O Telhado da Catedral"],
+     "quests": [
+        {"attach": 2, "name_en": "In Service to Science", "name_pt": "A Serviço da Ciência",
+         "zone_en": "The Control Blocks", "zone_pt": "Os Blocos de Controle", "reward": "+1 passive",
+         "note_en": "Take the Miasmeter and kill Justicar Casticus inside the Control Blocks.",
+         "note_pt": "Pegue o Miasmeter e mate o Justicar Casticus dentro dos Blocos de Controle."},
+        {"attach": 9, "name_en": "Kitava's Torments", "name_pt": "Os Tormentos de Kitava",
+         "zone_en": "The Reliquary", "zone_pt": "O Relicário", "reward": "+1 passive",
+         "note_en": "Find all 3 Kitava's Torment items in the corners of the Reliquary — an optional side zone, short detour.",
+         "note_pt": "Encontre os 3 itens Tormento de Kitava nos cantos do Relicário — uma zona opcional, desvio curto."},
+     ],
+     "boss_en": "Kitava, the Insatiable (first encounter)", "boss_pt": "Kitava, o Insaciável (primeiro encontro)"},
+
+    {"id": "a6", "title_en": "Act 6 — Lioneye's Watch (return)", "title_pt": "Ato 6 — Vigia de Lioneye (retorno)",
+     "route_en": ["Lioneye's Watch (town)", "The Twilight Strand", "The Coast", "The Mud Flats",
+                  "The Karui Fortress", "The Ridge", "The Lower Prison", "Shavronne's Tower",
+                  "Prisoner's Gate", "The Western Forest", "The Riverways", "The Wetlands",
+                  "The Southern Forest", "The Cavern of Anger", "The Beacon", "The Brine King's Reef"],
+     "route_pt": ["Vigia de Lioneye (cidade)", "A Faixa do Crepúsculo", "A Costa", "Os Pântanos Lodosos",
+                  "A Fortaleza Karui", "A Crista", "A Prisão Inferior", "A Torre de Shavronne",
+                  "O Portão do Prisioneiro", "Floresta Oeste", "As Vias Fluviais", "Os Pântanos",
+                  "Floresta Sul", "A Caverna da Fúria", "O Farol", "Recife do Rei das Marés"],
+     "quests": [
+        {"attach": 4, "name_en": "The Father of War", "name_pt": "O Pai da Guerra",
+         "zone_en": "The Karui Fortress", "zone_pt": "A Fortaleza Karui", "reward": "+1 passive",
+         "note_en": "Kill Tukohama, Karui God of War, inside the Karui Fortress.",
+         "note_pt": "Mate Tukohama, Deus Karui da Guerra, dentro da Fortaleza Karui."},
+        {"attach": 8, "name_en": "The Cloven One", "name_pt": "O Fendido",
+         "zone_en": "Prisoner's Gate", "zone_pt": "O Portão do Prisioneiro", "reward": "+1 passive",
+         "note_en": "Kill Abberath, the Cloven One, at Prisoner's Gate.",
+         "note_pt": "Mate Abberath, o Fendido, no Portão do Prisioneiro."},
+        {"attach": 11, "name_en": "The Puppet Mistress", "name_pt": "A Mestra das Marionetes",
+         "zone_en": "The Wetlands", "zone_pt": "Os Pântanos", "reward": "+1 passive",
+         "note_en": "Kill Ryslatha, the Puppet Mistress, in the Wetlands.",
+         "note_pt": "Mate Ryslatha, a Mestra das Marionetes, nos Pântanos."},
+     ],
+     "boss_en": "Tsoagoth, the Brine King", "boss_pt": "Tsoagoth, o Rei das Marés"},
+
+    {"id": "a7", "title_en": "Act 7 — The Bridge Encampment", "title_pt": "Ato 7 — Acampamento da Ponte",
+     "route_en": ["The Bridge Encampment (town)", "The Broken Bridge", "The Crossroads", "The Fellshrine Ruins",
+                  "The Crypt", "The Chamber of Sins (1-2)", "The Den", "The Ashen Fields",
+                  "The Northern Forest", "The Causeway", "The Vaal City", "The Dread Thicket",
+                  "The Temple of Decay (1-2)"],
+     "route_pt": ["Acampamento da Ponte (cidade)", "A Ponte Quebrada", "A Encruzilhada", "Ruínas de Fellshrine",
+                  "A Cripta", "Câmara dos Pecados (1-2)", "A Toca", "Os Campos de Cinzas",
+                  "Floresta Norte", "A Calçada", "A Cidade Vaal", "Matagal do Pavor",
+                  "Templo da Decadência (1-2)"],
+     "quests": [
+        {"attach": 7, "name_en": "The Master of a Million Faces", "name_pt": "O Mestre de um Milhão de Faces",
+         "zone_en": "The Ashen Fields", "zone_pt": "Os Campos de Cinzas", "reward": "+1 passive",
+         "note_en": "Kill Greust, Lord of the Forest, in the Ashen Fields.",
+         "note_pt": "Mate Greust, Senhor da Floresta, nos Campos de Cinzas."},
+        {"attach": 11, "name_en": "Queen of Despair", "name_pt": "Rainha do Desespero",
+         "zone_en": "The Dread Thicket", "zone_pt": "Matagal do Pavor", "reward": "+1 passive",
+         "note_en": "Kill Gruthkul, Mother of Despair, inside the Dread Thicket.",
+         "note_pt": "Mate Gruthkul, Mãe do Desespero, dentro do Matagal do Pavor."},
+        {"attach": 9, "name_en": "Kishara's Star", "name_pt": "A Estrela de Kishara",
+         "zone_en": "The Causeway", "zone_pt": "A Calçada", "reward": "+1 passive",
+         "note_en": "Find and take Kishara's Star along the Causeway.",
+         "note_pt": "Encontre e pegue a Estrela de Kishara ao longo da Calçada."},
+     ],
+     "boss_en": "Arakaali, Spinner of Shadows", "boss_pt": "Arakaali, Tecelã das Sombras"},
+
+    {"id": "a8", "title_en": "Act 8 — The Sarn Ramparts", "title_pt": "Ato 8 — As Muralhas de Sarn",
+     "route_en": ["The Sarn Ramparts", "The Sarn Encampment (town)", "The Toxic Conduits", "Doedre's Cesspool",
+                  "The Quay", "The Grain Gate", "The Imperial Fields", "The Solaris Temple (1-2)",
+                  "The Lunaris Concourse", "The Lunaris Temple (1-2)", "The Harbour Bridge",
+                  "The Bath House", "The High Gardens"],
+     "route_pt": ["As Muralhas de Sarn", "Acampamento de Sarn (cidade)", "Os Condutos Tóxicos", "O Poço de Doedre",
+                  "O Cais", "O Portão de Grãos", "Os Campos Imperiais", "Templo de Solaris (1-2)",
+                  "Terminal de Lunaris", "Templo de Lunaris (1-2)", "A Ponte do Porto",
+                  "A Casa de Banhos", "Os Jardins Altos"],
+     "quests": [
+        {"attach": 4, "name_en": "Love is Dead", "name_pt": "O Amor Está Morto",
+         "zone_en": "The Quay", "zone_pt": "O Cais", "reward": "+1 passive",
+         "note_en": "Talk to Clarissa and kill Tolman at the Quay.",
+         "note_pt": "Fale com Clarissa e mate Tolman no Cais."},
+        {"attach": 5, "name_en": "The Gemling Legion", "name_pt": "A Legião Gemulada",
+         "zone_en": "The Grain Gate", "zone_pt": "O Portão de Grãos", "reward": "+1 passive",
+         "note_en": "Find and kill the Gemling Legionnaires at the Grain Gate.",
+         "note_pt": "Encontre e mate os Legionários Gemulados no Portão de Grãos."},
+        {"attach": 12, "name_en": "Reflection of Terror", "name_pt": "Reflexo do Terror",
+         "zone_en": "The High Gardens", "zone_pt": "Os Jardins Altos", "reward": "+1 passive",
+         "note_en": "Kill Yugul, Reflection of Terror, in the High Gardens.",
+         "note_pt": "Mate Yugul, Reflexo do Terror, nos Jardins Altos."},
+     ],
+     "boss_en": "Yugul, Reflection of Terror (Lunaris and Solaris are also fought earlier, at The Harbour Bridge)",
+     "boss_pt": "Yugul, Reflexo do Terror (Lunaris e Solaris também são enfrentadas antes, na Ponte do Porto)"},
+
+    {"id": "a9", "title_en": "Act 9 — Highgate (return)", "title_pt": "Ato 9 — Highgate (retorno)",
+     "route_en": ["Highgate (town)", "The Descent", "The Vastiri Desert", "The Foothills",
+                  "The Boiling Lake", "The Oasis", "The Tunnel", "The Quarry", "The Refinery",
+                  "The Belly of the Beast", "The Rotting Core"],
+     "route_pt": ["Highgate (cidade)", "A Descida", "O Deserto de Vastiri", "As Colinas",
+                  "O Lago Fervente", "O Oásis", "O Túnel", "A Pedreira", "A Refinaria",
+                  "A Barriga da Fera", "O Núcleo Podre"],
+     "quests": [
+        {"attach": 5, "name_en": "Queen of the Sands", "name_pt": "Rainha das Areias",
+         "zone_en": "The Oasis", "zone_pt": "O Oásis", "reward": "+1 passive",
+         "note_en": "Kill Shakari, Queen of the Sands, at the Oasis.",
+         "note_pt": "Mate Shakari, Rainha das Areias, no Oásis."},
+        {"attach": 7, "name_en": "The Ruler of Highgate", "name_pt": "O Governante de Highgate",
+         "zone_en": "The Quarry", "zone_pt": "A Pedreira", "reward": "+1 passive",
+         "note_en": "Kill Garukhan, Queen of the Winds, at the Quarry.",
+         "note_pt": "Mate Garukhan, Rainha dos Ventos, na Pedreira."},
+     ],
+     "boss_en": "The Depraved Trinity (Doedre, Maligaro & Shavronne, fought together at The Rotting Core)",
+     "boss_pt": "A Trindade Depravada (Doedre, Maligaro e Shavronne, enfrentados juntos no Núcleo Podre)"},
+
+    {"id": "a10", "title_en": "Act 10 — Oriath Docks", "title_pt": "Ato 10 — Docas de Oriath",
+     "route_en": ["Oriath Docks (town)", "The Cathedral Rooftop", "The Ravaged Square", "The Control Blocks",
+                  "The Ossuary", "The Torched Courts", "The Desecrated Chambers", "The Canals",
+                  "The Feeding Trough", "Karui Shores"],
+     "route_pt": ["Docas de Oriath (cidade)", "O Telhado da Catedral", "A Praça Devastada", "Os Blocos de Controle",
+                  "O Ossário", "Os Tribunais Queimados", "As Câmaras Profanadas", "Os Canais",
+                  "O Cocho de Alimentação", "Praias Karui"],
+     "quests": [
+        {"attach": 3, "name_en": "Vilenta's Vengeance", "name_pt": "A Vingança de Vilenta",
+         "zone_en": "The Control Blocks", "zone_pt": "Os Blocos de Controle", "reward": "+1 passive",
+         "note_en": "Find and kill Vilenta inside the Control Blocks.",
+         "note_pt": "Encontre e mate Vilenta dentro dos Blocos de Controle."},
+        {"attach": 8, "name_en": "An End to Hunger", "name_pt": "Um Fim à Fome",
+         "zone_en": "The Feeding Trough", "zone_pt": "O Cocho de Alimentação", "reward": "+2 passive",
+         "note_en": "Worth +2 passive points on its own — the single highest-value optional quest in the campaign. Use /passives in-game to confirm you have all 24.",
+         "note_pt": "Vale +2 pontos de passiva sozinha — a quest opcional de maior valor de toda a campanha. Use /passives no jogo para confirmar que você tem todos os 24."},
+     ],
+     "boss_en": "Kitava, the Insatiable (final campaign fight)", "boss_pt": "Kitava, o Insaciável (confronto final da campanha)"},
+]
+
+_poe1_acts_body, _poe1_acts_i18n_en, _poe1_acts_i18n_pt = _render_campaign_acts(
+    POE1_CAMPAIGN_ACTS, img_dir="/imgs/poe1")
+_poe1_items_league_en = _render_campaign_items(
+    [{"item": it["item_en"], "why": it["why_en"]} for it in POE1_LEAGUE_START_ITEMS])
+_poe1_items_league_pt = _render_campaign_items(
+    [{"item": it["item_pt"], "why": it["why_pt"]} for it in POE1_LEAGUE_START_ITEMS])
+_poe1_items_second_en = _render_campaign_items(
+    [{"item": it["item_en"], "why": it["why_en"]} for it in POE1_SECOND_CHAR_ITEMS])
+_poe1_items_second_pt = _render_campaign_items(
+    [{"item": it["item_pt"], "why": it["why_pt"]} for it in POE1_SECOND_CHAR_ITEMS])
+
+POE1_CAMPAIGN_EXTRA_CONTROLS = ""
+
+POE1_CAMPAIGN_BODY = (r"""
 <div class="wrap">
-  <div class="note" data-i18n="poe2_campaign_note">
-    Path of Exile 2 campaign notes aren't built yet — this page is a placeholder so the route
-    and admin-only menu link exist ahead of real content.
+  <div class="note" data-i18n="campaign_intro">
+    A community-sourced rush guide, not an official one — the zone route and quest list are
+    cross-checked against the open-source exile-leveling project's route data, and
+    quest-giver NPCs are left out where that doesn't specify one. The map image for each act
+    is a real screenshot of that act's layout, not annotated by this site. Only the quests
+    below grant a passive skill point — every other optional quest in the campaign is safe to
+    skip if you're rushing; you can ignore this quest and come back for the loot on a slower
+    playthrough.
   </div>
+  <div class="campaign-section-label" data-i18n="campaign_items_league_label">League-start items</div>
+  <div data-i18n="campaign_items_league"></div>
+  <div class="campaign-section-label" data-i18n="campaign_items_second_label">Second-character items</div>
+  <div data-i18n="campaign_items_second"></div>
+""" + _poe1_acts_body + """
 </div>
-"""
+""")
 
-POE2_CAMPAIGN_JS = r"""const LEAGUE = __LEAGUE_JSON__;
+POE1_CAMPAIGN_JS = (r"""const LEAGUE = __LEAGUE_JSON__;
+
+function populateLeagueOptions(){
+  const sel = document.getElementById('leaguesel');
+  if(sel.options.length) return;
+  let currentLeague;
+  try { currentLeague = localStorage.getItem('bossFarmLeague'); } catch(e) { currentLeague = null; }
+  const cur = currentLeague || LEAGUE;
+  const opts = [LEAGUE, 'Standard', 'Hardcore', 'Hardcore ' + LEAGUE];
+  const seen = new Set();
+  sel.innerHTML = opts.filter(o => o && !seen.has(o) && seen.add(o))
+    .map(o => `<option value="${o}" ${o===cur?'selected':''}>${o}</option>`).join('');
+  document.getElementById('league').textContent = cur;
+}
+populateLeagueOptions();
 
 const I18N = {
 en: {
-  tagline: 'PATH OF EXILE 2 · CAMPAIGN',
-  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor',
+  tagline: 'PATH OF EXILE · CAMPAIGN GUIDE',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor', menu_campaign: 'Campaign Guide',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   btn_refresh: 'Refresh', btn_syncing: 'syncing…',
   footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games.',
   footer_made_by: 'Built by Erick Lúcio',
-  footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
-  poe2_campaign_note: 'Path of Exile 2 campaign notes aren\'t built yet — this page is a placeholder so the route and admin-only menu link exist ahead of real content.',
+  footer_dm: 'Send me an email there for comment or feedback',
+  campaign_intro: 'A community-sourced rush guide, not an official one — the zone route and quest list are cross-checked against the open-source exile-leveling project\'s route data, and quest-giver NPCs are left out where that doesn\'t specify one. The map image for each act is a real screenshot of that act\'s layout, not annotated by this site. Only the quests below grant a passive skill point — every other optional quest in the campaign is safe to skip if you\'re rushing; you can ignore this quest and come back for the loot on a slower playthrough.',
+  campaign_items_league_label: 'League-start items',
+  campaign_items_second_label: 'Second-character items',
+""" + _poe1_acts_i18n_en + r"""
+  campaign_items_league: """ + json.dumps(_poe1_items_league_en) + r""",
+  campaign_items_second: """ + json.dumps(_poe1_items_second_en) + r""",
 },
 pt: {
-  tagline: 'PATH OF EXILE 2 · CAMPANHA',
-  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip',
+  tagline: 'PATH OF EXILE · GUIA DE CAMPANHA',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip', menu_campaign: 'Guia de Campanha',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   btn_refresh: 'Atualizar', btn_syncing: 'sincronizando…',
   footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games.',
   footer_made_by: 'Feito por Erick Lúcio',
-  footer_dm: 'Sugestão ou opinião? Manda um DM no LinkedIn',
-  poe2_campaign_note: 'As notas de campanha do Path of Exile 2 ainda não foram escritas — esta página é um placeholder para a rota e o link de menu (admin) existirem antes do conteúdo real.',
+  footer_dm: 'Manda um e-mail lá para comentário ou feedback',
+  campaign_intro: 'Um guia feito com fontes da comunidade, não oficial — a rota de zonas e a lista de quests foram cruzadas com os dados de rota do projeto de código aberto exile-leveling, e os NPCs que dão as quests foram deixados de fora onde essa fonte não especifica um. A imagem do mapa de cada ato é uma captura de tela real do layout daquele ato, sem anotações deste site. Só as quests listadas abaixo dão ponto de passiva — qualquer outra quest opcional da campanha pode ser ignorada se você estiver correndo; pode ignorar essa quest e voltar pelo loot numa jogada mais tranquila depois.',
+  campaign_items_league_label: 'Itens de início de liga',
+  campaign_items_second_label: 'Itens para o segundo personagem',
+""" + _poe1_acts_i18n_pt + r"""
+  campaign_items_league: """ + json.dumps(_poe1_items_league_pt) + r""",
+  campaign_items_second: """ + json.dumps(_poe1_items_second_pt) + r""",
 },
 };
 
-// SHARED_HEADER_HTML's #langsel markup is shared across pages, but each page
-// has to wire its own change listener — without it, the dropdown just
-// changes its own selected option and nothing else updates. This page has
-// no other dynamic (non data-i18n) content, so applyStaticI18n() alone is
-// enough to refresh everything after a switch.
 const langSel = document.getElementById('langsel');
 langSel.value = lang;
 langSel.addEventListener('change', () => {
@@ -3579,17 +4086,250 @@ langSel.addEventListener('change', () => {
 });
 
 applyStaticI18n();
-"""
+""")
+
+
+def render_campaign_page():
+    head = (SHARED_HEAD_TEMPLATE
+            .replace("__PAGE_TITLE__", 'Campaign Guide — Path of Exile 1 Leveling Route & Passive Quests')
+            .replace("__PAGE_DESCRIPTION__", 'Path of Exile 1 campaign rush guide: fastest route, league-start and second-character item lists, and every quest that grants a bonus passive skill point, act by act.')
+            .replace("__PAGE_SOCIAL_TITLE__", 'Campaign Guide — Path of Exile 1')
+            .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Fastest campaign route, league-start gear, and every bonus passive-point quest, act by act.')
+            .replace("__PAGE_APP_NAME__", 'Campaign Guide')
+            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Path of Exile 1 campaign rush guide with route maps and passive skill point quests.')
+            .replace("__FAVICON_URL__", _favicon_data_uri(chr(0x1F5FA))))
+    header = (SHARED_HEADER_HTML.replace("__EXTRA_CONTROLS__", POE1_CAMPAIGN_EXTRA_CONTROLS)
+              .replace("__BRAND_ICON__", "&#128506;").replace("__BRAND_TITLE__", "Campaign Guide")
+              .replace("__PRICECHIPS_ATTR__", "hidden").replace("__DIVINE_CHIP_ATTR__", "hidden"))
+    return (head + "\n" + SHARED_CSS + '\n</head>\n<body>' + "\n"
+            + render_sitemenu("campaign") + header + POE1_CAMPAIGN_BODY + SHARED_FOOTER_HTML
+            + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n'
+            + "<script>\nconst PAGE_REQUIRES_ADMIN = false;\n" + SHARED_JS_CHROME + POE1_CAMPAIGN_JS
+            + '\n</script>\n</body>\n</html>')
+
+
+# --------------------------------------------------------------------------- #
+# PoE2 Campaign Guide page (/poe2-campaign) — public
+# --------------------------------------------------------------------------- #
+# PoE2 (0.5.x "Return of the Ancients") is still Early Access: 4 of a planned
+# 6 acts exist today, each followed by an Interlude. Content here is sourced
+# from Maxroll's league-start leveling guide for this patch rather than
+# pre-cutoff training knowledge (PoE2 is new enough that guessing from memory
+# is much riskier than for PoE1 — see the sourcing policy above
+# _campaign_act_svg()). Route waypoints stay at the act/interlude level
+# (no claimed sub-zone chains) for the same reason; the named encounters
+# below are exactly as the source describes them, without asserting whether
+# each is an NPC, a zone, or a mini-boss.
+POE2_LEAGUE_START_ITEMS = [
+    {"item_en": "Any 4-linked chest matching your main skill's colors", "item_pt": "Qualquer peitoral com 4 conexões nas cores da sua skill principal",
+     "why_en": "PoE2's link system is per-item (no separate Orb of Fusing/Jeweller's step) — a decent rare or magic chest with the right sockets is a bigger early spike than chasing a specific unique.",
+     "why_pt": "O sistema de conexões do PoE2 é por item (sem uma etapa separada de Orbe de Fusão/Joalheiro) — um peitoral raro ou mágico decente com os encaixes certos é um salto inicial maior do que perseguir um único específico."},
+    {"item_en": "Resistance-capping rings/amulet", "item_pt": "Anéis/amuleto que fecham as resistências",
+     "why_en": "Elemental resistances matter from the very first act — grab cheap rares/magics with any positive resistance rolls before pushing further.",
+     "why_pt": "As resistências elementais importam desde o primeiro ato — pegue raros/mágicos baratos com qualquer resistência positiva antes de avançar mais."},
+    {"item_en": "Spirit-boosting gear", "item_pt": "Equipamento que aumenta Spirit",
+     "why_en": "Spirit gates how many persistent buffs/auras/minions you can run — an early piece with flat Spirit noticeably widens your build options.",
+     "why_pt": "Spirit limita quantos buffs/auras/minions persistentes você consegue manter ativos — uma peça inicial com Spirit direto abre bastante as opções de build."},
+    {"item_en": "Movement-speed boots", "item_pt": "Botas com velocidade de movimento",
+     "why_en": "Basic movement speed on boots is one of the highest-value early upgrades per currency spent, same principle as PoE1's Wanderlust.",
+     "why_pt": "Velocidade de movimento básica nas botas é uma das melhorias de maior valor por currency gasta no início, mesmo princípio do Wanderlust no PoE1."},
+]
+
+POE2_SECOND_CHAR_ITEMS = [
+    {"item_en": "Buy a full resistance-capped rare set outright", "item_pt": "Compre um set raro completo com resistências fechadas direto",
+     "why_en": "With currency from your first character, skip the early gear grind entirely and buy a capped set instead of slowly upgrading piece by piece.",
+     "why_pt": "Com currency do seu primeiro personagem, pule totalmente o grind de equipamento inicial e compre um set com resistências fechadas em vez de melhorar peça por peça aos poucos."},
+    {"item_en": "A build-appropriate 4-linked weapon", "item_pt": "Uma arma com 4 conexões adequada à build",
+     "why_en": "Second characters can afford a real weapon matching the new build's skills immediately instead of leveling on whatever drops.",
+     "why_pt": "Personagens secundários já podem comprar uma arma de verdade compatível com as skills da nova build imediatamente, em vez de nivelar com o que cair."},
+    {"item_en": "Spare Waystones for early maps", "item_pt": "Waystones sobressalentes para mapas iniciais",
+     "why_en": "Bank a few low-tier Waystones ahead of time so endgame starts the moment the campaign ends, no farming detour needed first.",
+     "why_pt": "Guarde alguns Waystones de tier baixo com antecedência para o endgame começar assim que a campanha terminar, sem precisar de um desvio de farm antes."},
+]
+
+# "attach" = 0-based index into route_en/route_pt. Reward text is exactly as
+# sourced (resistance/Spirit/life/passive-point bonuses — PoE2's Early Access
+# campaign hands out a wider mix of permanent buffs than PoE1's "always a
+# passive point" pattern), so the page's intro note explains this instead of
+# assuming every bonus is a passive point.
+POE2_CAMPAIGN_ACTS = [
+    {"id": "a1", "title_en": "Act 1", "title_pt": "Ato 1",
+     "route_en": ["Act 1 start", "Freythorn", "Act 1 end"],
+     "route_pt": ["Início do Ato 1", "Freythorn", "Fim do Ato 1"],
+     "quests": [
+        {"attach": 0, "name_en": "Beira", "name_pt": "Beira",
+         "zone_en": "Act 1", "zone_pt": "Ato 1", "reward": "+10% Cold Resistance",
+         "note_en": "A permanent resistance bonus available during Act 1 — grab it on your first pass through.",
+         "note_pt": "Um bônus permanente de resistência disponível durante o Ato 1 — pegue já na primeira passagem."},
+        {"attach": 1, "name_en": "Crowbell and Una's Lute", "name_pt": "Crowbell e o Alaúde de Una",
+         "zone_en": "Act 1", "zone_pt": "Ato 1", "reward": "+2 passive points",
+         "note_en": "A permanent passive-point bonus available during Act 1.",
+         "note_pt": "Um bônus permanente de pontos de passiva disponível durante o Ato 1."},
+        {"attach": 1, "name_en": "Freythorn", "name_pt": "Freythorn",
+         "zone_en": "Freythorn", "zone_pt": "Freythorn", "reward": "+30 Spirit",
+         "note_en": "A permanent Spirit bonus tied to the Freythorn zone.",
+         "note_pt": "Um bônus permanente de Spirit ligado à zona de Freythorn."},
+     ]},
+
+    {"id": "a2", "title_en": "Act 2", "title_pt": "Ato 2",
+     "route_en": ["Act 2 start", "Act 2 end"],
+     "route_pt": ["Início do Ato 2", "Fim do Ato 2"],
+     "quests": [
+        {"attach": 0, "name_en": "Kabala", "name_pt": "Kabala",
+         "zone_en": "Act 2", "zone_pt": "Ato 2", "reward": "+2 passive points",
+         "note_en": "A permanent passive-point bonus available during Act 2.",
+         "note_pt": "Um bônus permanente de pontos de passiva disponível durante o Ato 2."},
+        {"attach": 0, "name_en": "Sun and Kabala Clan relics", "name_pt": "Relíquias do Sol e do Clã Kabala",
+         "zone_en": "Act 2", "zone_pt": "Ato 2", "reward": "Changeable Relic buff",
+         "note_en": "Relic-slot buffs — unlike most other bonuses on this page, these can be swapped later, so don't overthink the first pick.",
+         "note_pt": "Buffs de slot de relíquia — diferente da maioria dos outros bônus desta página, esses podem ser trocados depois, então não pense demais na primeira escolha."},
+        {"attach": 1, "name_en": "Sisters of Garukhan", "name_pt": "Irmãs de Garukhan",
+         "zone_en": "Act 2", "zone_pt": "Ato 2", "reward": "+10% Lightning Resistance",
+         "note_en": "A permanent resistance bonus available during Act 2.",
+         "note_pt": "Um bônus permanente de resistência disponível durante o Ato 2."},
+     ]},
+
+    {"id": "a3", "title_en": "Act 3", "title_pt": "Ato 3",
+     "route_en": ["Act 3 start", "Venom Crypts", "Act 3 end"],
+     "route_pt": ["Início do Ato 3", "Criptas de Veneno", "Fim do Ato 3"],
+     "quests": [
+        {"attach": 0, "name_en": "Silverfist", "name_pt": "Punho de Prata",
+         "zone_en": "Act 3", "zone_pt": "Ato 3", "reward": "+2 passive points",
+         "note_en": "A permanent passive-point bonus available during Act 3.",
+         "note_pt": "Um bônus permanente de pontos de passiva disponível durante o Ato 3."},
+        {"attach": 1, "name_en": "Blackjaw", "name_pt": "Mandíbula Negra",
+         "zone_en": "Venom Crypts", "zone_pt": "Criptas de Veneno", "reward": "+10% Fire Resistance",
+         "note_en": "One of the buff choices inside the Venom Crypts cannot be changed later — read the choice carefully before confirming.",
+         "note_pt": "Uma das escolhas de buff dentro das Criptas de Veneno não pode ser trocada depois — leia a escolha com atenção antes de confirmar."},
+        {"attach": 2, "name_en": "Ignagduk", "name_pt": "Ignagduk",
+         "zone_en": "Act 3", "zone_pt": "Ato 3", "reward": "+30 Spirit",
+         "note_en": "A permanent Spirit bonus available during Act 3.",
+         "note_pt": "Um bônus permanente de Spirit disponível durante o Ato 3."},
+     ]},
+
+    {"id": "a4", "title_en": "Act 4 and Interludes", "title_pt": "Ato 4 e Interlúdios",
+     "route_en": ["Interlude 1", "Interlude 2", "Interlude 3 (Doryani's Contingency)", "Act 4"],
+     "route_pt": ["Interlúdio 1", "Interlúdio 2", "Interlúdio 3 (Contingência de Doryani)", "Ato 4"],
+     "quests": [
+        {"attach": 2, "name_en": "Tattoos", "name_pt": "Tatuagens",
+         "zone_en": "Interludes", "zone_pt": "Interlúdios", "reward": "Attribute/resistance choice",
+         "note_en": "Small permanent attribute or resistance bonuses picked up across the interludes.",
+         "note_pt": "Pequenos bônus permanentes de atributo ou resistência obtidos ao longo dos interlúdios."},
+        {"attach": 3, "name_en": "Orbala's Pillars", "name_pt": "Pilares de Orbala",
+         "zone_en": "Act 4", "zone_pt": "Ato 4", "reward": "+5% Maximum Life and more passive points",
+         "note_en": "Multiple permanent bonuses (including further passive points) available across Act 4 and its interludes.",
+         "note_pt": "Vários bônus permanentes (incluindo mais pontos de passiva) disponíveis ao longo do Ato 4 e seus interlúdios."},
+     ]},
+]
+
+_poe2_acts_body, _poe2_acts_i18n_en, _poe2_acts_i18n_pt = _render_campaign_acts(POE2_CAMPAIGN_ACTS)
+_poe2_items_league_en = _render_campaign_items(
+    [{"item": it["item_en"], "why": it["why_en"]} for it in POE2_LEAGUE_START_ITEMS])
+_poe2_items_league_pt = _render_campaign_items(
+    [{"item": it["item_pt"], "why": it["why_pt"]} for it in POE2_LEAGUE_START_ITEMS])
+_poe2_items_second_en = _render_campaign_items(
+    [{"item": it["item_en"], "why": it["why_en"]} for it in POE2_SECOND_CHAR_ITEMS])
+_poe2_items_second_pt = _render_campaign_items(
+    [{"item": it["item_pt"], "why": it["why_pt"]} for it in POE2_SECOND_CHAR_ITEMS])
+
+POE2_CAMPAIGN_EXTRA_CONTROLS = ""
+
+POE2_CAMPAIGN_BODY = (r"""
+
+<div class="wrap">
+  <div class="note" data-i18n="campaign_intro">
+    A community-sourced rush guide, not an official one — Path of Exile 2 is still Early Access
+    (0.5.x, "Return of the Ancients"), with 4 of a planned 6 acts released so far, so this guide
+    covers Acts 1-4 and their interludes and will grow as GGG ships the rest. Unlike Path of
+    Exile 1, not every permanent bonus below is a passive skill point — some are resistances,
+    Spirit, or max life. Every other optional quest is safe to skip if you're rushing; you can
+    ignore this quest and come back for the loot on a slower playthrough.
+  </div>
+  <div class="campaign-section-label" data-i18n="campaign_items_league_label">League-start items</div>
+  <div data-i18n="campaign_items_league"></div>
+  <div class="campaign-section-label" data-i18n="campaign_items_second_label">Second-character items</div>
+  <div data-i18n="campaign_items_second"></div>
+""" + _poe2_acts_body + """
+</div>
+""")
+
+POE2_CAMPAIGN_JS = (r"""const LEAGUE = __LEAGUE_JSON__;
+
+// Separate localStorage key from PoE1 pages' 'bossFarmLeague' — this is a
+// PoE2 league name (e.g. "Return of the Ancients"), never mixed with PoE1's
+// league list, and picking one here must never overwrite a PoE1 page's
+// saved preference or vice versa.
+function populateLeagueOptions(){
+  const sel = document.getElementById('leaguesel');
+  if(sel.options.length) return;
+  let currentLeague;
+  try { currentLeague = localStorage.getItem('bossFarmLeaguePoe2'); } catch(e) { currentLeague = null; }
+  const cur = currentLeague || LEAGUE;
+  const opts = [LEAGUE, 'Standard', 'Hardcore', 'Hardcore ' + LEAGUE];
+  const seen = new Set();
+  sel.innerHTML = opts.filter(o => o && !seen.has(o) && seen.add(o))
+    .map(o => `<option value="${o}" ${o===cur?'selected':''}>${o}</option>`).join('');
+  document.getElementById('league').textContent = cur;
+  sel.addEventListener('change', () => {
+    try { localStorage.setItem('bossFarmLeaguePoe2', sel.value); } catch(e) {}
+    document.getElementById('league').textContent = sel.value;
+  });
+}
+populateLeagueOptions();
+
+const I18N = {
+en: {
+  tagline: 'PATH OF EXILE 2 · CAMPAIGN GUIDE',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor', menu_campaign: 'Campaign Guide',
+  chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
+  btn_refresh: 'Refresh', btn_syncing: 'syncing…',
+  footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games.',
+  footer_made_by: 'Built by Erick Lúcio',
+  footer_dm: 'Send me an email there for comment or feedback',
+  campaign_intro: 'A community-sourced rush guide, not an official one — Path of Exile 2 is still Early Access (0.5.x, "Return of the Ancients"), with 4 of a planned 6 acts released so far, so this guide covers Acts 1-4 and their interludes and will grow as GGG ships the rest. Unlike Path of Exile 1, not every permanent bonus below is a passive skill point — some are resistances, Spirit, or max life. Every other optional quest is safe to skip if you\'re rushing; you can ignore this quest and come back for the loot on a slower playthrough.',
+  campaign_items_league_label: 'League-start items',
+  campaign_items_second_label: 'Second-character items',
+""" + _poe2_acts_i18n_en + r"""
+  campaign_items_league: """ + json.dumps(_poe2_items_league_en) + r""",
+  campaign_items_second: """ + json.dumps(_poe2_items_second_en) + r""",
+},
+pt: {
+  tagline: 'PATH OF EXILE 2 · GUIA DE CAMPANHA',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip', menu_campaign: 'Guia de Campanha',
+  chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
+  btn_refresh: 'Atualizar', btn_syncing: 'sincronizando…',
+  footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games.',
+  footer_made_by: 'Feito por Erick Lúcio',
+  footer_dm: 'Manda um e-mail lá para comentário ou feedback',
+  campaign_intro: 'Um guia feito com fontes da comunidade, não oficial — o Path of Exile 2 ainda está em Early Access (0.5.x, "Return of the Ancients"), com 4 de 6 atos planejados lançados até agora, então este guia cobre os Atos 1-4 e seus interlúdios, e vai crescer conforme a GGG lançar o resto. Diferente do Path of Exile 1, nem todo bônus permanente abaixo é um ponto de passiva — alguns são resistências, Spirit ou vida máxima. Qualquer outra quest opcional pode ser ignorada se você estiver correndo; pode ignorar essa quest e voltar pelo loot numa jogada mais tranquila depois.',
+  campaign_items_league_label: 'Itens de início de liga',
+  campaign_items_second_label: 'Itens para o segundo personagem',
+""" + _poe2_acts_i18n_pt + r"""
+  campaign_items_league: """ + json.dumps(_poe2_items_league_pt) + r""",
+  campaign_items_second: """ + json.dumps(_poe2_items_second_pt) + r""",
+},
+};
+
+const langSel = document.getElementById('langsel');
+langSel.value = lang;
+langSel.addEventListener('change', () => {
+  lang = langSel.value;
+  try { localStorage.setItem('bossFarmLang', lang); } catch(e) {}
+  applyStaticI18n();
+});
+
+applyStaticI18n();
+""")
 
 
 def render_poe2_campaign_page():
     head = (SHARED_HEAD_TEMPLATE
-            .replace("__PAGE_TITLE__", 'PoE2 Campaign — Path of Exile 2 (Admin Preview)')
-            .replace("__PAGE_DESCRIPTION__", 'Placeholder page for future Path of Exile 2 campaign content.')
-            .replace("__PAGE_SOCIAL_TITLE__", 'PoE2 Campaign')
-            .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Placeholder page for future Path of Exile 2 campaign content.')
-            .replace("__PAGE_APP_NAME__", 'PoE2 Campaign')
-            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Placeholder page for future Path of Exile 2 campaign content.')
+            .replace("__PAGE_TITLE__", 'PoE2 Campaign Guide — Path of Exile 2 Leveling Route & Permanent Bonuses')
+            .replace("__PAGE_DESCRIPTION__", 'Path of Exile 2 campaign rush guide: fastest route, league-start and second-character item lists, and every permanent bonus available per act and interlude.')
+            .replace("__PAGE_SOCIAL_TITLE__", 'PoE2 Campaign Guide')
+            .replace("__PAGE_SOCIAL_DESCRIPTION__", 'Fastest campaign route, league-start gear, and every permanent act/interlude bonus.')
+            .replace("__PAGE_APP_NAME__", 'PoE2 Campaign Guide')
+            .replace("__PAGE_JSONLD_DESCRIPTION__", 'Path of Exile 2 campaign rush guide with route maps and permanent act/interlude bonuses.')
             .replace("__FAVICON_URL__", _favicon_data_uri(chr(0x2694) + chr(0xFE0F))))
     header = (SHARED_HEADER_HTML.replace("__EXTRA_CONTROLS__", POE2_CAMPAIGN_EXTRA_CONTROLS)
               .replace("__BRAND_ICON__", "&#9876;&#65039;").replace("__BRAND_TITLE__", "PoE2 Campaign")
@@ -3597,7 +4337,7 @@ def render_poe2_campaign_page():
     return (head + "\n" + SHARED_CSS + '\n</head>\n<body>' + "\n"
             + render_sitemenu("poe2-campaign") + header + POE2_CAMPAIGN_BODY + SHARED_FOOTER_HTML
             + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n'
-            + "<script>\nconst PAGE_REQUIRES_ADMIN = true;\n" + SHARED_JS_CHROME + POE2_CAMPAIGN_JS
+            + "<script>\nconst PAGE_REQUIRES_ADMIN = false;\n" + SHARED_JS_CHROME + POE2_CAMPAIGN_JS
             + '\n</script>\n</body>\n</html>')
 
 
@@ -3679,12 +4419,12 @@ populateLeagueOptions();
 const I18N = {
 en: {
   tagline: 'PATH OF EXILE · FLIP ADVISOR',
-  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor',
+  menu_title: 'Menu', menu_home: 'Home', menu_bosses: 'Boss Farm', menu_snipe: 'Trade Sniper', menu_poe2_campaign: 'PoE2 Campaign', menu_flip_advisor: 'Flip Advisor', menu_campaign: 'Campaign Guide',
   chip_league: 'League', chip_price: 'Price', chip_sync: 'Sync', chip_next: 'next',
   btn_refresh: 'Refresh', btn_syncing: 'syncing…',
   footer_disclaimer: 'Unofficial fan tool — not affiliated with or endorsed by Grinding Gear Games.',
   footer_made_by: 'Built by Erick Lúcio',
-  footer_dm: 'Suggestion or opinion? Send me a DM on LinkedIn',
+  footer_dm: 'Send me an email there for comment or feedback',
   flip_disclaimer: 'This uses the official currency-exchange market\'s hourly aggregate data — delayed and historical, not a live orderbook. A high spread% means that pair\'s rate moved a lot within the last completed hour (a volatility signal worth checking), not a guaranteed profit. Always verify the live price on the Bulk Item Exchange before trading.',
   flip_status_loading: 'Loading…',
   flip_status_ready: 'Showing top {n} pairs for {league} — hour data as of {time}',
@@ -3709,12 +4449,12 @@ en: {
 },
 pt: {
   tagline: 'PATH OF EXILE · CONSELHEIRO DE FLIP',
-  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip',
+  menu_title: 'Menu', menu_home: 'Início', menu_bosses: 'Farm de Chefes', menu_snipe: 'Caçador de Ofertas', menu_poe2_campaign: 'Campanha PoE2', menu_flip_advisor: 'Conselheiro de Flip', menu_campaign: 'Guia de Campanha',
   chip_league: 'Liga', chip_price: 'Preço', chip_sync: 'Sincronia', chip_next: 'próximo',
   btn_refresh: 'Atualizar', btn_syncing: 'sincronizando…',
   footer_disclaimer: 'Ferramenta não-oficial feita por fã — sem afiliação com a Grinding Gear Games.',
   footer_made_by: 'Feito por Erick Lúcio',
-  footer_dm: 'Sugestão ou opinião? Manda um DM no LinkedIn',
+  footer_dm: 'Manda um e-mail lá para comentário ou feedback',
   flip_disclaimer: 'Isso usa os dados agregados por hora do mercado oficial de troca de moedas — atrasados e históricos, não uma carteira de ordens ao vivo. Um spread% alto significa que a taxa daquele par variou bastante na última hora completa (um sinal de volatilidade que vale a pena checar), não um lucro garantido. Sempre confira o preço ao vivo no Bulk Item Exchange antes de negociar.',
   flip_status_loading: 'Carregando…',
   flip_status_ready: 'Mostrando os {n} melhores pares para {league} — dados da hora {time}',
@@ -3943,7 +4683,7 @@ def render_flip_advisor_page():
     return (head + "\n" + SHARED_CSS + '\n</head>\n<body>' + "\n"
             + render_sitemenu("flip-advisor") + header + FLIP_ADVISOR_BODY + SHARED_FOOTER_HTML
             + '\n\n<div class="popover" id="popover" role="tooltip"></div>\n\n'
-            + "<script>\nconst PAGE_REQUIRES_ADMIN = true;\n" + SHARED_JS_CHROME + FLIP_ADVISOR_JS
+            + "<script>\nconst PAGE_REQUIRES_ADMIN = false;\n" + SHARED_JS_CHROME + FLIP_ADVISOR_JS
             + '\n</script>\n</body>\n</html>')
 
 
@@ -3999,6 +4739,15 @@ def minify_page(html):
 # --------------------------------------------------------------------------- #
 # Server
 # --------------------------------------------------------------------------- #
+# Static image assets (e.g. imgs/poe1/act1.png, used as Campaign Guide act
+# backgrounds — see _render_campaign_acts()'s img_dir param) referenced from
+# rendered pages as "/imgs/<...>". The static build (build_static.py) copies
+# this whole directory into out_dir/imgs so Cloudflare's static-asset layer
+# serves them the same way; this do_GET branch is only for the local dev
+# server, which has no such layer of its own.
+IMGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "imgs")
+
+
 def make_handler(league, poll_ms, pages_html):
     pages_bytes = {slug: html.encode("utf-8") for slug, html in pages_html.items()}
 
@@ -4046,6 +4795,14 @@ def make_handler(league, poll_ms, pages_html):
                         self._send(200, body, "application/json")
                     except Exception as e:
                         self._send(500, json.dumps({"ok": False, "error": str(e)}).encode(), "application/json")
+            elif path.startswith("/imgs/"):
+                requested = os.path.normpath(os.path.join(IMGS_DIR, path[len("/imgs/"):]))
+                if not requested.startswith(IMGS_DIR + os.sep) or not os.path.isfile(requested):
+                    self._send(404, b"not found", "text/plain")
+                else:
+                    ctype = mimetypes.guess_type(requested)[0] or "application/octet-stream"
+                    with open(requested, "rb") as f:
+                        self._send(200, f.read(), ctype)
             elif path == "/api/flipadvisor":
                 qs = urllib.parse.parse_qs(parsed.query)
                 req_league = (qs.get("league") or [league])[0].strip()[:64] or league
@@ -4068,6 +4825,8 @@ def make_handler(league, poll_ms, pages_html):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--league", default="Allflame")
+    ap.add_argument("--league-poe2", default="Return of the Ancients",
+                    help="PoE2 league name, shown only on /poe2-campaign's league dropdown")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--poll", type=int, default=120,
                     help="browser auto-refresh interval, in seconds")
@@ -4088,11 +4847,14 @@ def main():
                   .replace("__LEAGUE_JSON__", json.dumps(args.league))
                   .replace("__CANONICAL_URL__", f"http://localhost:{args.port}/snipe")),
         "poe2-campaign": (render_poe2_campaign_page().replace("__POLL_MS__", str(args.poll * 1000))
-                          .replace("__LEAGUE_JSON__", json.dumps(args.league))
+                          .replace("__LEAGUE_JSON__", json.dumps(args.league_poe2))
                           .replace("__CANONICAL_URL__", f"http://localhost:{args.port}/poe2-campaign")),
         "flip-advisor": (render_flip_advisor_page().replace("__POLL_MS__", str(args.poll * 1000))
                          .replace("__LEAGUE_JSON__", json.dumps(args.league))
                          .replace("__CANONICAL_URL__", f"http://localhost:{args.port}/flip-advisor")),
+        "campaign": (render_campaign_page().replace("__POLL_MS__", str(args.poll * 1000))
+                     .replace("__LEAGUE_JSON__", json.dumps(args.league))
+                     .replace("__CANONICAL_URL__", f"http://localhost:{args.port}/campaign")),
     }
     if args.minify:
         pages_html = {slug: minify_page(html) for slug, html in pages_html.items()}
@@ -4104,8 +4866,9 @@ def main():
           f"\nBoss Farm dashboard at http://localhost:{args.port}/bosses"
           f"\nTrade Sniper (needs the deployed Worker to actually work) at "
           f"http://localhost:{args.port}/snipe"
-          f"\nPoE2 Campaign (admin-only stub) at http://localhost:{args.port}/poe2-campaign"
-          f"\nFlip Advisor (admin-only, PoE1) at http://localhost:{args.port}/flip-advisor")
+          f"\nPoE2 Campaign at http://localhost:{args.port}/poe2-campaign"
+          f"\nFlip Advisor (admin-only, PoE1) at http://localhost:{args.port}/flip-advisor"
+          f"\nCampaign Guide (PoE1) at http://localhost:{args.port}/campaign")
     try:
         webbrowser.open(url)
     except Exception:

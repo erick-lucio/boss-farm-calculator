@@ -31,6 +31,7 @@ Usage:
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -418,9 +419,18 @@ def render_home_page(league, worker_url, poll_ms):
     return html
 
 
-def render_poe2_campaign_page(league, worker_url, poll_ms):
+def render_poe2_campaign_page(league_poe2, worker_url, poll_ms):
+    # PoE2-only page — takes the PoE2 league value, not the site-wide PoE1
+    # --league arg (see the per-game league split in main() below).
     canonical_url = worker_url.rstrip("/") + "/poe2-campaign"
     return (boss.render_poe2_campaign_page().replace("__POLL_MS__", str(poll_ms))
+                    .replace("__LEAGUE_JSON__", json.dumps(league_poe2))
+                    .replace("__CANONICAL_URL__", canonical_url))
+
+
+def render_campaign_page(league, worker_url, poll_ms):
+    canonical_url = worker_url.rstrip("/") + "/campaign"
+    return (boss.render_campaign_page().replace("__POLL_MS__", str(poll_ms))
                     .replace("__LEAGUE_JSON__", json.dumps(league))
                     .replace("__CANONICAL_URL__", canonical_url))
 
@@ -466,6 +476,9 @@ def main():
                     help="Public site URL (custom domain if you have one, otherwise the "
                     "Cloudflare Worker's *.workers.dev URL)")
     ap.add_argument("--league", default="Allflame")
+    ap.add_argument("--league-poe2", default="Return of the Ancients",
+                    help="PoE2 league name, shown only on /poe2-campaign's league dropdown — "
+                    "independent of --league (PoE1) since the two games don't share a league")
     ap.add_argument("--poll", type=int, default=120,
                     help="browser auto-refresh interval, in seconds")
     ap.add_argument("--out", default="build", help="output directory (default: build — the same "
@@ -481,39 +494,55 @@ def main():
     snipe_dir = out_dir / "snipe"
     poe2_dir = out_dir / "poe2-campaign"
     flip_dir = out_dir / "flip-advisor"
-    for d in (home_dir, bosses_dir, snipe_dir, poe2_dir, flip_dir):
+    campaign_dir = out_dir / "campaign"
+    for d in (home_dir, bosses_dir, snipe_dir, poe2_dir, flip_dir, campaign_dir):
         d.mkdir(parents=True, exist_ok=True)
+
+    # Static image assets (Campaign Guide act backgrounds, see boss.py's
+    # _render_campaign_acts() img_dir param) — copied as-is so Cloudflare's
+    # static-asset layer serves them at the same "/imgs/..." paths the
+    # rendered HTML references, same mechanism as every other build/* file.
+    imgs_src = Path(__file__).resolve().parent / "imgs"
+    if imgs_src.is_dir():
+        shutil.copytree(imgs_src, out_dir / "imgs", dirs_exist_ok=True)
 
     home_html = render_home_page(args.league, args.worker_url, args.poll * 1000)
     html = render_page(args.league, args.worker_url, args.poll * 1000)
     snipe_html = render_snipe_page(args.league, args.worker_url, args.poll * 1000)
-    poe2_html = render_poe2_campaign_page(args.league, args.worker_url, args.poll * 1000)
+    poe2_html = render_poe2_campaign_page(args.league_poe2, args.worker_url, args.poll * 1000)
     flip_html = render_flip_advisor_page(args.league, args.worker_url, args.poll * 1000)
+    campaign_html = render_campaign_page(args.league, args.worker_url, args.poll * 1000)
     if not args.no_minify:
         home_html = boss.minify_page(home_html)
         html = boss.minify_page(html)
         snipe_html = boss.minify_page(snipe_html)
         poe2_html = boss.minify_page(poe2_html)
         flip_html = boss.minify_page(flip_html)
+        campaign_html = boss.minify_page(campaign_html)
     (home_dir / "index.html").write_text(home_html, encoding="utf-8")
     (bosses_dir / "index.html").write_text(html, encoding="utf-8")
     (snipe_dir / "index.html").write_text(snipe_html, encoding="utf-8")
     (poe2_dir / "index.html").write_text(poe2_html, encoding="utf-8")
     (flip_dir / "index.html").write_text(flip_html, encoding="utf-8")
+    (campaign_dir / "index.html").write_text(campaign_html, encoding="utf-8")
     (out_dir / "index.html").write_text(ROOT_REDIRECT, encoding="utf-8")
 
     base = args.worker_url.rstrip("/")
     (out_dir / "robots.txt").write_text(
         f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n", encoding="utf-8")
     (out_dir / "sitemap.xml").write_text(
-        # /snipe, /poe2-campaign, and /flip-advisor deliberately left out of the sitemap
-        # while they're admin-only/hidden from the site menu (see PAGES in boss.py) — all
-        # three still build and work at their URLs for direct/manual access, just aren't
-        # advertised for search engines to crawl yet.
+        # /snipe deliberately left out of the sitemap while it's admin-only/hidden from
+        # the site menu (see PAGES in boss.py) — still builds and works at its URL for
+        # direct/manual access, just isn't advertised for search engines to crawl yet.
+        # /flip-advisor, /campaign, and /poe2-campaign are all listed in PAGES (public)
+        # so they're included here.
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
         f"  <url><loc>{base}/home</loc></url>\n"
         f"  <url><loc>{base}/bosses</loc></url>\n"
+        f"  <url><loc>{base}/flip-advisor</loc></url>\n"
+        f"  <url><loc>{base}/campaign</loc></url>\n"
+        f"  <url><loc>{base}/poe2-campaign</loc></url>\n"
         "</urlset>\n", encoding="utf-8")
 
     print(f"Wrote {home_dir / 'index.html'} ({len(home_html):,} bytes)")
@@ -521,9 +550,10 @@ def main():
     print(f"Wrote {snipe_dir / 'index.html'} ({len(snipe_html):,} bytes)")
     print(f"Wrote {poe2_dir / 'index.html'} ({len(poe2_html):,} bytes)")
     print(f"Wrote {flip_dir / 'index.html'} ({len(flip_html):,} bytes)")
+    print(f"Wrote {campaign_dir / 'index.html'} ({len(campaign_html):,} bytes)")
     print(f"Wrote {out_dir / 'index.html'} (redirect -> /home)")
     print(f"Wrote {out_dir / 'robots.txt'} and {out_dir / 'sitemap.xml'}")
-    print(f"  league={args.league}  worker={args.worker_url}  poll={args.poll}s")
+    print(f"  league={args.league}  league_poe2={args.league_poe2}  worker={args.worker_url}  poll={args.poll}s")
     print(f"  {len(boss.ENTITIES)} boss entities embedded")
     print("Redeploy: cd worker && wrangler deploy   (or push, if Git auto-deploy is set up)")
 

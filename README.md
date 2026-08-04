@@ -169,4 +169,4 @@ leaked, just regenerate a new one (step 1 above) and update both sides.
 
 ## Author
 
-Built by **Erick Lúcio** — [linkedin.com/in/erick-lucioo](https://www.linkedin.com/in/erick-lucioo/)
+Built by **Erick Lúcio** — [ericklucio.suv@gmail.com](mailto:ericklucio.suv@gmail.com)
