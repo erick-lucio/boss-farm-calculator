@@ -1390,6 +1390,14 @@ def _campaign_act_content_html(act, lang):
                 f'<span class="cq-pin">{letter}</span> {name} '
                 f'<span class="cq-reward">{q["reward"]}</span></div>'
                 f'<div class="cq-zone">{zone}</div><div>{note}</div></div>')
+    if act.get("trials_en"):
+        trials = act["trials_en"] if lang == "en" else act["trials_pt"]
+        parts.append('<div class="campaign-section-label">' + pick(
+            "Trial of Ascendancy", "Julgamento de Ascendência") + '</div>')
+        parts.append('<div class="campaign-route-list">')
+        for zone in trials:
+            parts.append(f'<div class="rstep"><span class="rnum">&#9884;</span><span>{zone}</span></div>')
+        parts.append('</div>')
     if act.get("boss_en"):
         boss = pick(act["boss_en"], act["boss_pt"])
         parts.append('<div class="campaign-section-label">' + pick("Act boss", "Chefe do ato") + '</div>'
@@ -3787,6 +3795,7 @@ POE1_CAMPAIGN_ACTS = [
                   "A Ilha das Marés (opcional)", "As Profundezas Alagadas", "A Saliência", "A Subida",
                   "A Prisão Inferior", "A Prisão Superior", "O Portão do Prisioneiro", "Cemitério de Navios",
                   "A Caverna da Ira", "A Caverna da Fúria", "Covil de Merveil"],
+     "trials_en": ["The Lower Prison"], "trials_pt": ["A Prisão Inferior"],
      "quests": [
         {"attach": 5, "name_en": "The Dweller of the Deep", "name_pt": "O Habitante das Profundezas",
          "zone_en": "The Flooded Depths", "zone_pt": "As Profundezas Alagadas", "reward": "+1 passive",
@@ -3808,6 +3817,8 @@ POE1_CAMPAIGN_ACTS = [
                   "Câmara dos Pecados (1-2)", "Ruínas de Fellshrine", "A Cripta (1-2)", "As Vias Fluviais",
                   "Floresta Oeste", "Câmaras da Tecelã", "A Ponte Quebrada", "Os Pântanos",
                   "Ruínas Vaal", "Floresta Norte", "As Cavernas", "A Pirâmide Antiga"],
+     "trials_en": ["The Chamber of Sins, Level 2", "The Crypt, Level 1"],
+     "trials_pt": ["Câmara dos Pecados, Nível 2", "A Cripta, Nível 1"],
      "quests": [
         {"attach": 6, "name_en": "Through Sacred Ground", "name_pt": "Através do Solo Sagrado",
          "zone_en": "The Crypt, Level 2", "zone_pt": "A Cripta, Nível 2", "reward": "+1 passive",
@@ -3833,6 +3844,8 @@ POE1_CAMPAIGN_ACTS = [
                   "Os Esgotos", "O Mercado", "Linha de Frente", "Templo de Solaris (1-2)",
                   "As Docas", "Os Quartéis de Ébano", "Templo de Lunaris (1-2)", "Os Jardins Imperiais",
                   "O Cetro de Deus"],
+     "trials_en": ["The Crematorium", "The Catacombs", "The Imperial Gardens"],
+     "trials_pt": ["O Crematório", "As Catacumbas", "Os Jardins Imperiais"],
      "quests": [
         {"attach": 4, "name_en": "Victario's Secrets", "name_pt": "Segredos de Victario",
          "zone_en": "The Sewers", "zone_pt": "Os Esgotos", "reward": "+1 passive",
@@ -3889,6 +3902,7 @@ POE1_CAMPAIGN_ACTS = [
                   "A Fortaleza Karui", "A Crista", "A Prisão Inferior", "A Torre de Shavronne",
                   "O Portão do Prisioneiro", "Floresta Oeste", "As Vias Fluviais", "Os Pântanos",
                   "Floresta Sul", "A Caverna da Fúria", "O Farol", "Recife do Rei das Marés"],
+     "trials_en": ["The Lower Prison"], "trials_pt": ["A Prisão Inferior"],
      "quests": [
         {"attach": 4, "name_en": "The Father of War", "name_pt": "O Pai da Guerra",
          "zone_en": "The Karui Fortress", "zone_pt": "A Fortaleza Karui", "reward": "+1 passive",
@@ -3914,6 +3928,8 @@ POE1_CAMPAIGN_ACTS = [
                   "A Cripta", "Câmara dos Pecados (1-2)", "A Toca", "Os Campos de Cinzas",
                   "Floresta Norte", "A Calçada", "A Cidade Vaal", "Matagal do Pavor",
                   "Templo da Decadência (1-2)"],
+     "trials_en": ["The Crypt", "The Chamber of Sins, Level 2"],
+     "trials_pt": ["A Cripta", "Câmara dos Pecados, Nível 2"],
      "quests": [
         {"attach": 7, "name_en": "The Master of a Million Faces", "name_pt": "O Mestre de um Milhão de Faces",
          "zone_en": "The Ashen Fields", "zone_pt": "Os Campos de Cinzas", "reward": "+1 passive",
@@ -3939,6 +3955,7 @@ POE1_CAMPAIGN_ACTS = [
                   "O Cais", "O Portão de Grãos", "Os Campos Imperiais", "Templo de Solaris (1-2)",
                   "Terminal de Lunaris", "Templo de Lunaris (1-2)", "A Ponte do Porto",
                   "A Casa de Banhos", "Os Jardins Altos"],
+     "trials_en": ["The Bath House"], "trials_pt": ["A Casa de Banhos"],
      "quests": [
         {"attach": 4, "name_en": "Love is Dead", "name_pt": "O Amor Está Morto",
          "zone_en": "The Quay", "zone_pt": "O Cais", "reward": "+1 passive",
@@ -3963,6 +3980,7 @@ POE1_CAMPAIGN_ACTS = [
      "route_pt": ["Highgate (cidade)", "A Descida", "O Deserto de Vastiri", "As Colinas",
                   "O Lago Fervente", "O Oásis", "O Túnel", "A Pedreira", "A Refinaria",
                   "A Barriga da Fera", "O Núcleo Podre"],
+     "trials_en": ["The Tunnel"], "trials_pt": ["O Túnel"],
      "quests": [
         {"attach": 5, "name_en": "Queen of the Sands", "name_pt": "Rainha das Areias",
          "zone_en": "The Oasis", "zone_pt": "O Oásis", "reward": "+1 passive",
@@ -3983,6 +4001,7 @@ POE1_CAMPAIGN_ACTS = [
      "route_pt": ["Docas de Oriath (cidade)", "O Telhado da Catedral", "A Praça Devastada", "Os Blocos de Controle",
                   "O Ossário", "Os Tribunais Queimados", "As Câmaras Profanadas", "Os Canais",
                   "O Cocho de Alimentação", "Praias Karui"],
+     "trials_en": ["The Ossuary"], "trials_pt": ["O Ossário"],
      "quests": [
         {"attach": 3, "name_en": "Vilenta's Vengeance", "name_pt": "A Vingança de Vilenta",
          "zone_en": "The Control Blocks", "zone_pt": "Os Blocos de Controle", "reward": "+1 passive",
@@ -4020,6 +4039,13 @@ POE1_CAMPAIGN_BODY = (r"""
     skip if you're rushing; you can ignore this quest and come back for the loot on a slower
     playthrough.
   </div>
+  <div class="note" data-i18n="campaign_trial_note">
+    Each act's "Trial of Ascendancy" section (where present — Acts 4 and 5 have none) marks a
+    zone with a Trial of Ascendancy: complete it once to help unlock the Labyrinth, a separate
+    optional dungeon that grants Ascendancy points for your subclass. You only need 3 completed
+    trials per Labyrinth difficulty (Normal/Cruel/Merciless) — some acts have more than one
+    available, so treat extras as optional convenience, not a hard requirement.
+  </div>
   <div class="campaign-section-label" data-i18n="campaign_items_league_label">League-start items</div>
   <div data-i18n="campaign_items_league"></div>
   <div class="campaign-section-label" data-i18n="campaign_items_second_label">Second-character items</div>
@@ -4054,6 +4080,7 @@ en: {
   footer_made_by: 'Built by Erick Lúcio',
   footer_dm: 'Send me an email there for comment or feedback',
   campaign_intro: 'A community-sourced rush guide, not an official one — the zone route and quest list are cross-checked against the open-source exile-leveling project\'s route data, and quest-giver NPCs are left out where that doesn\'t specify one. The map image for each act is a real screenshot of that act\'s layout, not annotated by this site. Only the quests below grant a passive skill point — every other optional quest in the campaign is safe to skip if you\'re rushing; you can ignore this quest and come back for the loot on a slower playthrough.',
+  campaign_trial_note: 'Each act\'s "Trial of Ascendancy" section (where present — Acts 4 and 5 have none) marks a zone with a Trial of Ascendancy: complete it once to help unlock the Labyrinth, a separate optional dungeon that grants Ascendancy points for your subclass. You only need 3 completed trials per Labyrinth difficulty (Normal/Cruel/Merciless) — some acts have more than one available, so treat extras as optional convenience, not a hard requirement.',
   campaign_items_league_label: 'League-start items',
   campaign_items_second_label: 'Second-character items',
 """ + _poe1_acts_i18n_en + r"""
@@ -4069,6 +4096,7 @@ pt: {
   footer_made_by: 'Feito por Erick Lúcio',
   footer_dm: 'Manda um e-mail lá para comentário ou feedback',
   campaign_intro: 'Um guia feito com fontes da comunidade, não oficial — a rota de zonas e a lista de quests foram cruzadas com os dados de rota do projeto de código aberto exile-leveling, e os NPCs que dão as quests foram deixados de fora onde essa fonte não especifica um. A imagem do mapa de cada ato é uma captura de tela real do layout daquele ato, sem anotações deste site. Só as quests listadas abaixo dão ponto de passiva — qualquer outra quest opcional da campanha pode ser ignorada se você estiver correndo; pode ignorar essa quest e voltar pelo loot numa jogada mais tranquila depois.',
+  campaign_trial_note: 'A seção "Julgamento de Ascendência" de cada ato (quando existe — os Atos 4 e 5 não têm nenhum) marca uma zona com um Julgamento de Ascendência: complete uma vez para ajudar a desbloquear o Labirinto, uma masmorra opcional separada que dá pontos de Ascendência para sua subclasse. Você só precisa de 3 julgamentos completos por dificuldade do Labirinto (Normal/Cruel/Implacável) — alguns atos têm mais de um disponível, então trate os extras como conveniência opcional, não uma exigência.',
   campaign_items_league_label: 'Itens de início de liga',
   campaign_items_second_label: 'Itens para o segundo personagem',
 """ + _poe1_acts_i18n_pt + r"""

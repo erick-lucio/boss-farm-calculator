@@ -30,7 +30,10 @@
       routes have no reliable way to tell the intended path from an optional detour just from
       the image. PoE2 still uses the generated schematic SVG (`_campaign_act_svg()`, fixed to
       draw a real directional arrowhead toward each next node instead of a fixed up/down shape)
-      since it has no images yet.
+      since it has no images yet. Each PoE1 act also lists its Trial of Ascendancy zone(s), where
+      present (Acts 4/5 have none) — sourced from the same exile-leveling dataset's `Complete
+      {trial}` markers rather than poewiki (`Trial_of_Ascendancy`, Anubis-blocked again this
+      session), with a `campaign_trial_note` explaining the Labyrinth/Ascendancy-points mechanic.
 - [x] **Swapped LinkedIn for email in the site footer** — `footer_made_by`/`footer_dm` +
       `SHARED_FOOTER_HTML` now show a byline (no link) and a `mailto:ericklucio.suv@gmail.com`
       contact link instead of the LinkedIn profile link, across every page.

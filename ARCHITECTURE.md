@@ -573,11 +573,18 @@ old `/poe2-campaign` stub it replaced).
   dataset's actual zone sequence (10-16 zones per act) rather than a hand-picked shortlist, so they
   no longer contradict the real map images' own higher node counts. The bandit-choice branch
   assumed is "kill all three" (`BANDIT_KILL` in the source data), matching the standard leveling
-  recommendation already documented in the `Deal with the Bandits` quest note. PoE2's
-  **`POE2_CAMPAIGN_ACTS`** (4 acts + interludes) has no equivalent open dataset available yet, so
-  it's sourced from a single current (0.5.x "Return of the Ancients") community guide instead —
-  the page explicitly notes only 4 of a planned 6 acts exist yet and that not every bonus is a
-  passive point (some are resistances/Spirit/max life).
+  recommendation already documented in the `Deal with the Bandits` quest note. Each act's optional
+  `trials_en`/`trials_pt` field (list of zone names, rendered as its own "Trial of Ascendancy"
+  section by `_campaign_act_content_html()` — omitted entirely for Acts 4 and 5, which have none)
+  is likewise pulled straight from the same dataset's `Complete {trial}` markers, not from
+  poewiki (`Trial_of_Ascendancy`, which is Anubis-blocked for automated fetching — see the
+  Lessons section). `campaign_trial_note` explains the Labyrinth/Ascendancy-points mechanic and
+  that only 3 completed trials are needed per difficulty tier, since some acts have more than one
+  available. PoE2's **`POE2_CAMPAIGN_ACTS`** (4 acts + interludes) has no equivalent open dataset
+  available yet, so it's sourced from a single current (0.5.x "Return of the Ancients") community
+  guide instead — the page explicitly notes only 4 of a planned 6 acts exist yet and that not
+  every bonus is a passive point (some are resistances/Spirit/max life). PoE2 has no Trial of
+  Ascendancy/Labyrinth system, so it has no equivalent section.
 - **Per-game league dropdown, not a shared value**: every other PoE1 page's `LEAGUE`
   constant/dropdown comes from `build_static.py`'s single `--league` arg and `bossFarmLeague`
   localStorage key. `/poe2-campaign` is the one page that needs a *different* league value
